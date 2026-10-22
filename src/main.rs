@@ -1,3 +1,4 @@
+mod adapter;
 mod daemon;
 mod proto;
 mod pty;
@@ -16,7 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{env, thread};
 
-const USAGE: &str = "usage: arranger [ls | new <agent> [--branch <base>] | attach <id> | kill <id> | ping | serve]";
+const USAGE: &str = "usage: arranger [ls [--files] | new <agent> [--branch <base>] | attach <id> | kill <id>
+                 | approve <id> | deny <id> [reason] | events <id> | ping | serve | hook <adapter>]";
 /// Ctrl-\, raw and in kitty keyboard encoding.
 const DETACH: &[&[u8]] = &[b"\x1c", b"\x1b[92;5u"];
 
@@ -25,7 +27,15 @@ fn main() {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args[..] {
         ["serve"] => daemon::run(),
-        [] | ["ls"] => ls(),
+        [] | ["ls"] => ls(false),
+        ["ls", "--files"] => ls(true),
+        ["hook", adapter] => {
+            let _ = hook(adapter); // never fail the agent's hook; it carries on without us
+            Ok(())
+        }
+        ["approve", id] => parse_id(id).and_then(|id| answer(id, true, String::new())),
+        ["deny", id, ref reason @ ..] => parse_id(id).and_then(|id| answer(id, false, reason.join(" "))),
+        ["events", id] => parse_id(id).and_then(events),
         ["ping"] => request(&Request::Ping).map(|_| println!("pong")),
         ["new", agent] => new(agent, None),
         ["new", agent, "--branch", base] => new(agent, Some(base)),
@@ -83,12 +93,53 @@ fn request(req: &Request) -> io::Result<Reply> {
     }
 }
 
-fn ls() -> io::Result<()> {
-    let reply = request(&Request::List)?;
+fn ls(files: bool) -> io::Result<()> {
+    let reply = request(&Request::List { files })?;
     let Reply::Tasks(tasks) = reply else { return Err(unexpected(reply)) };
-    println!("{:<4} {:<8} {:<10} {:<14} WORKTREE", "ID", "STATE", "AGENT", "BRANCH");
+    println!("{:<4} {:<10} {:<10} {:<14} ACTION", "ID", "STATE", "AGENT", "BRANCH");
     for t in tasks {
-        println!("{:<4} {:<8} {:<10} {:<14} {}", t.id, t.state, t.agent, t.branch, t.worktree);
+        let action: String = t.action.replace('\n', " ").chars().take(60).collect();
+        println!("{:<4} {:<10} {:<10} {:<14} {action}", t.id, t.state, adapter::kind(&t.agent), t.branch);
+        for f in t.files {
+            println!("       {f}");
+        }
+    }
+    Ok(())
+}
+
+fn answer(id: u64, allow: bool, message: String) -> io::Result<()> {
+    request(&Request::Answer { id, allow, message }).map(drop)
+}
+
+fn events(id: u64) -> io::Result<()> {
+    let reply = request(&Request::Events { id })?;
+    let Reply::Events(events) = reply else { return Err(unexpected(reply)) };
+    let start = events.first().map_or(0, |e| e.0);
+    for (ts, event) in events {
+        let secs = (ts - start) / 1000;
+        println!("+{:02}:{:02}  {}", secs / 60, secs % 60, event.describe().replace('\n', " "));
+    }
+    Ok(())
+}
+
+/// `arranger hook <adapter>`: run by agents. Reads hook JSON (one document, or a stream for pi),
+/// forwards events, and for permission asks waits for the human and prints the decision.
+fn hook(adapter: &str) -> io::Result<()> {
+    let Some(task) = env::var("ARRANGER_TASK").ok().and_then(|t| t.parse().ok()) else { return Ok(()) };
+    let mut sock = UnixStream::connect(proto::socket_path())?; // no auto-start: no daemon, no tracking
+    let mut totals = adapter::Totals::default();
+    for value in serde_json::Deserializer::from_reader(io::stdin().lock()).into_iter() {
+        let (events, ask) = adapter::parse(adapter, &value?, &mut totals);
+        for event in events {
+            if ask && matches!(event, proto::Event::PermissionRequest { .. }) {
+                sock.write_all(&proto::frame(&Request::Ask { task, event }))?;
+                if let Reply::Decision { allow: Some(allow), message } = proto::read_msg(&mut sock)? {
+                    println!("{}", adapter::decision(allow, &message));
+                }
+            } else {
+                sock.write_all(&proto::frame(&Request::Event { task, event }))?;
+            }
+        }
     }
     Ok(())
 }

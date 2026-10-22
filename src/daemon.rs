@@ -1,6 +1,7 @@
 //! `arranger serve`: one thread, one mio loop owning every PTY, client and task.
 
-use crate::proto::{self, Reply, Request, TaskInfo};
+use crate::adapter::{self, Osc};
+use crate::proto::{self, Event, Reply, Request, TaskInfo};
 use crate::pty::{self, Pty};
 use crate::screen::Screen;
 use mio::net::{UnixListener, UnixStream};
@@ -18,6 +19,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const LISTENER: Token = Token(0);
 const CHILD: Token = Token(1);
@@ -33,6 +35,28 @@ struct Task {
     /// Raw output not yet compressed into the on-disk log.
     log: Vec<u8>,
     viewers: Vec<Token>,
+    osc: Osc,
+    activity: Activity,
+    /// Live action line, e.g. "editing src/pty.rs".
+    action: String,
+}
+
+/// What a running agent is up to, derived from its events.
+#[derive(Clone, Copy, PartialEq)]
+enum Activity {
+    Running,
+    NeedsYou,
+    Done,
+}
+
+impl Activity {
+    fn name(self) -> &'static str {
+        match self {
+            Activity::Running => "running",
+            Activity::NeedsYou => "needs-you",
+            Activity::Done => "done",
+        }
+    }
 }
 
 struct Conn {
@@ -48,9 +72,12 @@ struct Daemon {
     listener: UnixListener,
     conns: HashMap<Token, Conn>,
     tasks: HashMap<u64, Task>,
+    /// Hook connections blocked on a human decision: (task, hook connection), oldest first.
+    asks: Vec<(u64, Token)>,
     db: Connection,
     zstd: zstd::bulk::Compressor<'static>,
     data: PathBuf,
+    exe: PathBuf,
     sigchld: StdUnixStream,
     next_conn: usize,
     max_live: usize,
@@ -59,6 +86,7 @@ struct Daemon {
 pub fn run() -> io::Result<()> {
     let data = proto::data_dir();
     fs::create_dir_all(data.join("logs"))?;
+    fs::create_dir_all(data.join("adapters"))?;
     let sock = proto::socket_path();
     if StdUnixStream::connect(&sock).is_ok() {
         return Err(io::Error::other("daemon already running"));
@@ -73,6 +101,9 @@ pub fn run() -> io::Result<()> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             agent TEXT NOT NULL, repo TEXT NOT NULL, branch TEXT NOT NULL,
             worktree TEXT NOT NULL, state TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY, task INTEGER NOT NULL, ts INTEGER NOT NULL, event TEXT NOT NULL);
+         CREATE INDEX IF NOT EXISTS events_task ON events (task);
          UPDATE tasks SET state = 'dead' WHERE state = 'running';
          DELETE FROM tasks WHERE state = 'new';",
     )
@@ -90,9 +121,11 @@ pub fn run() -> io::Result<()> {
         listener,
         conns: HashMap::new(),
         tasks: HashMap::new(),
+        asks: Vec::new(),
         db,
         zstd: zstd::bulk::Compressor::new(3)?,
         data,
+        exe: std::env::current_exe()?,
         sigchld,
         next_conn: 3,
         max_live: std::env::var("ARRANGER_MAX_AGENTS").ok().and_then(|v| v.parse().ok()).unwrap_or(20),
@@ -230,7 +263,7 @@ impl Daemon {
         let attached = self.conns.get(&t).and_then(|c| c.attached);
         let reply = match req {
             Request::Ping => Reply::Pong,
-            Request::List => match self.list() {
+            Request::List { files } => match self.list(files) {
                 Ok(tasks) => Reply::Tasks(tasks),
                 Err(e) => Reply::Error(e),
             },
@@ -242,8 +275,35 @@ impl Daemon {
                 Ok(()) => Reply::Ok,
                 Err(e) => Reply::Error(e),
             },
+            Request::Events { id } => match self.events(id) {
+                Ok(events) => Reply::Events(events),
+                Err(e) => Reply::Error(e),
+            },
+            Request::Event { task, event } => {
+                self.record(task, event);
+                return;
+            }
+            Request::Ask { task, event } => {
+                self.record(task, event);
+                // ponytail: any viewer means a human is watching the agent's own prompt; Phase 3's GUI may want to answer here instead
+                if self.tasks.get(&task).is_some_and(|t| t.viewers.is_empty()) {
+                    self.asks.push((task, t));
+                    return;
+                }
+                Reply::Decision { allow: None, message: String::new() }
+            }
+            Request::Answer { id, allow, message } => match self.asks.iter().position(|a| a.0 == id) {
+                Some(i) => {
+                    let (_, hook) = self.asks.remove(i);
+                    self.send(hook, &proto::frame(&Reply::Decision { allow: Some(allow), message }));
+                    self.resume(id);
+                    Reply::Ok
+                }
+                None => Reply::Error(format!("task {id} isn't waiting on a permission ask")),
+            },
             Request::Attach { id, cols, rows } => {
                 self.detach(t);
+                self.release_asks(id);
                 match self.tasks.get_mut(&id) {
                     Some(task) => {
                         task.viewers.push(t);
@@ -257,8 +317,11 @@ impl Daemon {
                 }
             }
             Request::Input(bytes) => {
-                if let Some(task) = attached.and_then(|id| self.tasks.get(&id)) {
-                    write_pty(&task.pty.master, &bytes);
+                if let Some(id) = attached {
+                    if let Some(task) = self.tasks.get(&id) {
+                        write_pty(&task.pty.master, &bytes);
+                    }
+                    self.resume(id);
                 }
                 return;
             }
@@ -316,6 +379,7 @@ impl Daemon {
 
     fn close(&mut self, t: Token) {
         self.detach(t);
+        self.asks.retain(|a| a.1 != t);
         self.conns.remove(&t);
     }
 
@@ -347,15 +411,62 @@ impl Daemon {
         if task.log.len() >= LOG_CHUNK {
             flush_log(&self.data, id, &mut task.log, &mut self.zstd);
         }
+        let notices = task.osc.feed(bytes);
         let replies = task.screen.feed(bytes);
         if task.viewers.is_empty() {
             // Attached viewers' own terminals answer queries; answer only when nobody is.
             write_pty(&task.pty.master, &replies);
-            return;
         }
         let frame = proto::frame(&Reply::Output(bytes.to_vec()));
         for v in task.viewers.clone() {
             self.send(v, &frame);
+        }
+        for text in notices {
+            self.record(id, Event::Attention { text });
+        }
+    }
+
+    /// Stores an event and updates the task's derived state and action line.
+    fn record(&mut self, id: u64, event: Event) {
+        let Some(task) = self.tasks.get_mut(&id) else { return };
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let json = serde_json::to_string(&event).unwrap();
+        if let Err(e) = self.db.execute("INSERT INTO events (task, ts, event) VALUES (?1, ?2, ?3)", params![id, ts, json]) {
+            eprintln!("task {id}: {e}");
+        }
+        let (activity, action) = match &event {
+            Event::Usage { .. } => return,
+            // Agents with hooks also ping the terminal when idle; that's not a new ask.
+            Event::Attention { .. } if task.activity == Activity::Done => return,
+            Event::PermissionRequest { .. } | Event::Question { .. } | Event::Attention { .. } | Event::Error { .. } => {
+                (Activity::NeedsYou, event.describe())
+            }
+            Event::TurnDone => (Activity::Done, event.describe()),
+            Event::ToolStart { .. } => (Activity::Running, event.describe()),
+            Event::Prompt { .. } | Event::ToolEnd { .. } => (Activity::Running, "working".into()),
+        };
+        task.activity = activity;
+        task.action = action;
+    }
+
+    /// A human answered (approve/deny or typing): back to running unless more asks wait.
+    fn resume(&mut self, id: u64) {
+        let waiting = self.asks.iter().any(|a| a.0 == id);
+        if let Some(task) = self.tasks.get_mut(&id) {
+            if task.activity == Activity::NeedsYou && !waiting {
+                task.activity = Activity::Running;
+                task.action = "working".into();
+            }
+        }
+    }
+
+    /// Hands pending asks back to the agent undecided, so it shows its own prompt to the viewer.
+    fn release_asks(&mut self, id: u64) {
+        let frame = proto::frame(&Reply::Decision { allow: None, message: String::new() });
+        let (mine, rest): (Vec<_>, Vec<_>) = self.asks.drain(..).partition(|a| a.0 == id);
+        self.asks = rest;
+        for (_, hook) in mine {
+            self.send(hook, &frame);
         }
     }
 
@@ -436,14 +547,21 @@ impl Daemon {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })
             .map_err(e2s)?;
+        let (argv, env) = adapter::launch(&agent, &self.exe, &self.data).map_err(e2s)?;
         let mut cmd = if Path::new(&wt).join(".arranger/setup").exists() {
             let mut sh = Command::new("sh");
-            sh.args(["-c", "./.arranger/setup && exec \"$0\"", &agent]);
+            sh.args(["-c", "./.arranger/setup && exec \"$0\" \"$@\""]).args(&argv);
             sh
         } else {
-            Command::new(&agent)
+            let mut cmd = Command::new(&argv[0]);
+            cmd.args(&argv[1..]);
+            cmd
         };
+        for key in adapter::PARENT_SESSION_ENV {
+            cmd.env_remove(key);
+        }
         cmd.current_dir(&wt)
+            .envs(env)
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
             .env("ARRANGER_TASK", id.to_string())
@@ -456,7 +574,15 @@ impl Daemon {
             .registry()
             .register(&mut SourceFd(&pty.master.as_raw_fd()), token, Interest::READABLE)
             .map_err(e2s)?;
-        let task = Task { pty, screen: Screen::new(cols, rows), log: Vec::new(), viewers: Vec::new() };
+        let task = Task {
+            pty,
+            screen: Screen::new(cols, rows),
+            log: Vec::new(),
+            viewers: Vec::new(),
+            osc: Osc::default(),
+            activity: Activity::Running,
+            action: String::new(),
+        };
         self.tasks.insert(id, task);
         self.set_state(id, "running");
         Ok(())
@@ -479,17 +605,56 @@ impl Daemon {
         }
         let _ = fs::remove_file(self.data.join(format!("logs/{id}.zst")));
         self.db.execute("DELETE FROM tasks WHERE id = ?1", [id]).map_err(e2s)?;
+        self.db.execute("DELETE FROM events WHERE task = ?1", [id]).map_err(e2s)?;
         self.start_queued();
         Ok(())
     }
 
-    fn list(&self) -> Result<Vec<TaskInfo>, String> {
+    fn list(&self, with_files: bool) -> Result<Vec<TaskInfo>, String> {
         let mut stmt =
             self.db.prepare("SELECT id, agent, branch, worktree, state FROM tasks ORDER BY id").map_err(e2s)?;
         let rows = stmt.query_map([], |r| {
-            Ok(TaskInfo { id: r.get(0)?, agent: r.get(1)?, branch: r.get(2)?, worktree: r.get(3)?, state: r.get(4)? })
+            Ok(TaskInfo {
+                id: r.get(0)?,
+                agent: r.get(1)?,
+                branch: r.get(2)?,
+                worktree: r.get(3)?,
+                state: r.get(4)?,
+                action: String::new(),
+                files: Vec::new(),
+            })
         });
-        rows.and_then(Iterator::collect).map_err(e2s)
+        let mut tasks: Vec<TaskInfo> = rows.and_then(Iterator::collect).map_err(e2s)?;
+        for info in &mut tasks {
+            if let Some(task) = self.tasks.get(&info.id) {
+                info.state = task.activity.name().into();
+                info.action = task.action.clone();
+            }
+            if with_files {
+                info.files = self.files(info.id).map_err(e2s)?;
+            }
+        }
+        Ok(tasks)
+    }
+
+    /// Distinct files a task's edit events touched.
+    fn files(&self, id: u64) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.db.prepare(
+            "SELECT DISTINCT json_extract(event, '$.ToolStart.target') FROM events
+             WHERE task = ?1 AND json_extract(event, '$.ToolStart.kind') = 'Edit' ORDER BY 1",
+        )?;
+        stmt.query_map([id], |r| r.get(0))?.collect()
+    }
+
+    fn events(&self, id: u64) -> Result<Vec<(u64, Event)>, String> {
+        let mut stmt = self.db.prepare("SELECT ts, event FROM events WHERE task = ?1 ORDER BY id").map_err(e2s)?;
+        let rows = stmt.query_map([id], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?))).map_err(e2s)?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (ts, json) = row.map_err(e2s)?;
+            events.push((ts, serde_json::from_str(&json).map_err(e2s)?));
+        }
+        Ok(events)
     }
 
     fn state(&self, id: u64) -> String {
