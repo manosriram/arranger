@@ -1,13 +1,14 @@
-//! `arranger` with no args: the Workspace window (docs/ui/Main.dc.html, NewTask.dc.html).
+//! `arranger-gui` (what `arranger` with no args runs): the Workspace window (docs/ui/Main.dc.html, NewTask.dc.html).
 //! Immediate mode: every redraw lays out and draws everything, and resolves the click
 //! that triggered it. Redraws happen only on input or daemon pushes, so idle CPU is zero.
 
 mod render;
 mod theme;
 
-use crate::adapter;
-use crate::proto::{self, Event, Reply, Request, TaskInfo};
-use crate::screen::Screen;
+use arranger::adapter;
+use arranger::client::{connect, request};
+use arranger::proto::{self, Event, Reply, Request, TaskInfo};
+use arranger::screen::Screen;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::TermMode;
@@ -27,11 +28,11 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use theme::{AGENTS, GRAPHITE, PAPER, Rgba, Theme, accent, alpha};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
@@ -122,13 +123,24 @@ struct App {
     click: Option<(f32, f32)>,
     actions: Vec<Action>,
     scroll: f32,
+    /// ⌘A in a text field: the next edit replaces the whole field.
+    select_all: bool,
+    caret_on: bool,
+    blink_at: Instant,
     lost: bool,
 }
 
-pub fn run() -> io::Result<()> {
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("arranger: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> io::Result<()> {
     let event_loop = EventLoop::<Msg>::with_user_event().build().map_err(io::Error::other)?;
     let proxy = event_loop.create_proxy();
-    let mut watch = crate::connect()?;
+    let mut watch = connect()?;
     watch.write_all(&proto::frame(&Request::Watch))?;
     let p = proxy.clone();
     thread::spawn(move || {
@@ -158,6 +170,9 @@ pub fn run() -> io::Result<()> {
         click: None,
         actions: Vec::new(),
         scroll: 0.0,
+        select_all: false,
+        caret_on: true,
+        blink_at: Instant::now(),
         lost: false,
     };
     event_loop.run_app(&mut app).map_err(io::Error::other)
@@ -185,7 +200,26 @@ fn init_gfx(el: &ActiveEventLoop) -> Result<Gfx, String> {
     Ok(Gfx { window, surface, context, r: Renderer::new(gl)? })
 }
 
+const BLINK: Duration = Duration::from_millis(530);
+
 impl ApplicationHandler<Msg> for App {
+    fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
+        if let StartCause::ResumeTimeReached { .. } = cause {
+            self.caret_on = !self.caret_on;
+            self.blink_at = Instant::now() + BLINK;
+            self.redraw();
+        }
+    }
+
+    /// Wakes only to blink the caret, and only while a text field has focus.
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        if self.focus == Focus::Term {
+            el.set_control_flow(ControlFlow::Wait);
+        } else {
+            el.set_control_flow(ControlFlow::WaitUntil(self.blink_at));
+        }
+    }
+
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.gfx.is_some() {
             return;
@@ -259,6 +293,8 @@ impl ApplicationHandler<Msg> for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                self.caret_on = true;
+                self.blink_at = Instant::now() + BLINK;
                 self.key(&event);
                 self.apply();
                 self.redraw();
@@ -478,7 +514,7 @@ impl App {
         self.session = None;
         let Some(id) = want else { return };
         let (cols, rows) = self.pane;
-        let Ok(mut sock) = crate::connect() else { return };
+        let Ok(mut sock) = connect() else { return };
         if sock.write_all(&proto::frame(&Request::Attach { id, cols, rows, native: false })).is_err() {
             return;
         }
@@ -522,6 +558,7 @@ impl App {
             .unwrap_or_else(|| "HEAD".into());
         self.dialog = Some(Dialog { prompt: String::new(), agent: 0, base, error: String::new() });
         self.focus = Focus::Prompt;
+        self.select_all = false;
     }
 
     fn start(&mut self, attach: bool) {
@@ -532,7 +569,7 @@ impl App {
             base: Some(d.base.trim().to_string()).filter(|b| !b.is_empty()),
             prompt: Some(d.prompt.trim().to_string()).filter(|p| !p.is_empty()),
         };
-        match crate::request(&req) {
+        match request(&req) {
             Ok(Reply::Created { id, .. }) => {
                 self.dialog = None;
                 self.focus = Focus::Term;
@@ -560,8 +597,14 @@ impl App {
                     "f" => self.actions.push(Action::Focus(Focus::Filter)),
                     "i" => self.actions.push(Action::Focus(Focus::Message)),
                     "v" => self.paste(),
+                    "a" if self.focus != Focus::Term => self.select_all = true,
                     _ => {}
                 },
+                Key::Named(NamedKey::Backspace) if self.focus != Focus::Term => {
+                    let focus = self.focus;
+                    self.field(focus).clear();
+                    self.select_all = false;
+                }
                 Key::Named(NamedKey::ArrowDown) => self.move_selection(1),
                 Key::Named(NamedKey::ArrowUp) => self.move_selection(-1),
                 Key::Named(NamedKey::Enter) if self.dialog.is_some() => self.actions.push(Action::Start(true)),
@@ -581,6 +624,12 @@ impl App {
             return;
         }
         let focus = self.focus;
+        let linux_ctrl = !cfg!(target_os = "macos") && m.control_key();
+        if linux_ctrl && ev.logical_key == Key::Character("a".into()) {
+            self.select_all = true;
+            return;
+        }
+        let replace = std::mem::take(&mut self.select_all);
         match &ev.logical_key {
             Key::Named(NamedKey::Escape) => {
                 if self.dialog.is_some() {
@@ -599,13 +648,27 @@ impl App {
                 _ => self.focus = Focus::Term,
             },
             Key::Named(NamedKey::Backspace) => {
-                self.field(focus).pop();
+                let field = self.field(focus);
+                if replace {
+                    field.clear();
+                } else if m.alt_key() || linux_ctrl {
+                    // Option/Alt/Ctrl+Backspace: delete the word before the caret.
+                    let keep = field.trim_end().rfind(|c: char| c.is_whitespace()).map_or(0, |i| i + 1);
+                    field.truncate(keep);
+                } else {
+                    field.pop();
+                }
                 self.scroll = 0.0;
             }
             _ => {
-                if let Some(text) = &ev.text {
+                if let Some(text) = ev.text.as_ref().filter(|t| t.chars().any(|c| !c.is_control())) {
                     let field = self.field(focus);
+                    if replace {
+                        field.clear();
+                    }
                     field.extend(text.chars().filter(|c| !c.is_control()));
+                } else {
+                    self.select_all = replace; // modifiers and other keys keep the selection
                 }
                 self.scroll = 0.0;
             }
@@ -629,6 +692,9 @@ impl App {
             self.send_input(bytes.into_bytes());
         } else {
             let focus = self.focus;
+            if std::mem::take(&mut self.select_all) {
+                self.field(focus).clear();
+            }
             self.field(focus).push_str(&text);
         }
     }
@@ -641,7 +707,10 @@ impl App {
                     self.focus = Focus::Term;
                     self.sync_session();
                 }
-                Action::Focus(f) => self.focus = f,
+                Action::Focus(f) => {
+                    self.select_all &= self.focus == f;
+                    self.focus = f;
+                }
                 Action::NewTask => self.open_dialog(),
                 Action::CloseDialog => {
                     self.dialog = None;
@@ -650,7 +719,7 @@ impl App {
                 Action::ToggleTheme => self.dark = !self.dark,
                 Action::Answer(allow) => {
                     if let Some(id) = self.current().filter(|t| t.asking).map(|t| t.id) {
-                        let _ = crate::request(&Request::Answer { id, allow, message: String::new() });
+                        let _ = request(&Request::Answer { id, allow, message: String::new() });
                     }
                 }
                 Action::Input(bytes) => self.send_input(bytes),
@@ -662,6 +731,18 @@ impl App {
                 Action::Start(attach) => self.start(attach),
             }
         }
+    }
+
+    /// Text field contents with the ⌘A highlight and a blinking caret at the end. Returns the width.
+    fn field_text(&self, r: &mut Renderer, t: &Theme, x: f32, y: f32, s: &str, font: usize, size: f32, max_w: f32, focused: bool, caret: Rgba) -> f32 {
+        let w = r.text(x, y, s, font, size, 400, t.text, max_w);
+        let h = size * 1.35;
+        if focused && self.select_all && !s.is_empty() {
+            r.rect(Rect::new(x - 1.0, y - size * 0.15, w + 2.0, h), 2.0, alpha(t.work, 0x50));
+        } else if focused && self.caret_on {
+            r.rect(Rect::new(x + w + 1.0, y - size * 0.15, 1.5, h), 0.0, caret);
+        }
+        w
     }
 
     fn hit(&self, r: Rect) -> bool {
@@ -740,12 +821,11 @@ impl App {
             r.rect(Rect::new(f.x + 8.0 + (16.0 - lw) / 2.0 * 0.7, f.y + 8.0 + i as f32 * 4.0, lw * 0.7, 1.4), 0.5, t.text3);
         }
         let n = self.tasks.len();
-        let (txt, col) = if self.filter.is_empty() && !focused {
-            (format!("Filter {n} agents"), t.text3)
+        if self.filter.is_empty() && !focused {
+            r.text(f.x + 25.0, r.center(f, UI, 12.0), &format!("Filter {n} agents"), UI, 12.0, 400, t.text3, f.w - 50.0);
         } else {
-            (format!("{}{}", self.filter, if focused { "▏" } else { "" }), t.text)
-        };
-        r.text(f.x + 25.0, r.center(f, UI, 12.0), &txt, UI, 12.0, 400, col, f.w - 50.0);
+            self.field_text(r, t, f.x + 25.0, r.center(f, UI, 12.0), &self.filter.clone(), UI, 12.0, f.w - 50.0, focused, t.work);
+        }
         r.text(f.x + f.w - 8.0 - r.measure(MONO, 10.0, 400, &mod_label("F")), r.center(f, MONO, 10.0), &mod_label("F"), MONO, 10.0, 400, t.text3, 60.0);
         if self.hit(f) {
             self.actions.push(Action::Focus(Focus::Filter));
@@ -846,12 +926,11 @@ impl App {
         let focused = self.focus == Focus::Message;
         r.frame(ib, 4.0, t.panel, if focused { t.work } else { t.border2 });
         r.text(ib.x + 10.0, r.center(ib, MONO, 12.5), "›", MONO, 12.5, 400, t.text3, 20.0);
-        let (txt, col) = if self.message.is_empty() && !focused {
-            (format!("Message {kind}  ·  {}", mod_label("I")), t.text3)
+        if self.message.is_empty() && !focused {
+            r.text(ib.x + 26.0, r.center(ib, UI, 12.5), &format!("Message {kind}  ·  {}", mod_label("I")), UI, 12.5, 400, t.text3, ib.w - 60.0);
         } else {
-            (format!("{}{}", self.message, if focused { "▏" } else { "" }), t.text)
-        };
-        r.text(ib.x + 26.0, r.center(ib, UI, 12.5), &txt, UI, 12.5, 400, col, ib.w - 60.0);
+            self.field_text(r, t, ib.x + 26.0, r.center(ib, UI, 12.5), &self.message.clone(), UI, 12.5, ib.w - 60.0, focused, t.work);
+        }
         r.text(ib.x + ib.w - 22.0, r.center(ib, MONO, 10.5), "↵", MONO, 10.5, 400, t.text3, 20.0);
         if self.hit(ib) {
             self.actions.push(Action::Focus(Focus::Message));
@@ -1021,9 +1100,15 @@ impl App {
             r.text(dlg.x + 18.0, ty + 4.0, "Describe the task", UI, 18.0, 400, t.faint, dlg.w - 36.0);
         }
         for (i, line) in prompt_lines.iter().enumerate() {
-            let lw = r.text(dlg.x + 18.0, ty + 4.0 + i as f32 * 27.0, line, UI, 18.0, 400, t.text, dlg.w - 36.0);
-            if prompt_focus && i == prompt_lines.len() - 1 {
-                r.rect(Rect::new(dlg.x + 19.0 + lw, ty + 6.0 + i as f32 * 27.0, 1.5, 20.0), 0.0, a);
+            let last = i == prompt_lines.len() - 1;
+            let y = ty + 4.0 + i as f32 * 27.0;
+            if last {
+                self.field_text(r, t, dlg.x + 18.0, y, line, UI, 18.0, dlg.w - 36.0, prompt_focus, a);
+            } else {
+                let lw = r.text(dlg.x + 18.0, y, line, UI, 18.0, 400, t.text, dlg.w - 36.0);
+                if prompt_focus && self.select_all {
+                    r.rect(Rect::new(dlg.x + 17.0, y - 2.0, lw + 2.0, 24.0), 2.0, alpha(t.work, 0x50));
+                }
             }
         }
         let prompt_area = Rect::new(dlg.x, ty, dlg.w, text_h + 16.0);
@@ -1057,8 +1142,11 @@ impl App {
         r.text(bx, gy + 14.0, "Branch", UI, 11.0, 400, t.text3, 100.0);
         let row = Rect::new(bx, gy + 36.0, dlg.w / 2.0 - 36.0, 28.0);
         let base_focus = self.focus == Focus::Base;
-        let shown = format!("{base}{}", if base_focus { "▏" } else { "" });
-        let bw = r.text(row.x, r.center(row, MONO, 12.0), &shown, MONO, 12.0, 400, if base_focus { t.text } else { t.text3 }, 160.0);
+        let bw = if base_focus {
+            self.field_text(r, t, row.x, r.center(row, MONO, 12.0), &base, MONO, 12.0, 160.0, true, a) + 4.0
+        } else {
+            r.text(row.x, r.center(row, MONO, 12.0), &base, MONO, 12.0, 400, t.text3, 160.0)
+        };
         if self.hit(Rect::new(row.x - 4.0, row.y, bw + 8.0, row.h)) {
             self.actions.push(Action::Focus(Focus::Base));
         }

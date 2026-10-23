@@ -7,6 +7,9 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 
 const MAX_FRAME: usize = 64 << 20;
+/// Bump whenever Request/Reply change shape. A daemon left running from an older build
+/// can't decode newer messages, so clients check this before anything else.
+pub const VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -29,6 +32,8 @@ pub enum Request {
     Watch,
     Input(Vec<u8>),
     Resize { cols: u16, rows: u16 },
+    /// Sent first on every client connection; see `VERSION`.
+    Version,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -44,6 +49,7 @@ pub enum Reply {
     Output(Vec<u8>),
     Exited,
     Error(String),
+    Version(u32),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

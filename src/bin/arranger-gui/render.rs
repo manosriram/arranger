@@ -10,7 +10,7 @@ use swash::{FontRef, NormalizedCoord};
 
 pub const UI: usize = 0;
 pub const MONO: usize = 1;
-const BUNDLED: [&[u8]; 2] = [include_bytes!("../../assets/fonts/Geist.ttf"), include_bytes!("../../assets/fonts/GeistMono.ttf")];
+const BUNDLED: [&[u8]; 2] = [include_bytes!("../../../assets/fonts/Geist.ttf"), include_bytes!("../../../assets/fonts/GeistMono.ttf")];
 /// System fonts tried, in order, for glyphs Geist lacks (❯ ⏺ ⎿ ✳ …). Missing files are skipped.
 const FALLBACKS: &[&str] = &[
     "/System/Library/Fonts/Menlo.ttc",

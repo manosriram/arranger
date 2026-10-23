@@ -1,26 +1,20 @@
-mod adapter;
-mod daemon;
-mod gui;
-mod proto;
-mod pty;
-mod screen;
-
-use proto::{Reply, Request};
+use arranger::client::{connect, request};
+use arranger::proto::{self, Reply, Request};
+use arranger::{adapter, daemon};
 use rustix::termios::{self, OptionalActions};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use std::{env, thread};
 
 const USAGE: &str = "usage: arranger            open the workspace window
        arranger [ls [--files] | new <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
-                 | approve <id> | deny <id> [reason] | events <id> | ping | serve | hook <adapter>]";
+                 | approve <id> | deny <id> [reason] | events <id> | ping | stop | serve | hook <adapter>]";
 /// Ctrl-\, raw and in kitty keyboard encoding.
 const DETACH: &[&[u8]] = &[b"\x1c", b"\x1b[92;5u"];
 
@@ -29,7 +23,7 @@ fn main() {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args[..] {
         ["serve"] => daemon::run(),
-        [] => gui::run(),
+        [] => gui(),
         ["ls"] => ls(false),
         ["ls", "--files"] => ls(true),
         ["hook", adapter] => {
@@ -40,6 +34,7 @@ fn main() {
         ["deny", id, ref reason @ ..] => parse_id(id).and_then(|id| answer(id, false, reason.join(" "))),
         ["events", id] => parse_id(id).and_then(events),
         ["ping"] => request(&Request::Ping).map(|_| println!("pong")),
+        ["stop"] => arranger::client::stop(),
         ["new", agent, "--branch", base, ref prompt @ ..] => new(agent, Some(base), prompt),
         ["new", agent, ref prompt @ ..] => new(agent, None, prompt),
         ["attach", id] => parse_id(id).and_then(attach),
@@ -55,45 +50,19 @@ fn main() {
     }
 }
 
+/// Replaces this process with `arranger-gui`, found next to this binary or on PATH.
+fn gui() -> io::Result<()> {
+    let sibling = env::current_exe()?.with_file_name("arranger-gui");
+    let program = if sibling.exists() { sibling } else { "arranger-gui".into() };
+    Err(Command::new(program).exec())
+}
+
 fn parse_id(s: &str) -> io::Result<u64> {
     s.parse().map_err(|_| io::Error::other(format!("bad task id: {s}")))
 }
 
 fn unexpected(reply: Reply) -> io::Error {
     io::Error::other(format!("unexpected reply: {reply:?}"))
-}
-
-/// Connects to the daemon, starting it detached if nothing is listening.
-fn connect() -> io::Result<UnixStream> {
-    let sock = proto::socket_path();
-    if let Ok(s) = UnixStream::connect(&sock) {
-        return Ok(s);
-    }
-    let data = proto::data_dir();
-    fs::create_dir_all(&data)?;
-    let log = File::options().create(true).append(true).open(data.join("daemon.log"))?;
-    let mut cmd = Command::new(env::current_exe()?);
-    cmd.arg("serve").stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
-    unsafe {
-        cmd.pre_exec(|| Ok(rustix::process::setsid().map(drop)?));
-    }
-    cmd.spawn()?;
-    for _ in 0..100 {
-        thread::sleep(Duration::from_millis(20));
-        if let Ok(s) = UnixStream::connect(&sock) {
-            return Ok(s);
-        }
-    }
-    Err(io::Error::other(format!("daemon did not start, see {}", data.join("daemon.log").display())))
-}
-
-fn request(req: &Request) -> io::Result<Reply> {
-    let mut s = connect()?;
-    s.write_all(&proto::frame(req))?;
-    match proto::read_msg(&mut s)? {
-        Reply::Error(e) => Err(io::Error::other(e)),
-        reply => Ok(reply),
-    }
 }
 
 fn ls(files: bool) -> io::Result<()> {

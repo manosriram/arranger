@@ -101,6 +101,7 @@ pub fn run() -> io::Result<()> {
     let _ = fs::remove_file(&sock);
     let mut listener = UnixListener::bind(&sock)?;
     fs::set_permissions(&sock, Permissions::from_mode(0o600))?;
+    fs::write(data.join("daemon.pid"), std::process::id().to_string())?;
 
     let db = Connection::open(data.join("arranger.db")).map_err(io::Error::other)?;
     db.execute_batch(
@@ -291,6 +292,7 @@ impl Daemon {
         let attached = self.conns.get(&t).and_then(|c| c.attached);
         let reply = match req {
             Request::Ping => Reply::Pong,
+            Request::Version => Reply::Version(proto::VERSION),
             Request::List { files } => match self.list(files) {
                 Ok(tasks) => Reply::Tasks(tasks),
                 Err(e) => Reply::Error(e),
@@ -749,5 +751,6 @@ impl Daemon {
             flush_log(&self.data, id, &mut task.log, &mut self.zstd);
         }
         let _ = fs::remove_file(sock);
+        let _ = fs::remove_file(self.data.join("daemon.pid"));
     }
 }
