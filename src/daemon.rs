@@ -37,6 +37,8 @@ struct Task {
     viewers: Vec<Token>,
     osc: Osc,
     activity: Activity,
+    /// What put the task in needs-you.
+    need: Option<Event>,
     /// Live action line, e.g. "editing src/pty.rs".
     action: String,
 }
@@ -64,6 +66,9 @@ struct Conn {
     inbuf: Vec<u8>,
     outbuf: Vec<u8>,
     attached: Option<u64>,
+    /// Attached from a terminal: asks are answered in the agent's own UI.
+    native: bool,
+    watching: bool,
     writable: bool,
 }
 
@@ -81,6 +86,8 @@ struct Daemon {
     sigchld: StdUnixStream,
     next_conn: usize,
     max_live: usize,
+    /// Some task changed; push the list to watchers after this loop turn.
+    dirty: bool,
 }
 
 pub fn run() -> io::Result<()> {
@@ -108,6 +115,10 @@ pub fn run() -> io::Result<()> {
          DELETE FROM tasks WHERE state = 'new';",
     )
     .map_err(io::Error::other)?;
+    // Columns added after Phase 1; errors just mean they're already there.
+    for col in ["created INTEGER NOT NULL DEFAULT 0", "title TEXT NOT NULL DEFAULT ''", "prompt TEXT NOT NULL DEFAULT ''"] {
+        let _ = db.execute(&format!("ALTER TABLE tasks ADD COLUMN {col}"), []);
+    }
 
     let poll = Poll::new()?;
     poll.registry().register(&mut listener, LISTENER, Interest::READABLE)?;
@@ -129,6 +140,7 @@ pub fn run() -> io::Result<()> {
         sigchld,
         next_conn: 3,
         max_live: std::env::var("ARRANGER_MAX_AGENTS").ok().and_then(|v| v.parse().ok()).unwrap_or(20),
+        dirty: false,
     };
     d.start_queued();
 
@@ -151,6 +163,10 @@ pub fn run() -> io::Result<()> {
                 Token(t) if t >= TASK => d.read_task((t - TASK) as u64),
                 t => d.conn_event(t, ev.is_readable(), ev.is_writable()),
             }
+        }
+        if d.dirty {
+            d.dirty = false;
+            d.push_tasks();
         }
     }
 }
@@ -205,6 +221,10 @@ fn write_pty(master: &OwnedFd, mut bytes: &[u8]) {
     }
 }
 
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
 fn e2s(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
@@ -215,7 +235,15 @@ impl Daemon {
             let t = Token(self.next_conn);
             self.next_conn += 1;
             if self.poll.registry().register(&mut stream, t, Interest::READABLE).is_ok() {
-                let conn = Conn { stream, inbuf: Vec::new(), outbuf: Vec::new(), attached: None, writable: false };
+                let conn = Conn {
+                    stream,
+                    inbuf: Vec::new(),
+                    outbuf: Vec::new(),
+                    attached: None,
+                    native: false,
+                    watching: false,
+                    writable: false,
+                };
                 self.conns.insert(t, conn);
             }
         }
@@ -267,7 +295,7 @@ impl Daemon {
                 Ok(tasks) => Reply::Tasks(tasks),
                 Err(e) => Reply::Error(e),
             },
-            Request::New { agent, repo, base } => match self.create(&agent, &repo, base.as_deref()) {
+            Request::New { agent, repo, base, prompt } => match self.create(&agent, &repo, base.as_deref(), prompt.as_deref().unwrap_or("")) {
                 Ok(id) => Reply::Created { id, state: self.state(id) },
                 Err(e) => Reply::Error(e),
             },
@@ -285,31 +313,43 @@ impl Daemon {
             }
             Request::Ask { task, event } => {
                 self.record(task, event);
-                // ponytail: any viewer means a human is watching the agent's own prompt; Phase 3's GUI may want to answer here instead
-                if self.tasks.get(&task).is_some_and(|t| t.viewers.is_empty()) {
+                if !self.has_native_viewer(task) {
                     self.asks.push((task, t));
                     return;
                 }
                 Reply::Decision { allow: None, message: String::new() }
+            }
+            Request::Watch => {
+                if let Some(c) = self.conns.get_mut(&t) {
+                    c.watching = true;
+                }
+                match self.list(false) {
+                    Ok(tasks) => Reply::Tasks(tasks),
+                    Err(e) => Reply::Error(e),
+                }
             }
             Request::Answer { id, allow, message } => match self.asks.iter().position(|a| a.0 == id) {
                 Some(i) => {
                     let (_, hook) = self.asks.remove(i);
                     self.send(hook, &proto::frame(&Reply::Decision { allow: Some(allow), message }));
                     self.resume(id);
+                    self.dirty = true;
                     Reply::Ok
                 }
                 None => Reply::Error(format!("task {id} isn't waiting on a permission ask")),
             },
-            Request::Attach { id, cols, rows } => {
+            Request::Attach { id, cols, rows, native } => {
                 self.detach(t);
-                self.release_asks(id);
+                if native {
+                    self.release_asks(id);
+                }
                 match self.tasks.get_mut(&id) {
                     Some(task) => {
                         task.viewers.push(t);
                         self.resize(id, cols, rows);
                         if let Some(c) = self.conns.get_mut(&t) {
                             c.attached = Some(id);
+                            c.native = native;
                         }
                         Reply::Output(self.tasks[&id].screen.snapshot())
                     }
@@ -379,7 +419,9 @@ impl Daemon {
 
     fn close(&mut self, t: Token) {
         self.detach(t);
+        let before = self.asks.len();
         self.asks.retain(|a| a.1 != t);
+        self.dirty |= self.asks.len() != before;
         self.conns.remove(&t);
     }
 
@@ -429,6 +471,7 @@ impl Daemon {
     /// Stores an event and updates the task's derived state and action line.
     fn record(&mut self, id: u64, event: Event) {
         let Some(task) = self.tasks.get_mut(&id) else { return };
+        self.dirty = true;
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let json = serde_json::to_string(&event).unwrap();
         if let Err(e) = self.db.execute("INSERT INTO events (task, ts, event) VALUES (?1, ?2, ?3)", params![id, ts, json]) {
@@ -445,8 +488,28 @@ impl Daemon {
             Event::ToolStart { .. } => (Activity::Running, event.describe()),
             Event::Prompt { .. } | Event::ToolEnd { .. } => (Activity::Running, "working".into()),
         };
+        task.need = (activity == Activity::NeedsYou).then(|| event.clone());
         task.activity = activity;
         task.action = action;
+        if let Event::Prompt { text } = &event {
+            let _ = self.db.execute("UPDATE tasks SET title = ?1 WHERE id = ?2 AND title = ''", params![text, id]);
+        }
+    }
+
+    fn has_native_viewer(&self, id: u64) -> bool {
+        self.tasks.get(&id).is_some_and(|t| t.viewers.iter().any(|v| self.conns.get(v).is_some_and(|c| c.native)))
+    }
+
+    fn push_tasks(&mut self) {
+        let watchers: Vec<Token> = self.conns.iter().filter(|(_, c)| c.watching).map(|(&t, _)| t).collect();
+        if watchers.is_empty() {
+            return;
+        }
+        let Ok(tasks) = self.list(false) else { return };
+        let frame = proto::frame(&Reply::Tasks(tasks));
+        for t in watchers {
+            self.send(t, &frame);
+        }
     }
 
     /// A human answered (approve/deny or typing): back to running unless more asks wait.
@@ -456,6 +519,8 @@ impl Daemon {
             if task.activity == Activity::NeedsYou && !waiting {
                 task.activity = Activity::Running;
                 task.action = "working".into();
+                task.need = None;
+                self.dirty = true;
             }
         }
     }
@@ -465,6 +530,7 @@ impl Daemon {
         let frame = proto::frame(&Reply::Decision { allow: None, message: String::new() });
         let (mine, rest): (Vec<_>, Vec<_>) = self.asks.drain(..).partition(|a| a.0 == id);
         self.asks = rest;
+        self.dirty |= !mine.is_empty();
         for (_, hook) in mine {
             self.send(hook, &frame);
         }
@@ -498,13 +564,14 @@ impl Daemon {
         self.set_state(id, state);
     }
 
-    fn create(&mut self, agent: &str, dir: &Path, base: Option<&str>) -> Result<u64, String> {
+    fn create(&mut self, agent: &str, dir: &Path, base: Option<&str>, prompt: &str) -> Result<u64, String> {
         let top = PathBuf::from(git(git_in(dir).args(["rev-parse", "--show-toplevel"]))?);
         let repo_name = top.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         self.db
             .execute(
-                "INSERT INTO tasks (agent, repo, branch, worktree, state) VALUES (?1, ?2, '', '', 'new')",
-                params![agent, top.to_string_lossy()],
+                "INSERT INTO tasks (agent, repo, branch, worktree, state, created, title, prompt)
+                 VALUES (?1, ?2, '', '', 'new', ?3, ?4, ?4)",
+                params![agent, top.to_string_lossy(), now_secs(), prompt],
             )
             .map_err(e2s)?;
         let id = self.db.last_insert_rowid() as u64;
@@ -541,13 +608,13 @@ impl Daemon {
     }
 
     fn start(&mut self, id: u64) -> Result<(), String> {
-        let (agent, repo, wt): (String, String, String) = self
+        let (agent, repo, wt, prompt): (String, String, String, String) = self
             .db
-            .query_row("SELECT agent, repo, worktree FROM tasks WHERE id = ?1", [id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            .query_row("SELECT agent, repo, worktree, prompt FROM tasks WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .map_err(e2s)?;
-        let (argv, env) = adapter::launch(&agent, &self.exe, &self.data).map_err(e2s)?;
+        let (argv, env) = adapter::launch(&agent, &prompt, &self.exe, &self.data).map_err(e2s)?;
         let mut cmd = if Path::new(&wt).join(".arranger/setup").exists() {
             let mut sh = Command::new("sh");
             sh.args(["-c", "./.arranger/setup && exec \"$0\" \"$@\""]).args(&argv);
@@ -581,6 +648,7 @@ impl Daemon {
             viewers: Vec::new(),
             osc: Osc::default(),
             activity: Activity::Running,
+            need: None,
             action: String::new(),
         };
         self.tasks.insert(id, task);
@@ -606,13 +674,14 @@ impl Daemon {
         let _ = fs::remove_file(self.data.join(format!("logs/{id}.zst")));
         self.db.execute("DELETE FROM tasks WHERE id = ?1", [id]).map_err(e2s)?;
         self.db.execute("DELETE FROM events WHERE task = ?1", [id]).map_err(e2s)?;
+        self.dirty = true;
         self.start_queued();
         Ok(())
     }
 
     fn list(&self, with_files: bool) -> Result<Vec<TaskInfo>, String> {
         let mut stmt =
-            self.db.prepare("SELECT id, agent, branch, worktree, state FROM tasks ORDER BY id").map_err(e2s)?;
+            self.db.prepare("SELECT id, agent, branch, worktree, state, title, created FROM tasks ORDER BY id").map_err(e2s)?;
         let rows = stmt.query_map([], |r| {
             Ok(TaskInfo {
                 id: r.get(0)?,
@@ -622,6 +691,10 @@ impl Daemon {
                 state: r.get(4)?,
                 action: String::new(),
                 files: Vec::new(),
+                title: r.get(5)?,
+                created: r.get(6)?,
+                need: None,
+                asking: false,
             })
         });
         let mut tasks: Vec<TaskInfo> = rows.and_then(Iterator::collect).map_err(e2s)?;
@@ -629,6 +702,8 @@ impl Daemon {
             if let Some(task) = self.tasks.get(&info.id) {
                 info.state = task.activity.name().into();
                 info.action = task.action.clone();
+                info.need = task.need.clone();
+                info.asking = self.asks.iter().any(|a| a.0 == info.id);
             }
             if with_files {
                 info.files = self.files(info.id).map_err(e2s)?;
@@ -661,7 +736,8 @@ impl Daemon {
         self.db.query_row("SELECT state FROM tasks WHERE id = ?1", [id], |r| r.get(0)).unwrap_or_default()
     }
 
-    fn set_state(&self, id: u64, state: &str) {
+    fn set_state(&mut self, id: u64, state: &str) {
+        self.dirty = true;
         if let Err(e) = self.db.execute("UPDATE tasks SET state = ?1 WHERE id = ?2", params![state, id]) {
             eprintln!("task {id}: {e}");
         }

@@ -11,7 +11,8 @@ const MAX_FRAME: usize = 64 << 20;
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
     Ping,
-    New { agent: String, repo: PathBuf, base: Option<String> },
+    /// `prompt` is passed to the agent as its first message.
+    New { agent: String, repo: PathBuf, base: Option<String>, prompt: Option<String> },
     List { files: bool },
     Kill { id: u64 },
     Events { id: u64 },
@@ -21,7 +22,11 @@ pub enum Request {
     Ask { task: u64, event: Event },
     Answer { id: u64, allow: bool, message: String },
     /// Turns the connection into a stream: Output/Exited down, Input/Resize up.
-    Attach { id: u64, cols: u16, rows: u16 },
+    /// `native`: the viewer answers permission asks in the agent's own UI (terminal attach),
+    /// rather than through Answer (GUI).
+    Attach { id: u64, cols: u16, rows: u16, native: bool },
+    /// Subscribes to `Tasks` pushes whenever any task changes.
+    Watch,
     Input(Vec<u8>),
     Resize { cols: u16, rows: u16 },
 }
@@ -41,7 +46,7 @@ pub enum Reply {
     Error(String),
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TaskInfo {
     pub id: u64,
     pub agent: String,
@@ -51,6 +56,14 @@ pub struct TaskInfo {
     /// What the agent is doing right now, e.g. "editing src/pty.rs".
     pub action: String,
     pub files: Vec<String>,
+    /// First prompt, or "" before there is one.
+    pub title: String,
+    /// Unix seconds.
+    pub created: u64,
+    /// The event that put the task in needs-you, while it's there.
+    pub need: Option<Event>,
+    /// A permission ask is waiting on Answer.
+    pub asking: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
@@ -70,7 +83,11 @@ pub enum Event {
     ToolStart { kind: ToolKind, target: String },
     ToolEnd { ok: bool },
     PermissionRequest { tool: String, detail: String },
-    Question { text: String },
+    Question {
+        text: String,
+        #[serde(default)]
+        options: Vec<String>,
+    },
     /// OSC 9/777 terminal notification.
     Attention { text: String },
     TurnDone,
@@ -97,7 +114,7 @@ impl Event {
             Event::ToolEnd { ok: true } => "tool done".into(),
             Event::ToolEnd { ok: false } => "tool failed".into(),
             Event::PermissionRequest { tool, detail } => format!("wants {tool}: {detail}"),
-            Event::Question { text } => format!("asks: {text}"),
+            Event::Question { text, .. } => format!("asks: {text}"),
             Event::Attention { text } => format!("notice: {text}"),
             Event::TurnDone => "done".into(),
             Event::Error { message } => format!("error: {message}"),

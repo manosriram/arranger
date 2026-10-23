@@ -1,5 +1,6 @@
 mod adapter;
 mod daemon;
+mod gui;
 mod proto;
 mod pty;
 mod screen;
@@ -17,7 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{env, thread};
 
-const USAGE: &str = "usage: arranger [ls [--files] | new <agent> [--branch <base>] | attach <id> | kill <id>
+const USAGE: &str = "usage: arranger            open the workspace window
+       arranger [ls [--files] | new <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
                  | approve <id> | deny <id> [reason] | events <id> | ping | serve | hook <adapter>]";
 /// Ctrl-\, raw and in kitty keyboard encoding.
 const DETACH: &[&[u8]] = &[b"\x1c", b"\x1b[92;5u"];
@@ -27,7 +29,8 @@ fn main() {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args[..] {
         ["serve"] => daemon::run(),
-        [] | ["ls"] => ls(false),
+        [] => gui::run(),
+        ["ls"] => ls(false),
         ["ls", "--files"] => ls(true),
         ["hook", adapter] => {
             let _ = hook(adapter); // never fail the agent's hook; it carries on without us
@@ -37,8 +40,8 @@ fn main() {
         ["deny", id, ref reason @ ..] => parse_id(id).and_then(|id| answer(id, false, reason.join(" "))),
         ["events", id] => parse_id(id).and_then(events),
         ["ping"] => request(&Request::Ping).map(|_| println!("pong")),
-        ["new", agent] => new(agent, None),
-        ["new", agent, "--branch", base] => new(agent, Some(base)),
+        ["new", agent, "--branch", base, ref prompt @ ..] => new(agent, Some(base), prompt),
+        ["new", agent, ref prompt @ ..] => new(agent, None, prompt),
         ["attach", id] => parse_id(id).and_then(attach),
         ["kill", id] => parse_id(id).and_then(|id| request(&Request::Kill { id }).map(drop)),
         _ => {
@@ -144,8 +147,9 @@ fn hook(adapter: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn new(agent: &str, base: Option<&str>) -> io::Result<()> {
-    let req = Request::New { agent: agent.into(), repo: env::current_dir()?, base: base.map(Into::into) };
+fn new(agent: &str, base: Option<&str>, prompt: &[&str]) -> io::Result<()> {
+    let prompt = Some(prompt.join(" ")).filter(|p| !p.is_empty());
+    let req = Request::New { agent: agent.into(), repo: env::current_dir()?, base: base.map(Into::into), prompt };
     match request(&req)? {
         Reply::Created { id, state } => Ok(println!("{id} {state}")),
         reply => Err(unexpected(reply)),
@@ -161,7 +165,7 @@ fn attach(id: u64) -> io::Result<()> {
     let tty = File::options().read(true).write(true).open("/dev/tty")?;
     let (cols, rows) = tty_size(&tty)?;
     let mut sock = connect()?;
-    sock.write_all(&proto::frame(&Request::Attach { id, cols, rows }))?;
+    sock.write_all(&proto::frame(&Request::Attach { id, cols, rows, native: true }))?;
     let snapshot = match proto::read_msg(&mut sock)? {
         Reply::Output(bytes) => bytes,
         Reply::Error(e) => return Err(io::Error::other(e)),

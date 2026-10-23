@@ -61,6 +61,14 @@ impl Screen {
         self.replies.0.take()
     }
 
+    pub fn grid(&self) -> &alacritty_terminal::Grid<Cell> {
+        self.term.grid()
+    }
+
+    pub fn mode(&self) -> TermMode {
+        *self.term.mode()
+    }
+
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.term.resize(Size { cols: cols.into(), rows: rows.into() });
     }

@@ -29,7 +29,7 @@ pub const PARENT_SESSION_ENV: &[&str] = &[
 ];
 
 /// Program, args and extra env that start `agent` with arranger's hooks installed.
-pub fn launch(agent: &str, exe: &Path, data: &Path) -> io::Result<(Vec<String>, Vec<(String, String)>)> {
+pub fn launch(agent: &str, prompt: &str, exe: &Path, data: &Path) -> io::Result<(Vec<String>, Vec<(String, String)>)> {
     let hook = |name: &str| format!("'{}' hook {name}", exe.display());
     let mut argv = vec![agent.to_string()];
     let mut env = vec![("ARRANGER_BIN".to_string(), exe.display().to_string())];
@@ -70,6 +70,12 @@ pub fn launch(agent: &str, exe: &Path, data: &Path) -> io::Result<(Vec<String>, 
         }
         _ => {}
     }
+    if !prompt.is_empty() {
+        if kind(agent) == "gemini" {
+            argv.push("-i".into()); // gemini's positional prompt runs non-interactively
+        }
+        argv.push(prompt.into());
+    }
     Ok((argv, env))
 }
 
@@ -103,7 +109,7 @@ pub fn parse(adapter: &str, v: &Value, totals: &mut Totals) -> (Vec<Event>, bool
         }
         "Notification" => match v["notification_type"].as_str().unwrap_or("") {
             "elicitation_dialog" | "elicitation_url_dialog" | "agent_needs_input" => {
-                vec![Event::Question { text: str(&v["message"]) }]
+                vec![Event::Question { text: str(&v["message"]), options: Vec::new() }]
             }
             "ToolPermission" => vec![Event::PermissionRequest { tool: "tool".into(), detail: str(&v["message"]) }],
             _ => vec![],
@@ -150,7 +156,11 @@ fn tool_start(tool: &str, input: &Value, cwd: &str) -> Vec<Event> {
         relative(&p.unwrap_or_default(), cwd)
     };
     let (kind, target) = match tool {
-        "AskUserQuestion" => return vec![Event::Question { text: str(&input["questions"][0]["question"]) }],
+        "AskUserQuestion" => {
+            let q = &input["questions"][0];
+            let options = q["options"].as_array().into_iter().flatten().map(|o| str(&o["label"])).collect();
+            return vec![Event::Question { text: str(&q["question"]), options }];
+        }
         "apply_patch" => {
             let files: Vec<Event> = patch_files(&str(&input["command"]))
                 .map(|f| Event::ToolStart { kind: ToolKind::Edit, target: relative(f, cwd) })
