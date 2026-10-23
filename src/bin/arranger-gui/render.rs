@@ -108,6 +108,8 @@ pub enum Cursor {
     Arrow,
     Pointer,
     Text,
+    /// A divider that drags left and right.
+    Resize,
 }
 
 pub struct Renderer {

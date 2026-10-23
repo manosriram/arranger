@@ -5,8 +5,7 @@ use super::*;
 use arranger::proto::{FileDiff, Hunk};
 use std::collections::HashSet;
 
-const STRIP_H: f32 = 56.0;
-const RAIL_W: f32 = 280.0;
+pub const STRIP_H: f32 = 56.0;
 const BAR_H: f32 = 62.0;
 const LINE: f32 = 21.0;
 const HUNK_H: f32 = 36.0;
@@ -358,7 +357,8 @@ impl App {
         r.rect(Rect::new(area.x, strip.y + STRIP_H - 1.0, area.w, 1.0), 0.0, t.border);
         let back = Rect::new(area.x + 24.0, strip.y + 14.0, 28.0, 28.0);
         r.frame(back, 4.0, t.bg, t.border2);
-        r.text(back.x + 8.0, r.center(back, MONO, 14.0), "←", MONO, 14.0, 400, t.tc, 20.0);
+        // Drawn, not a glyph: the font's arrow sits off its box's centre.
+        r.path(7, "M46 32L18 32M30 19L17 32L30 45", Some(6.0), back.x + 6.0, back.y + 6.0, 16.0, t.tc);
         if self.hit(r, back) {
             acts.push(ReviewAction::Close);
         }
@@ -409,9 +409,9 @@ impl App {
         let files: &[FileDiff] = rv.data.as_ref().map_or(&[], |d| &d.files);
 
         // Left rail.
-        let rail = Rect::new(body.x, body.y, RAIL_W, body.h);
+        let rail = Rect::new(body.x, body.y, self.rail_w, body.h);
         r.rect(rail, 0.0, t.panel);
-        r.rect(Rect::new(rail.x + RAIL_W - 1.0, rail.y, 1.0, rail.h), 0.0, t.border);
+        r.rect(Rect::new(rail.x + self.rail_w - 1.0, rail.y, 1.0, rail.h), 0.0, t.border);
         r.set_clip(Some(rail));
         let mut y = rail.y + 16.0;
         let section = |r: &mut Renderer, y: f32, label: &str| {
@@ -424,7 +424,7 @@ impl App {
             y += 28.0;
         }
         for (i, f) in files.iter().enumerate() {
-            let row = Rect::new(rail.x + 8.0, y, RAIL_W - 17.0, 32.0);
+            let row = Rect::new(rail.x + 8.0, y, self.rail_w - 17.0, 32.0);
             let on = i == rv.file;
             if on {
                 r.frame(row, 4.0, t.sel, t.sel_ring);
@@ -452,7 +452,7 @@ impl App {
             section(r, y, "CHECKS");
             y += 24.0;
             for (cmd, ok) in &d.checks {
-                let row = Rect::new(rail.x + 16.0, y, RAIL_W - 32.0, 20.0);
+                let row = Rect::new(rail.x + 16.0, y, self.rail_w - 32.0, 20.0);
                 let (icon, ic, label) = match ok {
                     Some(true) => ("✓", t.add, "passed"),
                     Some(false) => ("✗", t.del, "failed"),
@@ -468,12 +468,12 @@ impl App {
         if let Some(summary) = rv.data.as_ref().map(|d| d.summary.trim()).filter(|s| !s.is_empty()) {
             y += 18.0;
             section(r, y, "AGENT SUMMARY");
-            draw_markdown(r, t, summary, rail.x + 16.0, y + 24.0, RAIL_W - 32.0, rail.y + rail.h - 20.0);
+            draw_markdown(r, t, summary, rail.x + 16.0, y + 24.0, self.rail_w - 32.0, rail.y + rail.h - 20.0);
         }
         r.set_clip(None);
 
         // Diff column and commit bar.
-        let col = Rect::new(body.x + RAIL_W, body.y, body.w - RAIL_W, body.h - BAR_H);
+        let col = Rect::new(body.x + self.rail_w, body.y, body.w - self.rail_w, body.h - BAR_H);
         r.rect(col, 0.0, t.term);
         if let Some(file) = files.get(rv.file) {
             r.set_clip(Some(col));
@@ -680,10 +680,12 @@ impl App {
         let state = if editing { "draft" } else { "saved" };
         r.text(hx + 32.0 + yw, r.center(badge, UI, 12.0), &format!("· line {}{side} · {state}", note.line), UI, 12.0, 400, t.text3, b.w - 90.0);
         let lines = wrap(r, &note.text, UI, 13.0, b.w - 28.0);
+        let caret = self.caret_for(Focus::Note, &note.text).filter(|_| editing).map(|at| caret_line(&note.text, &lines, at));
         let mut y = b.y + 38.0;
         for (k, line) in lines.iter().enumerate() {
-            if editing && k == lines.len() - 1 {
-                self.field_text(r, t, hx, y, line, UI, 13.0, b.w - 28.0, self.focus == Focus::Note, t.work);
+            if editing {
+                let at = caret.filter(|c| c.0 == k).map(|c| c.1);
+                self.field_text(r, t, hx, y, line, UI, 13.0, b.w - 28.0, self.focus == Focus::Note, at, t.work);
             } else {
                 r.text(hx, y, line, UI, 13.0, 400, t.text, b.w - 28.0);
             }
@@ -738,7 +740,7 @@ impl App {
         if rv.message.is_empty() && !focused {
             r.text(fx, r.center(field, MONO, 12.5), "commit message", MONO, 12.5, 400, t.faint, field.w - lw - 34.0);
         } else {
-            self.field_text(r, t, fx, r.center(field, MONO, 12.5), &rv.message, MONO, 12.5, field.w - lw - 34.0, focused, t.work);
+            self.field_text(r, t, fx, r.center(field, MONO, 12.5), &rv.message, MONO, 12.5, field.w - lw - 34.0, focused, self.caret_for(Focus::CommitMsg, &rv.message), t.work);
         }
         if self.hit_as(r, field, Cursor::Text) {
             acts.push(ReviewAction::FocusMessage);

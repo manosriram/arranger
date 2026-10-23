@@ -179,6 +179,13 @@ enum Action {
     AddHost,
     Reconnect(usize),
     RemoveHost(usize),
+    ShowEnded(usize),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Divider {
+    Sidebar,
+    Rail,
 }
 
 struct App {
@@ -217,6 +224,14 @@ struct App {
     collapsed: std::collections::HashSet<String>,
     /// ⌘A in a text field: the next edit replaces the whole field.
     select_all: bool,
+    /// Caret in the focused field, as a byte offset; None (or another field) is its end.
+    caret: Option<(Focus, usize)>,
+    /// Sidebar and review-rail widths, which their dividers drag.
+    sidebar_w: f32,
+    rail_w: f32,
+    dragging: Option<Divider>,
+    /// Machines whose ended tasks are listed; they're folded into one row otherwise.
+    show_ended: std::collections::HashSet<usize>,
     caret_on: bool,
     blink_at: Instant,
 }
@@ -271,6 +286,11 @@ fn run() -> io::Result<()> {
         scroll: 0.0,
         collapsed: Default::default(),
         select_all: false,
+        caret: None,
+        sidebar_w: SIDEBAR_W,
+        rail_w: 280.0,
+        dragging: None,
+        show_ended: Default::default(),
         caret_on: true,
         blink_at: Instant::now(),
     };
@@ -422,6 +442,12 @@ impl ApplicationHandler<Msg> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let dpi = self.scale() as f64;
                 self.mouse = ((position.x / dpi) as f32, (position.y / dpi) as f32);
+                if let Some(d) = self.dragging {
+                    let max = self.gfx.as_ref().map_or(1280.0, |g| g.window.inner_size().width as f32 / self.scale()) - 400.0;
+                    let w = self.mouse.0.clamp(200.0, max.max(200.0));
+                    *if d == Divider::Sidebar { &mut self.sidebar_w } else { &mut self.rail_w } = w;
+                    self.redraw();
+                }
                 self.hover_changed();
             }
             WindowEvent::CursorLeft { .. } => {
@@ -429,9 +455,13 @@ impl ApplicationHandler<Msg> for App {
                 self.hover_changed();
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                self.click = Some(self.mouse);
+                self.dragging = self.divider_at(self.mouse);
+                if self.dragging.is_none() {
+                    self.click = Some(self.mouse);
+                }
                 self.redraw();
             }
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => self.dragging = None,
             WindowEvent::MouseWheel { delta, .. } => {
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y * ROW_H,
@@ -440,7 +470,7 @@ impl ApplicationHandler<Msg> for App {
                 if let Some(rv) = self.review.as_mut().filter(|_| self.mouse.1 > TITLE_H + 56.0) {
                     rv.scroll = (rv.scroll - dy).max(0.0);
                     self.redraw();
-                } else if self.mouse.0 < SIDEBAR_W {
+                } else if self.mouse.0 < self.sidebar_w {
                     self.scroll = (self.scroll - dy).max(0.0);
                     self.redraw();
                 } else if self.review.is_none() {
@@ -448,6 +478,12 @@ impl ApplicationHandler<Msg> for App {
                     let lines = self.wheel.trunc();
                     self.wheel -= lines;
                     let id = self.selected;
+                    if let Some(s) = self.session.as_ref().filter(|s| Some(s.task) == id && lines != 0.0) {
+                        if let Some(bytes) = self.wheel_bytes(&s.screen, lines as i32) {
+                            self.send_input(bytes);
+                            return;
+                        }
+                    }
                     let screen = match (&mut self.session, &mut self.history) {
                         (Some(s), _) if Some(s.task) == id => Some(&mut s.screen),
                         (_, Some((h, screen))) if Some(*h) == id => Some(screen),
@@ -479,6 +515,8 @@ struct Section<'a> {
     key: String,
     host: Option<usize>,
     tasks: Vec<&'a TaskInfo>,
+    /// Tasks whose agent has ended, listed last; folded out of `tasks` unless shown.
+    ended: usize,
 }
 
 /// Keeps machine `m`'s daemon reachable: runs `arranger endpoint` over ssh, forwards its socket,
@@ -768,11 +806,15 @@ impl App {
         let sort = |v: &mut Vec<&TaskInfo>| v.sort_by_key(|t| (group(&t.state), std::cmp::Reverse(t.created), std::cmp::Reverse(t.id)));
         let mut needs: Vec<&TaskInfo> = self.all_tasks().filter(shown).filter(|t| group(&t.state) == 0).collect();
         sort(&mut needs);
-        let mut out = vec![Section { key: "needs".into(), host: None, tasks: needs }];
+        let mut out = vec![Section { key: "needs".into(), host: None, tasks: needs, ended: 0 }];
         for (i, h) in self.hosts.iter().enumerate().filter(|(_, h)| !h.removed) {
             let mut tasks: Vec<&TaskInfo> = h.tasks.iter().filter(shown).filter(|t| group(&t.state) != 0).collect();
             sort(&mut tasks);
-            out.push(Section { key: format!("host:{i}"), host: Some(i), tasks });
+            let ended = tasks.iter().filter(|t| group(&t.state) == 4).count();
+            if f.is_empty() && !self.show_ended.contains(&i) {
+                tasks.truncate(tasks.len() - ended);
+            }
+            out.push(Section { key: format!("host:{i}"), host: Some(i), tasks, ended });
         }
         out
     }
@@ -854,6 +896,48 @@ impl App {
             self.selected = None;
             self.sync_session();
         }
+    }
+
+    /// The sidebar's or review rail's divider under `p`, which a press starts dragging.
+    fn divider_at(&self, p: (f32, f32)) -> Option<Divider> {
+        if self.dialog.is_some() || self.add_host.is_some() || p.1 < TITLE_H {
+            return None;
+        }
+        match &self.review {
+            None => ((p.0 - self.sidebar_w).abs() <= 4.0).then_some(Divider::Sidebar),
+            Some(_) => ((p.0 - self.rail_w).abs() <= 4.0 && p.1 > TITLE_H + review::STRIP_H).then_some(Divider::Rail),
+        }
+    }
+
+    /// A full-screen agent (alternate screen, no scrollback here) scrolls its own chat: the
+    /// wheel goes to it as mouse-wheel reports, or as arrow keys when it doesn't take the mouse.
+    fn wheel_bytes(&self, screen: &Screen, lines: i32) -> Option<Vec<u8>> {
+        let mode = screen.mode();
+        if !mode.contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let up = lines > 0;
+        let n = lines.unsigned_abs() as usize;
+        if mode.intersects(TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) {
+            let cell_w = self.gfx.as_ref()?.r.advance(MONO, TERM_SIZE, 400, '0');
+            let col = ((self.mouse.0 - self.sidebar_w - 16.0) / cell_w).max(0.0) as u32 + 1;
+            let row = ((self.mouse.1 - TITLE_H - HEADER_H - 12.0) / LINE_H).max(0.0) as u32 + 1;
+            let button = if up { 64 } else { 65 };
+            let one = if mode.contains(TermMode::SGR_MOUSE) {
+                format!("\x1b[<{button};{col};{row}M").into_bytes()
+            } else {
+                vec![0x1b, b'[', b'M', 32 + button as u8, (32 + col.min(223)) as u8, (32 + row.min(223)) as u8]
+            };
+            return Some(one.repeat(n));
+        }
+        let app = mode.contains(TermMode::APP_CURSOR);
+        let key: &[u8] = match (up, app) {
+            (true, true) => b"\x1bOA",
+            (true, false) => b"\x1b[A",
+            (false, true) => b"\x1bOB",
+            (false, false) => b"\x1b[B",
+        };
+        Some(key.repeat(n))
     }
 
     /// Redraws only when the mouse crosses into another target, so moving it costs nothing otherwise.
@@ -1036,6 +1120,13 @@ impl App {
                     self.field(focus).clear();
                     self.select_all = false;
                 }
+                // ⌘← / ⌘→: start or end of the field.
+                Key::Named(k @ (NamedKey::ArrowLeft | NamedKey::ArrowRight)) if self.focus != Focus::Term => {
+                    let focus = self.focus;
+                    let end = if *k == NamedKey::ArrowLeft { 0 } else { self.field(focus).len() };
+                    self.caret = Some((focus, end));
+                    self.select_all = false;
+                }
                 Key::Named(NamedKey::ArrowDown) => self.move_selection(1),
                 Key::Named(NamedKey::ArrowUp) => self.move_selection(-1),
                 Key::Named(NamedKey::Enter) if self.dialog.is_some() => self.actions.push(Action::Start(true)),
@@ -1083,6 +1174,30 @@ impl App {
             return;
         }
         let replace = std::mem::take(&mut self.select_all);
+        let word = m.alt_key() || linux_ctrl;
+        let caret = self.caret;
+        let field = self.field(focus);
+        let at = if replace { 0 } else { caret_at(caret, focus, field) };
+        // Caret keys: ←/→ by character (⌥ by word), ↑/Home to the start, ↓/End to the end.
+        let moved = match &ev.logical_key {
+            Key::Named(NamedKey::ArrowLeft) if word => Some(word_left(field, at)),
+            Key::Named(NamedKey::ArrowLeft) => Some(field[..at].char_indices().next_back().map_or(0, |(i, _)| i)),
+            Key::Named(NamedKey::ArrowRight) if word => Some(word_right(field, at)),
+            Key::Named(NamedKey::ArrowRight) => Some(field[at..].chars().next().map_or(at, |c| at + c.len_utf8())),
+            Key::Named(NamedKey::ArrowUp | NamedKey::Home) => Some(0),
+            Key::Named(NamedKey::ArrowDown | NamedKey::End) => Some(field.len()),
+            Key::Named(NamedKey::Delete) => {
+                if at < field.len() {
+                    field.remove(at);
+                }
+                Some(at)
+            }
+            _ => None,
+        };
+        if let Some(to) = moved {
+            self.caret = Some((focus, to));
+            return;
+        }
         match &ev.logical_key {
             Key::Named(NamedKey::Escape) => {
                 if self.add_host.is_some() {
@@ -1097,7 +1212,10 @@ impl App {
                 }
             }
             Key::Named(NamedKey::Tab) if focus == Focus::Message && m.shift_key() => self.send_input(b"\x1b[Z".to_vec()), // cycles the agent's mode
-            Key::Named(NamedKey::Enter) if matches!(focus, Focus::Prompt | Focus::Note) && m.shift_key() => self.field(focus).push('\n'),
+            Key::Named(NamedKey::Enter) if matches!(focus, Focus::Prompt | Focus::Note) && m.shift_key() => {
+                self.field(focus).insert(at, '\n');
+                self.caret = Some((focus, at + 1));
+            }
             Key::Named(NamedKey::Enter) => match focus {
                 Focus::Message => {
                     let text = std::mem::take(&mut self.message);
@@ -1113,15 +1231,15 @@ impl App {
             },
             Key::Named(NamedKey::Backspace) => {
                 let field = self.field(focus);
-                if replace {
-                    field.clear();
-                } else if m.alt_key() || linux_ctrl {
-                    // Option/Alt/Ctrl+Backspace: delete the word before the caret.
-                    let keep = field.trim_end().rfind(|c: char| c.is_whitespace()).map_or(0, |i| i + 1);
-                    field.truncate(keep);
+                let from = if replace {
+                    field.len()
+                } else if word {
+                    word_left(field, at) // Option/Alt/Ctrl+Backspace: the word before the caret
                 } else {
-                    field.pop();
-                }
+                    field[..at].char_indices().next_back().map_or(0, |(i, _)| i)
+                };
+                field.drain(from.min(at)..from.max(at));
+                self.caret = Some((focus, from.min(at)));
                 self.scroll = 0.0;
             }
             _ => {
@@ -1130,7 +1248,9 @@ impl App {
                     if replace {
                         field.clear();
                     }
-                    field.extend(text.chars().filter(|c| !c.is_control()));
+                    let text: String = text.chars().filter(|c| !c.is_control()).collect();
+                    field.insert_str(at, &text);
+                    self.caret = Some((focus, at + text.len()));
                 } else {
                     self.select_all = replace; // modifiers and other keys keep the selection
                 }
@@ -1174,7 +1294,11 @@ impl App {
             if std::mem::take(&mut self.select_all) {
                 self.field(focus).clear();
             }
-            self.field(focus).push_str(&text);
+            let caret = self.caret;
+            let field = self.field(focus);
+            let at = caret_at(caret, focus, field);
+            field.insert_str(at, &text);
+            self.caret = Some((focus, at + text.len()));
         }
     }
 
@@ -1242,6 +1366,11 @@ impl App {
                         let _ = tx.send(());
                     }
                 }
+                Action::ShowEnded(m) => {
+                    if !self.show_ended.remove(&m) {
+                        self.show_ended.insert(m);
+                    }
+                }
                 Action::RemoveHost(m) => {
                     if self.remove_armed == Some(m) {
                         self.remove_armed = None;
@@ -1254,16 +1383,25 @@ impl App {
         }
     }
 
-    /// Text field contents with the ⌘A highlight and a blinking caret at the end. Returns the width.
-    fn field_text(&self, r: &mut Renderer, t: &Theme, x: f32, y: f32, s: &str, font: usize, size: f32, max_w: f32, focused: bool, caret: Rgba) -> f32 {
+    /// Text field contents with the ⌘A highlight and, at byte `caret` of `s`, a blinking I-beam
+    /// caret. Returns the width.
+    fn field_text(&self, r: &mut Renderer, t: &Theme, x: f32, y: f32, s: &str, font: usize, size: f32, max_w: f32, focused: bool, caret: Option<usize>, color: Rgba) -> f32 {
         let w = r.text(x, y, s, font, size, 400, t.text, max_w);
-        let h = size * 1.35;
+        let (top, h) = (y - size * 0.15, size * 1.35);
         if focused && self.select_all && !s.is_empty() {
-            r.rect(Rect::new(x - 1.0, y - size * 0.15, w + 2.0, h), 2.0, alpha(t.work, 0x50));
-        } else if focused && self.caret_on {
-            r.rect(Rect::new(x + w + 1.0, y - size * 0.15, 1.5, h), 0.0, caret);
+            r.rect(Rect::new(x - 1.0, top, w + 2.0, h), 2.0, alpha(t.work, 0x50));
+        } else if let Some(at) = caret.filter(|_| focused && self.caret_on) {
+            let cx = x + 1.0 + if at >= s.len() { w } else { r.measure(font, size, 400, &s[..at]).min(w) };
+            r.rect(Rect::new(cx, top, 1.5, h), 0.0, color);
+            r.rect(Rect::new(cx - 2.0, top, 5.5, 1.5), 0.0, color);
+            r.rect(Rect::new(cx - 2.0, top + h - 1.5, 5.5, 1.5), 0.0, color);
         }
         w
+    }
+
+    /// The caret's byte offset in `s` while field `focus` has focus.
+    fn caret_for(&self, focus: Focus, s: &str) -> Option<usize> {
+        (self.focus == focus).then(|| caret_at(self.caret, focus, s))
     }
 
     /// A button or row: was it clicked this frame? Hover gives it a tint and a hand cursor.
@@ -1292,8 +1430,10 @@ impl App {
             self.draw_review(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H - STATUS_H));
         } else {
             self.draw_sidebar(r, t, h);
-            self.draw_main(r, t, Rect::new(SIDEBAR_W, TITLE_H, w - SIDEBAR_W, h - TITLE_H - STATUS_H));
+            self.draw_main(r, t, Rect::new(self.sidebar_w, TITLE_H, w - self.sidebar_w, h - TITLE_H - STATUS_H));
         }
+        let (x, top) = if self.review.is_some() { (self.rail_w, TITLE_H + review::STRIP_H) } else { (self.sidebar_w, TITLE_H) };
+        r.target(Rect::new(x - 4.0, top, 8.0, h - top - STATUS_H), Cursor::Resize);
         self.draw_status(r, t, w, h);
         if self.dialog.is_some() {
             self.draw_dialog(r, t, w, h);
@@ -1309,6 +1449,7 @@ impl App {
                 Cursor::Arrow => CursorIcon::Default,
                 Cursor::Pointer => CursorIcon::Pointer,
                 Cursor::Text => CursorIcon::Text,
+                Cursor::Resize => CursorIcon::ColResize,
             });
         }
         if let Ok(path) = std::env::var("ARRANGER_SNAPSHOT") {
@@ -1364,12 +1505,12 @@ impl App {
     }
 
     fn draw_sidebar(&mut self, r: &mut Renderer, t: &Theme, h: f32) {
-        let side = Rect::new(0.0, TITLE_H, SIDEBAR_W, h - TITLE_H - STATUS_H);
+        let side = Rect::new(0.0, TITLE_H, self.sidebar_w, h - TITLE_H - STATUS_H);
         r.rect(side, 0.0, t.panel);
-        r.rect(Rect::new(SIDEBAR_W - 1.0, TITLE_H, 1.0, side.h), 0.0, t.border);
+        r.rect(Rect::new(self.sidebar_w - 1.0, TITLE_H, 1.0, side.h), 0.0, t.border);
 
         // Filter + new task.
-        let f = Rect::new(8.0, TITLE_H + 8.0, SIDEBAR_W - 16.0 - 32.0, 26.0);
+        let f = Rect::new(8.0, TITLE_H + 8.0, self.sidebar_w - 16.0 - 32.0, 26.0);
         let focused = self.focus == Focus::Filter;
         r.frame(f, 3.0, t.bg, if focused { t.work } else { t.border });
         for (i, lw) in [16.0, 10.0, 4.0].iter().enumerate() {
@@ -1381,13 +1522,14 @@ impl App {
         if self.filter.is_empty() && !focused {
             r.text(f.x + 25.0, r.center(f, UI, 12.0), &placeholder, UI, 12.0, 400, t.text3, f.w - 50.0);
         } else {
-            self.field_text(r, t, f.x + 25.0, r.center(f, UI, 12.0), &self.filter.clone(), UI, 12.0, f.w - 50.0, focused, t.work);
+            let filter = self.filter.clone();
+            self.field_text(r, t, f.x + 25.0, r.center(f, UI, 12.0), &filter, UI, 12.0, f.w - 50.0, focused, self.caret_for(Focus::Filter, &filter), t.work);
         }
         r.text(f.x + f.w - 8.0 - r.measure(MONO, 10.0, 400, &mod_label("F")), r.center(f, MONO, 10.0), &mod_label("F"), MONO, 10.0, 400, t.text3, 60.0);
         if self.hit_as(r, f, Cursor::Text) {
             self.actions.push(Action::Focus(Focus::Filter));
         }
-        let plus = Rect::new(SIDEBAR_W - 8.0 - 26.0, f.y, 26.0, 26.0);
+        let plus = Rect::new(self.sidebar_w - 8.0 - 26.0, f.y, 26.0, 26.0);
         r.rect(plus, 3.0, t.primary_bg);
         r.rect(Rect::new(plus.x + 7.5, plus.y + 12.0, 11.0, 2.0), 1.0, t.primary_fg);
         r.rect(Rect::new(plus.x + 12.0, plus.y + 7.5, 2.0, 11.0), 1.0, t.primary_fg);
@@ -1396,8 +1538,8 @@ impl App {
         }
 
         // Sections: Needs you (every machine), then one per machine.
-        let add = Rect::new(8.0, side.y + side.h - 8.0 - 28.0, SIDEBAR_W - 16.0, 28.0);
-        let list = Rect::new(0.0, f.y + f.h + 8.0, SIDEBAR_W - 1.0, add.y - 6.0 - (f.y + f.h + 8.0));
+        let add = Rect::new(8.0, side.y + side.h - 8.0 - 28.0, self.sidebar_w - 16.0, 28.0);
+        let list = Rect::new(0.0, f.y + f.h + 8.0, self.sidebar_w - 1.0, add.y - 6.0 - (f.y + f.h + 8.0));
         r.set_clip(Some(list));
         let multi = self.hosts.iter().filter(|h| !h.removed).count() > 1;
         let clicked = |p: Option<(f32, f32)>| p.is_some_and(|p| list.contains(p));
@@ -1408,20 +1550,20 @@ impl App {
             let folded = self.collapsed.contains(&sec.key);
             let chevron = |r: &mut Renderer, cy: f32| {
                 let (id, path) = if folded { (6, "M24 16L42 32L24 48Z") } else { (5, "M16 24L48 24L32 42Z") };
-                r.path(id, path, None, SIDEBAR_W - 26.0, cy - 5.0, 10.0, t.text3);
+                r.path(id, path, None, self.sidebar_w - 26.0, cy - 5.0, 10.0, t.text3);
             };
             let mut host_down = None;
             match sec.host {
                 None if sec.tasks.is_empty() => continue,
                 None => {
-                    let head = Rect::new(6.0, y + 4.0, SIDEBAR_W - 13.0, GROUP_H - 4.0);
+                    let head = Rect::new(6.0, y + 4.0, self.sidebar_w - 13.0, GROUP_H - 4.0);
                     r.rect(Rect::new(12.0, head.y + head.h / 2.0 - 2.5, 5.0, 5.0), 1.0, t.needs);
                     let lw = r.text(23.0, r.center(head, UI, 10.5), "NEEDS YOU", UI, 10.5, 500, t.text3, 150.0);
                     r.text(29.0 + lw, r.center(head, MONO, 10.5), &sec.tasks.len().to_string(), MONO, 10.5, 400, t.text3, 40.0);
                     if multi {
                         let note = "all machines";
                         let nw = r.measure(UI, 10.5, 400, note);
-                        r.text(SIDEBAR_W - 34.0 - nw, r.center(head, UI, 10.5), note, UI, 10.5, 400, t.text3, nw + 2.0);
+                        r.text(self.sidebar_w - 34.0 - nw, r.center(head, UI, 10.5), note, UI, 10.5, 400, t.text3, nw + 2.0);
                     }
                     chevron(r, head.y + head.h / 2.0);
                     if self.hit(r, head) && clicked(self.click) {
@@ -1432,9 +1574,9 @@ impl App {
                 Some(m) => {
                     let h = &self.hosts[m];
                     if i > 0 {
-                        r.rect(Rect::new(6.0, y + 4.0, SIDEBAR_W - 13.0, 1.0), 0.0, t.border);
+                        r.rect(Rect::new(6.0, y + 4.0, self.sidebar_w - 13.0, 1.0), 0.0, t.border);
                     }
-                    let head = Rect::new(6.0, y + 8.0, SIDEBAR_W - 13.0, 38.0);
+                    let head = Rect::new(6.0, y + 8.0, self.sidebar_w - 13.0, 38.0);
                     let (dot, status, sc) = match &h.link {
                         Link::Up(ms) => {
                             let mut s = host_summary(&h.tasks);
@@ -1483,13 +1625,28 @@ impl App {
             if folded {
                 continue;
             }
-            if sec.host.is_some_and(|m| self.hosts[m].link == Link::Up(0) || matches!(self.hosts[m].link, Link::Up(_))) && sec.tasks.is_empty() {
+            if sec.host.is_some_and(|m| matches!(self.hosts[m].link, Link::Up(_))) && sec.tasks.is_empty() && sec.ended == 0 {
                 let note = if self.filter.is_empty() { format!("No tasks · {} to start one", mod_label("N")) } else { "No matches".into() };
-                r.text(26.0, y + 2.0, &note, UI, 11.5, 400, t.text3, SIDEBAR_W - 40.0);
+                r.text(26.0, y + 2.0, &note, UI, 11.5, 400, t.text3, self.sidebar_w - 40.0);
                 y += 24.0;
             }
-            for task in &sec.tasks {
-                let row = Rect::new(6.0, y, SIDEBAR_W - 13.0, ROW2_H);
+            // Ended tasks sit behind one row, so they don't crowd out live ones but aren't lost.
+            let live = sec.tasks.iter().take_while(|t| group(&t.state) != 4).count();
+            for k in 0..=sec.tasks.len() {
+                if let Some(m) = sec.host.filter(|_| k == live && sec.ended > 0 && self.filter.is_empty()) {
+                    let open = self.show_ended.contains(&m);
+                    let row = Rect::new(6.0, y, self.sidebar_w - 13.0, 26.0);
+                    let label = if open { format!("Hide {} ended", sec.ended) } else { format!("{} ended · click to show", sec.ended) };
+                    let (id, path) = if open { (5, "M16 24L48 24L32 42Z") } else { (6, "M24 16L42 32L24 48Z") };
+                    r.path(id, path, None, row.x + 9.0, row.y + 8.0, 10.0, t.text3);
+                    r.text(row.x + 28.0, r.center(row, UI, 11.5), &label, UI, 11.5, 400, t.text3, row.w - 36.0);
+                    if self.hit(r, row) && clicked(self.click) {
+                        picks.push(Action::ShowEnded(m));
+                    }
+                    y += 28.0;
+                }
+                let Some(task) = sec.tasks.get(k) else { break };
+                let row = Rect::new(6.0, y, self.sidebar_w - 13.0, ROW2_H);
                 let chip = (sec.host.is_none() && multi).then(|| self.hosts[task.machine].name());
                 if self.draw_row(r, t, task, row, chip) && clicked(self.click) {
                     picks.push(Action::Select((task.machine, task.id)));
@@ -1622,7 +1779,8 @@ impl App {
                 None => format!("Message {kind}  ·  {}", mod_label("I")),
             }, UI, 12.5, 400, t.text3, text_w);
         } else {
-            self.field_text(r, t, ib.x + 26.0, r.center(ib, UI, 12.5), &self.message.clone(), UI, 12.5, text_w, focused, t.work);
+            let message = self.message.clone();
+            self.field_text(r, t, ib.x + 26.0, r.center(ib, UI, 12.5), &message, UI, 12.5, text_w, focused, self.caret_for(Focus::Message, &message), t.work);
         }
         r.text(ib.x + ib.w - 22.0, r.center(ib, MONO, 10.5), "↵", MONO, 10.5, 400, t.text3, 20.0);
         if ib_hit && self.actions.is_empty() {
@@ -1781,7 +1939,7 @@ impl App {
         if value.is_empty() && !focused {
             r.text(b.x + 10.0, y, placeholder, font, 12.5, 400, t.text3, b.w - 20.0);
         } else {
-            self.field_text(r, t, b.x + 10.0, y, value, font, 12.5, b.w - 20.0, focused, t.work);
+            self.field_text(r, t, b.x + 10.0, y, value, font, 12.5, b.w - 20.0, focused, self.caret_for(focus, value), t.work);
         }
         self.hit_as(r, b, Cursor::Text)
     }
@@ -1904,17 +2062,11 @@ impl App {
         if prompt.is_empty() {
             r.text(dlg.x + 18.0, ty + 4.0, "Describe the task", UI, 18.0, 400, t.faint, dlg.w - 36.0);
         }
+        let caret = self.caret_for(Focus::Prompt, &prompt).map(|at| caret_line(&prompt, &prompt_lines, at));
         for (i, line) in prompt_lines.iter().enumerate() {
-            let last = i == prompt_lines.len() - 1;
             let y = ty + 4.0 + i as f32 * 27.0;
-            if last {
-                self.field_text(r, t, dlg.x + 18.0, y, line, UI, 18.0, dlg.w - 36.0, prompt_focus, a);
-            } else {
-                let lw = r.text(dlg.x + 18.0, y, line, UI, 18.0, 400, t.text, dlg.w - 36.0);
-                if prompt_focus && self.select_all {
-                    r.rect(Rect::new(dlg.x + 17.0, y - 2.0, lw + 2.0, 24.0), 2.0, alpha(t.work, 0x50));
-                }
-            }
+            let at = caret.filter(|c| c.0 == i).map(|c| c.1);
+            self.field_text(r, t, dlg.x + 18.0, y, line, UI, 18.0, dlg.w - 36.0, prompt_focus, at, a);
         }
         let prompt_area = Rect::new(dlg.x, ty, dlg.w, text_h + 16.0);
         if self.hit_as(r, prompt_area, Cursor::Text) {
@@ -1948,7 +2100,7 @@ impl App {
         let row = Rect::new(bx, gy + 36.0, dlg.w / 2.0 - 36.0, 28.0);
         let base_focus = self.focus == Focus::Base;
         let bw = if base_focus {
-            self.field_text(r, t, row.x, r.center(row, MONO, 12.0), &base, MONO, 12.0, 160.0, true, a) + 4.0
+            self.field_text(r, t, row.x, r.center(row, MONO, 12.0), &base, MONO, 12.0, 160.0, true, self.caret_for(Focus::Base, &base), a) + 4.0
         } else if base.is_empty() {
             r.text(row.x, r.center(row, MONO, 12.0), "current branch", MONO, 12.0, 400, t.text3, 160.0)
         } else {
@@ -2024,6 +2176,41 @@ impl App {
             self.actions.push(Action::Start(true));
         }
     }
+}
+
+/// Byte offset of the caret in field `focus` holding `s`; its end unless the caret was moved there.
+fn caret_at(caret: Option<(Focus, usize)>, focus: Focus, s: &str) -> usize {
+    let mut at = caret.filter(|c| c.0 == focus).map_or(s.len(), |c| c.1.min(s.len()));
+    while !s.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// The start of the word before byte `at`.
+fn word_left(s: &str, at: usize) -> usize {
+    s[..at].trim_end().char_indices().rev().find(|(_, c)| c.is_whitespace()).map_or(0, |(i, c)| i + c.len_utf8())
+}
+
+/// The end of the word after byte `at`.
+fn word_right(s: &str, at: usize) -> usize {
+    let rest = &s[at..];
+    let word = rest.trim_start();
+    at + rest.len() - word.len() + word.find(char::is_whitespace).unwrap_or(word.len())
+}
+
+/// Which of `text`'s wrapped `lines` holds byte `at`, and where in it. Lines are pieces of
+/// `text` in order, so each is found after the last.
+fn caret_line(text: &str, lines: &[String], at: usize) -> (usize, usize) {
+    let mut pos = 0;
+    for (i, line) in lines.iter().enumerate() {
+        let start = text[pos..].find(line.as_str()).map_or(pos, |o| pos + o);
+        if at <= start + line.len() {
+            return (i, at.saturating_sub(start));
+        }
+        pos = start + line.len();
+    }
+    (lines.len().saturating_sub(1), lines.last().map_or(0, |l| l.len()))
 }
 
 /// State icon in a 12px box at (x, cy): square, ring, faint ring, check.
@@ -2179,6 +2366,19 @@ fn draw_term(r: &mut Renderer, t: &Theme, screen: &Screen, area: Rect, cell_w: f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caret_moves_and_maps_to_wrapped_lines() {
+        assert_eq!(word_left("fix the bug", 11), 8);
+        assert_eq!(word_right("fix the bug", 3), 7);
+        assert_eq!(caret_at(Some((Focus::Message, 99)), Focus::Message, "héllo"), 6);
+        assert_eq!(caret_at(Some((Focus::Message, 2)), Focus::Message, "héllo"), 1); // inside é
+        assert_eq!(caret_at(Some((Focus::Filter, 1)), Focus::Message, "abc"), 3); // another field's caret
+        let lines = vec!["fix the".to_string(), "bug".to_string()];
+        assert_eq!(caret_line("fix the bug", &lines, 5), (0, 5));
+        assert_eq!(caret_line("fix the bug", &lines, 9), (1, 1));
+        assert_eq!(caret_line("fix the bug", &lines, 11), (1, 3));
+    }
 
     #[test]
     fn markdown_runs() {
