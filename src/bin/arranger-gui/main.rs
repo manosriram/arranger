@@ -645,8 +645,11 @@ impl App {
 
     fn move_selection(&mut self, d: i32) {
         let order = self.order();
+        if order.is_empty() {
+            return;
+        }
         let i = self.selected.and_then(|id| order.iter().position(|&x| x == id)).unwrap_or(0) as i32;
-        if let Some(&id) = order.get((i + d).clamp(0, order.len() as i32 - 1).max(0) as usize) {
+        if let Some(&id) = order.get((i + d).clamp(0, order.len() as i32 - 1) as usize) {
             self.actions.push(Action::Select(id));
         }
     }
