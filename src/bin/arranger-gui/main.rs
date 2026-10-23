@@ -2139,9 +2139,11 @@ impl App {
                 r.text(grid.x, grid.y, &note, MONO, TERM_SIZE, 400, t.text3, grid.w);
             }
         }
-        // Learn the agent's box height from the live screen; the next frame resizes to hide it.
+        // Learn the agent's box height from the live screen; the next frame resizes to hide it. Only
+        // ever grows: the blank rows above the box come and go as text streams, and resizing each
+        // time made the agent redraw (stutter). The last text stays in view either way.
         if let (Some(b), Some(s)) = (box_rows.filter(|&b| b <= 16), self.session.as_mut().filter(|s| s.task == (task.machine, task.id))) {
-            s.extra = b;
+            s.extra = s.extra.max(b);
         }
         if let Some(need) = &task.need {
             let bar = Rect::new(sec.x + 16.0, sec.y + sec.h - 16.0 - 38.0, sec.w - 32.0, 38.0);
