@@ -119,6 +119,9 @@ struct Session {
     writer: UnixStream,
     screen: Screen,
     size: (u16, u16),
+    /// Rows of the agent's own input box. The terminal is this much taller than the pane, so the
+    /// box sits just below it, out of sight, and the agent's text fills the pane.
+    extra: u16,
 }
 
 impl Drop for Session {
@@ -194,6 +197,7 @@ enum Action {
     /// Shows (true) or leaves the Overview table.
     Overview(bool),
     OvGroup(Option<usize>),
+    OvHost(Option<usize>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -227,6 +231,8 @@ struct App {
     /// The Overview table is showing, filtered to one state group (None: all).
     overview: bool,
     ov_group: Option<usize>,
+    /// ...and to one machine, from its header's "N ended" link.
+    ov_host: Option<usize>,
     ov_scroll: f32,
     /// ⌘= / ⌘- / ⌘0: scales the whole window on top of the display's own scale.
     zoom: f32,
@@ -303,6 +309,7 @@ fn run() -> io::Result<()> {
         last_esc: None,
         overview: false,
         ov_group: None,
+        ov_host: None,
         ov_scroll: 0.0,
         zoom: 1.0,
         focus: Focus::Term,
@@ -884,7 +891,7 @@ impl App {
         let f = self.filter.to_lowercase();
         let mut v: Vec<&TaskInfo> = self
             .all_tasks()
-            .filter(|t| self.ov_group.is_none_or(|g| group(&t.state) == g))
+            .filter(|t| self.ov_group.is_none_or(|g| group(&t.state) == g) && self.ov_host.is_none_or(|m| t.machine == m))
             .filter(|t| f.is_empty() || format!("{} {} {} {}", title(t), t.agent, t.branch, self.hosts[t.machine].name()).to_lowercase().contains(&f))
             .collect();
         v.sort_by_key(|t| (group(&t.state), std::cmp::Reverse(t.created), t.machine, std::cmp::Reverse(t.id)));
@@ -1160,7 +1167,7 @@ impl App {
             }
             let _ = p.send_event(Msg::Exited(seq));
         });
-        self.session = Some(Session { seq, task: key, writer: sock, screen: Screen::new(cols, rows), size: (cols, rows) });
+        self.session = Some(Session { seq, task: key, writer: sock, screen: Screen::new(cols, rows), size: (cols, rows), extra: 0 });
     }
 
     /// For a task that is no longer running, replays its PTY log so its chat stays readable.
@@ -1566,11 +1573,16 @@ impl App {
                     self.overview = on;
                     self.review = None;
                     if !on {
+                        self.ov_host = None;
                         self.focus = self.rest();
                     }
                 }
                 Action::OvGroup(g) => {
                     self.ov_group = g;
+                    self.ov_scroll = 0.0;
+                }
+                Action::OvHost(m) => {
+                    self.ov_host = m;
                     self.ov_scroll = 0.0;
                 }
                 Action::Answer(allow) => {
@@ -1874,7 +1886,7 @@ impl App {
                             r.text(x + lw, sy, &status[at + label.len()..], UI, 11.0, 400, sc, sub.x + sub.w - x - lw);
                             link = Rect::new(x - 2.0, sub.y, lw + 4.0, sub.h);
                             if self.hit(r, link) && clicked(self.click) {
-                                picks.extend([Action::Overview(true), Action::OvGroup(Some(4))]);
+                                picks.extend([Action::Overview(true), Action::OvGroup(Some(4)), Action::OvHost(Some(m))]);
                             }
                         }
                         None => {
@@ -2070,13 +2082,15 @@ impl App {
             self.actions.push(Action::Focus(Focus::Term));
         }
         let bar_h = if task.need.is_some() { 48.0 } else { 0.0 };
-        let grid = Rect::new(sec.x + 16.0, sec.y + 12.0, sec.w - 32.0, sec.h - 28.0 - bar_h);
+        let grid = Rect::new(sec.x + 16.0, sec.y + 12.0, sec.w - 32.0, sec.h - 20.0 - bar_h);
         let cell_w = r.advance(MONO, TERM_SIZE, 400, '0');
         let size = (((grid.w / cell_w) as u16).max(2), ((grid.h / LINE_H) as u16).max(1));
         self.pane = size;
         let term_focus = self.focus == Focus::Term && self.dialog.is_none();
+        let mut box_rows = None;
         let screen = match (&mut self.session, &mut self.history) {
             (Some(s), _) if s.task == (task.machine, task.id) => {
+                let size = (size.0, size.1 + s.extra);
                 if s.size != size {
                     s.size = size;
                     s.screen.resize(size.0, size.1);
@@ -2090,12 +2104,28 @@ impl App {
         match screen {
             Some(screen) => {
                 // Stop above the agent's own input box: ours below replaces it.
-                let rows = agent_box(screen, kind).map_or(screen.grid().screen_lines(), |(row, _)| row) as f32;
-                // A replay taller than the pane keeps its last text in view.
-                let last = (0..rows as usize).rev().find(|&row| (0..screen.grid().columns()).any(|c| screen.grid()[Line(row as i32)][Column(c)].c != ' '));
-                let lift = (last.map_or(0.0, |l| l as f32 + 1.0) * LINE_H - grid.h).max(0.0);
-                r.set_clip(Some(Rect::new(sec.x, sec.y, sec.w, (sec.h - bar_h).min(grid.y - sec.y + rows * LINE_H - lift))));
-                draw_term(r, t, screen, Rect { y: grid.y - lift, ..grid }, cell_w, term_focus);
+                let found = agent_box(screen, kind).map(|(row, _)| row);
+                box_rows = found.map(|row| {
+                    // With the blank rows the agent leaves above its box (a couple at most).
+                    let g = screen.grid();
+                    let gap = (1..=2.min(row)).take_while(|k| (0..g.columns()).all(|c| g[Line((row - k) as i32)][Column(c)].c == ' ')).count();
+                    (g.screen_lines() - row + gap) as u16
+                });
+                let rows = found.unwrap_or(screen.grid().screen_lines()) as f32;
+                // The last text sits on the pane's bottom, just above our input box, with scrollback
+                // filling the space above it. When everything fits, the first text sits at the top instead.
+                let g = screen.grid();
+                let off = g.display_offset() as i32;
+                let blank = |v: i32| (0..g.columns()).all(|c| g[Line(v - off)][Column(c)].c == ' ');
+                let last = (0..rows as i32).rev().find(|&v| !blank(v));
+                let mut shift = grid.h - last.map_or(grid.h, |l| (l + 1) as f32 * LINE_H);
+                let above = g.history_size() as i32 - off; // view rows of scrollback above row 0
+                if (shift / LINE_H).ceil() as i32 >= above {
+                    let first = (-above..=last.unwrap_or(-1)).find(|&v| !blank(v)).unwrap_or(0);
+                    shift = shift.min(-first as f32 * LINE_H);
+                }
+                r.set_clip(Some(Rect::new(sec.x, sec.y, sec.w, (sec.h - bar_h).min(grid.y + shift - sec.y + rows * LINE_H))));
+                draw_term(r, t, screen, Rect { y: grid.y + shift, ..grid }, sec.y, cell_w, term_focus);
                 r.set_clip(None);
             }
             None => {
@@ -2108,6 +2138,10 @@ impl App {
                 };
                 r.text(grid.x, grid.y, &note, MONO, TERM_SIZE, 400, t.text3, grid.w);
             }
+        }
+        // Learn the agent's box height from the live screen; the next frame resizes to hide it.
+        if let (Some(b), Some(s)) = (box_rows.filter(|&b| b <= 16), self.session.as_mut().filter(|s| s.task == (task.machine, task.id))) {
+            s.extra = b;
         }
         if let Some(need) = &task.need {
             let bar = Rect::new(sec.x + 16.0, sec.y + sec.h - 16.0 - 38.0, sec.w - 32.0, 38.0);
@@ -2659,14 +2693,16 @@ fn logo(r: &mut Renderer, x: f32, y: f32, size: f32, ink: Rgba, amber: Rgba) {
     r.path(4, "M27.5 45a4.5 4.5 0 1 0 9 0a4.5 4.5 0 1 0 -9 0", None, x, y, size, amber);
 }
 
-fn draw_term(r: &mut Renderer, t: &Theme, screen: &Screen, area: Rect, cell_w: f32, focused: bool) {
+/// Draws the screen with its first row at `area.y`, and scrollback above that up to `top`.
+fn draw_term(r: &mut Renderer, t: &Theme, screen: &Screen, area: Rect, top: f32, cell_w: f32, focused: bool) {
     let grid = screen.grid();
     let mode = screen.mode();
     let (asc, desc) = r.vmetrics(MONO, TERM_SIZE);
     let base = (LINE_H - (asc + desc)) / 2.0 + asc;
     let offset = grid.display_offset() as i32;
-    for row in 0..grid.screen_lines() {
-        let line = &grid[Line(row as i32 - offset)];
+    let above = (((area.y - top) / LINE_H).ceil().max(0.0) as i32).min(grid.history_size() as i32 - offset);
+    for row in -above..grid.screen_lines() as i32 {
+        let line = &grid[Line(row - offset)];
         let y = area.y + row as f32 * LINE_H;
         for col in 0..grid.columns() {
             let cell = &line[Column(col)];

@@ -22,7 +22,7 @@ impl App {
             acts.push(Action::Focus(Focus::Filter));
         }
         let mut counts = [0; 5];
-        for task in self.all_tasks() {
+        for task in self.all_tasks().filter(|x| self.ov_host.is_none_or(|m| x.machine == m)) {
             counts[group(&task.state)] += 1;
         }
         let mut x = f.x + f.w + 8.0;
@@ -45,6 +45,18 @@ impl App {
                 acts.push(Action::OvGroup(g));
             }
             x += tw + 1.0;
+        }
+        if let Some(m) = self.ov_host {
+            // The machine filter, as a chip that clears it.
+            let name = self.hosts[m].name();
+            let cw = r.measure(UI, 12.0, 400, name) + 34.0;
+            let chip = Rect::new(x + 8.0, f.y, cw, 26.0);
+            r.frame(chip, 3.0, t.bg, t.border2);
+            r.text(chip.x + 9.0, r.center(chip, UI, 12.0), name, UI, 12.0, 400, t.text, cw);
+            r.text(chip.x + cw - 18.0, r.center(chip, UI, 12.0), "×", UI, 12.0, 400, t.text3, 12.0);
+            if self.hit(r, chip) {
+                acts.push(Action::OvHost(None));
+            }
         }
 
         // Columns: icon | Task | Machine | Agent | Branch | Latest | Time | action.
