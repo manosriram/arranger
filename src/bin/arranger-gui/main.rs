@@ -2,6 +2,7 @@
 //! Immediate mode: every redraw lays out and draws everything, and resolves the click
 //! that triggered it. Redraws happen only on input or daemon pushes, so idle CPU is zero.
 
+mod overview;
 mod render;
 mod review;
 mod theme;
@@ -35,7 +36,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use review::{ReviewAction, ReviewView, Tag};
-use theme::{AGENTS, GRAPHITE, PAPER, Rgba, Theme, accent, alpha, blend, readable};
+use theme::{AGENTS, Rgba, THEMES, Theme, accent, alpha, blend, readable};
+#[cfg(test)]
+use theme::{GRAPHITE, PAPER};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
@@ -127,6 +130,8 @@ impl Drop for Session {
 #[derive(Clone, Copy, PartialEq)]
 enum Focus {
     Term,
+    /// Vim keys' normal mode: keys move and act instead of typing.
+    Normal,
     Filter,
     Message,
     Prompt,
@@ -180,6 +185,12 @@ enum Action {
     Reconnect(usize),
     RemoveHost(usize),
     ShowEnded(usize),
+    PickTheme(usize),
+    ToggleMenu,
+    ToggleVim,
+    /// Shows (true) or leaves the Overview table.
+    Overview(bool),
+    OvGroup(Option<usize>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -197,7 +208,23 @@ struct App {
     session: Option<Session>,
     seq: u64,
     pane: (u16, u16),
-    dark: bool,
+    /// Index into THEMES.
+    theme: usize,
+    /// Vim keys: a normal mode for moving and acting without the mouse.
+    vim: bool,
+    /// The scheme menu is open; `scheme_btn` is the title-bar button that opens it.
+    menu: bool,
+    scheme_btn: Rect,
+    /// The vim keybinding sheet.
+    help: bool,
+    /// `g` was pressed and waits for a second `g`.
+    pending_g: bool,
+    /// When Esc was last pressed in vim mode: a second one soon after goes to the agent.
+    last_esc: Option<Instant>,
+    /// The Overview table is showing, filtered to one state group (None: all).
+    overview: bool,
+    ov_group: Option<usize>,
+    ov_scroll: f32,
     /// ⌘= / ⌘- / ⌘0: scales the whole window on top of the display's own scale.
     zoom: f32,
     focus: Focus,
@@ -266,7 +293,16 @@ fn run() -> io::Result<()> {
         session: None,
         seq: 0,
         pane: (80, 24),
-        dark: true,
+        theme: 0,
+        vim: false,
+        menu: false,
+        scheme_btn: Rect::new(0.0, 0.0, 0.0, 0.0),
+        help: false,
+        pending_g: false,
+        last_esc: None,
+        overview: false,
+        ov_group: None,
+        ov_scroll: 0.0,
         zoom: 1.0,
         focus: Focus::Term,
         filter: String::new(),
@@ -294,11 +330,32 @@ fn run() -> io::Result<()> {
         caret_on: true,
         blink_at: Instant::now(),
     };
+    let settings = Settings::load();
+    app.theme = THEMES.iter().position(|t| t.name == settings.theme).unwrap_or(0);
+    app.vim = settings.vim;
+    app.focus = app.rest();
     app.link_host(None);
     for m in machine::load() {
         app.link_host(Some(m));
     }
     event_loop.run_app(&mut app).map_err(io::Error::other)
+}
+
+/// Window preferences, kept in <data>/gui.json.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct Settings {
+    theme: String,
+    vim: bool,
+}
+
+impl Settings {
+    fn path() -> PathBuf {
+        proto::data_dir().join("gui.json")
+    }
+
+    fn load() -> Settings {
+        std::fs::read(Self::path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
 }
 
 fn init_gfx(el: &ActiveEventLoop) -> Result<Gfx, String> {
@@ -341,7 +398,7 @@ impl ApplicationHandler<Msg> for App {
 
     /// Wakes only to blink the caret, and only while a text field has focus.
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        if self.focus == Focus::Term {
+        if matches!(self.focus, Focus::Term | Focus::Normal) {
             el.set_control_flow(ControlFlow::Wait);
         } else {
             el.set_control_flow(ControlFlow::WaitUntil(self.blink_at));
@@ -469,6 +526,9 @@ impl ApplicationHandler<Msg> for App {
                 };
                 if let Some(rv) = self.review.as_mut().filter(|_| self.mouse.1 > TITLE_H + 56.0) {
                     rv.scroll = (rv.scroll - dy).max(0.0);
+                    self.redraw();
+                } else if self.overview {
+                    self.ov_scroll = (self.ov_scroll - dy).max(0.0);
                     self.redraw();
                 } else if self.mouse.0 < self.sidebar_w {
                     self.scroll = (self.scroll - dy).max(0.0);
@@ -777,7 +837,7 @@ fn wrap(r: &Renderer, text: &str, font: usize, size: f32, max_w: f32) -> Vec<Str
 
 impl App {
     fn theme(&self) -> &'static Theme {
-        if self.dark { &GRAPHITE } else { &PAPER }
+        THEMES[self.theme]
     }
 
     fn task(&self, (m, id): TaskKey) -> Option<&TaskInfo> {
@@ -819,8 +879,23 @@ impl App {
         out
     }
 
-    /// Sidebar order, for keyboard switching: rows of folded sections are skipped.
+    /// The Overview's rows: by state, newest first, through the filter and the state tabs.
+    fn ov_tasks(&self) -> Vec<&TaskInfo> {
+        let f = self.filter.to_lowercase();
+        let mut v: Vec<&TaskInfo> = self
+            .all_tasks()
+            .filter(|t| self.ov_group.is_none_or(|g| group(&t.state) == g))
+            .filter(|t| f.is_empty() || format!("{} {} {} {}", title(t), t.agent, t.branch, self.hosts[t.machine].name()).to_lowercase().contains(&f))
+            .collect();
+        v.sort_by_key(|t| (group(&t.state), std::cmp::Reverse(t.created), t.machine, std::cmp::Reverse(t.id)));
+        v
+    }
+
+    /// Sidebar order (or the Overview's), for keyboard switching: rows of folded sections are skipped.
     fn order(&self) -> Vec<TaskKey> {
+        if self.overview {
+            return self.ov_tasks().iter().map(|t| (t.machine, t.id)).collect();
+        }
         let sections = self.sections();
         let open = sections.iter().filter(|s| !self.collapsed.contains(&s.key));
         open.flat_map(|s| s.tasks.iter().map(|t| (t.machine, t.id))).collect()
@@ -875,7 +950,7 @@ impl App {
         list.push(cfg.clone());
         let _ = machine::save(&list);
         self.add_host = None;
-        self.focus = Focus::Term;
+        self.focus = self.rest();
         self.link_host(Some(cfg));
     }
 
@@ -898,12 +973,115 @@ impl App {
         }
     }
 
+    /// Where focus rests when no field has it: the agent's terminal, or vim's normal mode.
+    fn rest(&self) -> Focus {
+        if self.vim { Focus::Normal } else { Focus::Term }
+    }
+
+    fn set_theme(&mut self, i: usize) {
+        self.theme = i;
+        self.save_settings();
+    }
+
+    fn save_settings(&self) {
+        let s = Settings { theme: THEMES[self.theme].name.into(), vim: self.vim };
+        let _ = std::fs::write(Settings::path(), serde_json::to_vec_pretty(&s).unwrap_or_default());
+    }
+
+    /// Selects the next (or previous) task that needs you, wrapping around.
+    fn jump_needs(&mut self, forward: bool) {
+        let order = self.order();
+        let needs: Vec<usize> = (0..order.len()).filter(|&i| self.task(order[i]).is_some_and(|t| group(&t.state) == 0)).collect();
+        let cur = self.selected.and_then(|k| order.iter().position(|&x| x == k));
+        let pick = match (forward, cur) {
+            (true, Some(c)) => needs.iter().find(|&&i| i > c).or(needs.first()),
+            (false, Some(c)) => needs.iter().rev().find(|&&i| i < c).or(needs.last()),
+            (true, None) => needs.first(),
+            (false, None) => needs.last(),
+        };
+        if let Some(&i) = pick {
+            self.actions.push(Action::Select(order[i]));
+        }
+    }
+
+    /// Opens the selected task's chat from the Overview, typing into its message box (insert
+    /// mode) unless the agent has ended.
+    fn open_from_overview(&mut self) {
+        self.actions.push(Action::Overview(false));
+        self.actions.push(Action::Focus(Focus::Message)); // ignored for an ended agent
+    }
+
+    /// Steps Workspace → Overview → Review → Workspace (or back). Review needs a selected task,
+    /// so without one it's passed over.
+    fn cycle_view(&mut self, forward: bool) {
+        let cur = if self.review.is_some() { 2 } else if self.overview { 1 } else { 0 };
+        let mut next = if forward { (cur + 1) % 3 } else { (cur + 2) % 3 };
+        if next == 2 && self.current().is_none() {
+            next = if forward { 0 } else { 1 };
+        }
+        self.actions.push(match next {
+            0 => Action::Overview(false),
+            1 => Action::Overview(true),
+            _ => Action::OpenReview,
+        });
+    }
+
+    /// Vim's normal mode: one key, one command (`gg` takes two).
+    fn normal_key(&mut self, ev: &KeyEvent) {
+        let key = match &ev.logical_key {
+            Key::Character(c) => c.to_string(),
+            Key::Named(NamedKey::ArrowDown) => "j".into(),
+            Key::Named(NamedKey::ArrowUp) => "k".into(),
+            Key::Named(NamedKey::Enter) => "o".into(),
+            Key::Named(NamedKey::Escape) => "esc".into(),
+            _ => return,
+        };
+        let g = std::mem::take(&mut self.pending_g);
+        let files = self.review.as_ref().and_then(|rv| rv.data.as_ref()).map_or(0, |d| d.files.len());
+        let file = self.review.as_ref().map(|rv| rv.file);
+        match key.as_str() {
+            "j" if file.is_some() => self.actions.push(Action::Review(ReviewAction::File((file.unwrap() + 1).min(files.saturating_sub(1))))),
+            "k" if file.is_some() => self.actions.push(Action::Review(ReviewAction::File(file.unwrap().saturating_sub(1)))),
+            "j" => self.move_selection(1),
+            "k" => self.move_selection(-1),
+            "g" if g => self.move_selection(-(1 << 20)),
+            "g" => self.pending_g = true,
+            "G" => self.move_selection(1 << 20),
+            "J" => self.jump_needs(true),
+            "K" => self.jump_needs(false),
+            "/" => self.actions.push(Action::Focus(Focus::Filter)),
+            // Insert: the selected agent's message box, from whichever view.
+            "i" if self.current().is_some() => {
+                self.overview = false;
+                self.review = None;
+                self.actions.push(Action::Focus(Focus::Message));
+            }
+            "h" | "l" => self.cycle_view(key == "l"),
+            "o" if self.overview => self.open_from_overview(),
+            "o" if self.review.is_none() && self.current().is_some() => {
+                self.overview = false;
+                self.actions.push(Action::Focus(Focus::Term));
+            }
+            "a" => self.actions.push(Action::Answer(true)),
+            "x" => self.actions.push(Action::Answer(false)),
+            "r" => self.actions.push(Action::OpenReview),
+            "n" => self.actions.push(Action::NewTask),
+            "m" if self.review.is_none() && !self.overview => self.actions.push(Action::OpenAddHost),
+            "?" => self.help = !self.help,
+            "esc" if self.help => self.help = false,
+            "esc" if self.review.is_some() => self.actions.push(Action::Review(ReviewAction::Close)),
+            "esc" if self.overview => self.actions.push(Action::Overview(false)),
+            _ => {}
+        }
+    }
+
     /// The sidebar's or review rail's divider under `p`, which a press starts dragging.
     fn divider_at(&self, p: (f32, f32)) -> Option<Divider> {
         if self.dialog.is_some() || self.add_host.is_some() || p.1 < TITLE_H {
             return None;
         }
         match &self.review {
+            None if self.overview => None,
             None => ((p.0 - self.sidebar_w).abs() <= 4.0).then_some(Divider::Sidebar),
             Some(_) => ((p.0 - self.rail_w).abs() <= 4.0 && p.1 > TITLE_H + review::STRIP_H).then_some(Divider::Rail),
         }
@@ -1089,6 +1267,10 @@ impl App {
 
     fn key(&mut self, ev: &KeyEvent) {
         let m = self.mods;
+        if self.menu && ev.logical_key == Key::Named(NamedKey::Escape) {
+            self.menu = false;
+            return;
+        }
         if app_mod(m) {
             match &ev.logical_key {
                 Key::Character(c) => match c.to_lowercase().as_str() {
@@ -1148,6 +1330,43 @@ impl App {
             self.actions.push(Action::PickAgent(usize::MAX));
             return;
         }
+        // Vim: Esc twice quickly is the agent's own Esc (stop Claude), while it's on screen.
+        if self.vim && ev.logical_key == Key::Named(NamedKey::Escape) && !ev.repeat {
+            let double = self.last_esc.is_some_and(|at| at.elapsed() < Duration::from_millis(400));
+            self.last_esc = (!double).then(Instant::now);
+            if double && self.review.is_none() && !self.overview && self.dialog.is_none() && self.add_host.is_none() && self.session.is_some() {
+                self.send_input(b"\x1b".to_vec());
+                self.focus = Focus::Normal;
+                return;
+            }
+        }
+        // Vim: Esc anywhere is normal mode, closing whatever was being typed into (the agent's
+        // terminal doesn't get it).
+        if self.vim && self.focus != Focus::Normal && ev.logical_key == Key::Named(NamedKey::Escape) {
+            if self.add_host.take().is_none() && self.dialog.is_some() {
+                self.actions.push(Action::CloseDialog);
+            }
+            if self.focus == Focus::Note {
+                self.actions.push(Action::Review(ReviewAction::SaveNote));
+            }
+            self.focus = Focus::Normal;
+            return;
+        }
+        if self.focus == Focus::Normal {
+            self.normal_key(ev);
+            return;
+        }
+        if self.focus == Focus::Term && self.overview && self.dialog.is_none() {
+            // The table has no terminal: arrows move, ↵ opens the task, Esc goes back.
+            match &ev.logical_key {
+                Key::Named(NamedKey::ArrowDown) => self.move_selection(1),
+                Key::Named(NamedKey::ArrowUp) => self.move_selection(-1),
+                Key::Named(NamedKey::Enter) => self.open_from_overview(),
+                Key::Named(NamedKey::Escape) => self.actions.push(Action::Overview(false)),
+                _ => {}
+            }
+            return;
+        }
         if self.focus == Focus::Term && self.review.is_some() && self.dialog.is_none() {
             if ev.logical_key == Key::Named(NamedKey::Escape) {
                 self.actions.push(Action::Review(ReviewAction::Close));
@@ -1202,13 +1421,13 @@ impl App {
             Key::Named(NamedKey::Escape) => {
                 if self.add_host.is_some() {
                     self.add_host = None;
-                    self.focus = Focus::Term;
+                    self.focus = self.rest();
                 } else if self.dialog.is_some() {
                     self.actions.push(Action::CloseDialog);
                 } else if focus == Focus::Note {
                     self.actions.push(Action::Review(ReviewAction::SaveNote));
                 } else {
-                    self.focus = Focus::Term;
+                    self.focus = self.rest();
                 }
             }
             Key::Named(NamedKey::Tab) if focus == Focus::Message && m.shift_key() => self.send_input(b"\x1b[Z".to_vec()), // cycles the agent's mode
@@ -1227,7 +1446,7 @@ impl App {
                 Focus::CommitMsg => self.actions.push(Action::Review(ReviewAction::Commit(false))),
                 Focus::Prompt | Focus::Base | Focus::Repo => self.actions.push(Action::Start(false)),
                 Focus::HostSsh | Focus::HostName | Focus::HostRepo => self.actions.push(Action::AddHost),
-                _ => self.focus = Focus::Term,
+                _ => self.focus = self.rest(),
             },
             Key::Named(NamedKey::Backspace) => {
                 let field = self.field(focus);
@@ -1307,9 +1526,11 @@ impl App {
             match action {
                 Action::Select(id) => {
                     self.selected = Some(id);
-                    self.focus = Focus::Term;
+                    self.focus = self.rest();
                     self.sync_session();
                 }
+                // An ended agent has no message box to type into.
+                Action::Focus(Focus::Message) if self.current().is_none_or(|t| group(&t.state) == 4) => {}
                 Action::Focus(f) => {
                     self.select_all &= self.focus == f;
                     self.focus = f;
@@ -1317,9 +1538,34 @@ impl App {
                 Action::NewTask => self.open_dialog(),
                 Action::CloseDialog => {
                     self.dialog = None;
-                    self.focus = Focus::Term;
+                    self.focus = self.rest();
                 }
-                Action::ToggleTheme => self.dark = !self.dark,
+                // ⌘T: the same slot in the other half of the list, dark <-> light.
+                Action::ToggleTheme => self.set_theme((self.theme + 4) % THEMES.len()),
+                Action::PickTheme(i) => {
+                    self.set_theme(i);
+                    self.menu = false;
+                }
+                Action::ToggleMenu => self.menu = !self.menu,
+                Action::ToggleVim => {
+                    self.vim = !self.vim;
+                    (self.help, self.pending_g) = (false, false);
+                    if matches!(self.focus, Focus::Term | Focus::Normal) {
+                        self.focus = self.rest();
+                    }
+                    self.save_settings();
+                }
+                Action::Overview(on) => {
+                    self.overview = on;
+                    self.review = None;
+                    if !on {
+                        self.focus = self.rest();
+                    }
+                }
+                Action::OvGroup(g) => {
+                    self.ov_group = g;
+                    self.ov_scroll = 0.0;
+                }
                 Action::Answer(allow) => {
                     if let Some((m, id)) = self.current().filter(|t| t.asking).map(|t| (t.machine, t.id)) {
                         let _ = request_at(self.sock(m).as_deref(), &Request::Answer { id, allow, message: String::new() });
@@ -1383,8 +1629,8 @@ impl App {
         }
     }
 
-    /// Text field contents with the ⌘A highlight and, at byte `caret` of `s`, a blinking I-beam
-    /// caret. Returns the width.
+    /// Text field contents with the ⌘A highlight and, at byte `caret` of `s`, a blinking caret.
+    /// Returns the width.
     fn field_text(&self, r: &mut Renderer, t: &Theme, x: f32, y: f32, s: &str, font: usize, size: f32, max_w: f32, focused: bool, caret: Option<usize>, color: Rgba) -> f32 {
         let w = r.text(x, y, s, font, size, 400, t.text, max_w);
         let (top, h) = (y - size * 0.15, size * 1.35);
@@ -1393,8 +1639,6 @@ impl App {
         } else if let Some(at) = caret.filter(|_| focused && self.caret_on) {
             let cx = x + 1.0 + if at >= s.len() { w } else { r.measure(font, size, 400, &s[..at]).min(w) };
             r.rect(Rect::new(cx, top, 1.5, h), 0.0, color);
-            r.rect(Rect::new(cx - 2.0, top, 5.5, 1.5), 0.0, color);
-            r.rect(Rect::new(cx - 2.0, top + h - 1.5, 5.5, 1.5), 0.0, color);
         }
         w
     }
@@ -1428,18 +1672,28 @@ impl App {
         self.draw_title(r, t, w);
         if self.review.is_some() {
             self.draw_review(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H - STATUS_H));
+        } else if self.overview {
+            self.draw_overview(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H - STATUS_H));
         } else {
             self.draw_sidebar(r, t, h);
             self.draw_main(r, t, Rect::new(self.sidebar_w, TITLE_H, w - self.sidebar_w, h - TITLE_H - STATUS_H));
         }
-        let (x, top) = if self.review.is_some() { (self.rail_w, TITLE_H + review::STRIP_H) } else { (self.sidebar_w, TITLE_H) };
-        r.target(Rect::new(x - 4.0, top, 8.0, h - top - STATUS_H), Cursor::Resize);
+        if self.review.is_some() || !self.overview {
+            let (x, top) = if self.review.is_some() { (self.rail_w, TITLE_H + review::STRIP_H) } else { (self.sidebar_w, TITLE_H) };
+            r.target(Rect::new(x - 4.0, top, 8.0, h - top - STATUS_H), Cursor::Resize);
+        }
         self.draw_status(r, t, w, h);
         if self.dialog.is_some() {
             self.draw_dialog(r, t, w, h);
         }
         if self.add_host.is_some() {
             self.draw_add_host(r, t, w, h);
+        }
+        if self.help && self.vim {
+            self.draw_help(r, t, w, h);
+        }
+        if self.menu {
+            self.draw_menu(r, t);
         }
         let cursor = r.finish(self.mouse);
         self.hot = r.hot(self.mouse);
@@ -1476,9 +1730,10 @@ impl App {
         let repo = repo.strip_prefix(&home).map_or(repo.clone(), |rest| format!("~{rest}"));
         let rw = r.text(x + 10.0, r.center(bar, MONO, 11.0), &repo, MONO, 11.0, 400, t.text3, 400.0);
 
-        // Views: Workspace | Review.
+        // Views: Workspace | Overview | Review.
         let mut nx = x + 26.0 + rw;
-        for (label, on) in [("Workspace", self.review.is_none()), ("Review", self.review.is_some())] {
+        let (review, overview) = (self.review.is_some(), self.overview && self.review.is_none());
+        for (label, on) in [("Workspace", !review && !overview), ("Overview", overview), ("Review", review)] {
             let tw = r.measure(UI, 12.0, 400, label) + 16.0;
             let tab = Rect::new(nx, 7.0, tw, 22.0);
             if on {
@@ -1486,21 +1741,28 @@ impl App {
             }
             r.text(tab.x + 8.0, r.center(tab, UI, 12.0), label, UI, 12.0, 400, if on { t.text } else { t.text3 }, tw);
             if self.hit(r, tab) && !on {
-                self.actions.push(if label == "Review" { Action::OpenReview } else { Action::Review(ReviewAction::Close) });
+                self.actions.push(match label {
+                    "Review" => Action::OpenReview,
+                    "Overview" => Action::Overview(true),
+                    _ if review => Action::Review(ReviewAction::Close),
+                    _ => Action::Overview(false),
+                });
             }
             nx += tw + 1.0;
         }
 
-        // Scheme toggle: [swatch] Graphite
+        // Scheme menu button: [swatch] Graphite ˅
         let label_w = r.measure(UI, 12.0, 400, t.name);
-        let b = Rect::new(w - 10.0 - (label_w + 37.0), 5.0, label_w + 37.0, 26.0);
+        let b = Rect::new(w - 10.0 - (label_w + 51.0), 5.0, label_w + 51.0, 26.0);
+        self.scheme_btn = b;
         r.frame(b, 3.0, t.bg, t.border);
         r.rect(Rect::new(b.x + 7.0, b.y + 6.0, 14.0, 14.0), 3.0, t.border2);
         r.rect(Rect::new(b.x + 8.0, b.y + 7.0, 6.0, 12.0), 2.0, t.bg);
         r.rect(Rect::new(b.x + 14.0, b.y + 7.0, 6.0, 12.0), 2.0, t.needs);
         r.text(b.x + 28.0, r.center(b, UI, 12.0), t.name, UI, 12.0, 400, t.text2, label_w + 4.0);
+        r.path(5, "M16 24L48 24L32 42Z", None, b.x + b.w - 17.0, b.y + 8.0, 10.0, t.text3);
         if self.hit(r, b) {
-            self.actions.push(Action::ToggleTheme);
+            self.actions.push(Action::ToggleMenu);
         }
     }
 
@@ -1751,40 +2013,47 @@ impl App {
         let kw = r.text(mx, r.center(head, MONO, 11.0), kind, MONO, 11.0, 400, accent(kind), 100.0);
         r.text(mx + kw + 4.0, r.center(head, MONO, 11.0), &meta, MONO, 11.0, 400, t.text3, meta_w);
 
-        // Message box at the bottom.
-        let input_area = Rect::new(area.x, area.y + area.h - 49.0, area.w, 49.0);
-        r.rect(Rect::new(area.x, input_area.y, area.w, 1.0), 0.0, t.border);
-        let ib = Rect::new(area.x + 10.0, input_area.y + 9.0, area.w - 20.0, 32.0);
-        let focused = self.focus == Focus::Message;
-        r.frame(ib, 4.0, t.panel, if focused { t.work } else { t.border2 });
-        let ib_hit = self.hit_as(r, ib, Cursor::Text); // before the chip, so the chip is on top
-        r.text(ib.x + 10.0, r.center(ib, MONO, 12.5), "›", MONO, 12.5, 400, t.text3, 20.0);
-        // The agent's mode (read from its hidden footer); click or ⇧Tab cycles it.
-        let mut text_w = ib.w - 60.0;
-        if let Some((_, mode)) = self.session.as_ref().filter(|s| s.task == (task.machine, task.id)).and_then(|s| agent_box(&s.screen, kind)) {
-            let label = if mode.is_empty() { "default mode".to_string() } else { mode };
-            let cw = r.measure(MONO, 10.5, 400, &label) + r.measure(UI, 10.0, 400, "⇧Tab") + 26.0;
-            let chip = Rect::new(ib.x + ib.w - 34.0 - cw, ib.y + 6.0, cw, 20.0);
-            r.rect(chip, 3.0, t.raised);
-            let lw = r.text(chip.x + 8.0, r.center(chip, MONO, 10.5), &label, MONO, 10.5, 400, t.text2, cw);
-            r.text(chip.x + 16.0 + lw, r.center(chip, UI, 10.0), "⇧Tab", UI, 10.0, 400, t.text3, 40.0);
-            if self.hit(r, chip) {
-                self.actions.push(Action::Input(b"\x1b[Z".to_vec()));
+        // Message box at the bottom; none once the agent has ended, as nothing can read it.
+        let ended = group(&task.state) == 4;
+        let input_area = Rect::new(area.x, area.y + area.h - if ended { 0.0 } else { 49.0 }, area.w, if ended { 0.0 } else { 49.0 });
+        if !ended {
+            r.rect(Rect::new(area.x, input_area.y, area.w, 1.0), 0.0, t.border);
+            let ib = Rect::new(area.x + 10.0, input_area.y + 9.0, area.w - 20.0, 32.0);
+            let focused = self.focus == Focus::Message;
+            r.frame(ib, 4.0, t.panel, if focused { t.work } else { t.border2 });
+            let ib_hit = self.hit_as(r, ib, Cursor::Text); // before the chip, so the chip is on top
+            r.text(ib.x + 10.0, r.center(ib, MONO, 12.5), "›", MONO, 12.5, 400, t.text3, 20.0);
+            // The agent's mode (read from its hidden footer); click or ⇧Tab cycles it.
+            let mut text_w = ib.w - 60.0;
+            if let Some((_, mode)) = self.session.as_ref().filter(|s| s.task == (task.machine, task.id)).and_then(|s| agent_box(&s.screen, kind)) {
+                let label = if mode.is_empty() { "default mode".to_string() } else { mode };
+                let cw = r.measure(MONO, 10.5, 400, &label) + r.measure(UI, 10.0, 400, "⇧Tab") + 26.0;
+                let chip = Rect::new(ib.x + ib.w - 34.0 - cw, ib.y + 6.0, cw, 20.0);
+                r.rect(chip, 3.0, t.raised);
+                let lw = r.text(chip.x + 8.0, r.center(chip, MONO, 10.5), &label, MONO, 10.5, 400, t.text2, cw);
+                r.text(chip.x + 16.0 + lw, r.center(chip, UI, 10.0), "⇧Tab", UI, 10.0, 400, t.text3, 40.0);
+                if self.hit(r, chip) {
+                    self.actions.push(Action::Input(b"\x1b[Z".to_vec()));
+                }
+                text_w -= cw + 8.0;
             }
-            text_w -= cw + 8.0;
-        }
-        if self.message.is_empty() && !focused {
-            r.text(ib.x + 26.0, r.center(ib, UI, 12.5), &match &host.cfg {
-                Some(_) => format!("Message {kind} on {}  ·  {}", host.name(), mod_label("I")),
-                None => format!("Message {kind}  ·  {}", mod_label("I")),
-            }, UI, 12.5, 400, t.text3, text_w);
-        } else {
-            let message = self.message.clone();
-            self.field_text(r, t, ib.x + 26.0, r.center(ib, UI, 12.5), &message, UI, 12.5, text_w, focused, self.caret_for(Focus::Message, &message), t.work);
-        }
-        r.text(ib.x + ib.w - 22.0, r.center(ib, MONO, 10.5), "↵", MONO, 10.5, 400, t.text3, 20.0);
-        if ib_hit && self.actions.is_empty() {
-            self.actions.push(Action::Focus(Focus::Message));
+            if self.message.is_empty() && !focused {
+                let on = host.cfg.as_ref().map(|_| format!(" on {}", host.name())).unwrap_or_default();
+                if self.focus == Focus::Normal {
+                    r.text(ib.x + 26.0, r.center(ib, UI, 12.5), &format!("i to message {kind}{on}"), UI, 12.5, 400, t.text3, text_w);
+                } else {
+                    // The shortcut in mono, whose I has serifs; the UI font's is a bare stroke.
+                    let hw = r.text(ib.x + 26.0, r.center(ib, UI, 12.5), &format!("Message {kind}{on}  ·  "), UI, 12.5, 400, t.text3, text_w);
+                    r.text(ib.x + 26.0 + hw, r.center(ib, MONO, 11.5), &mod_label("I"), MONO, 11.5, 400, t.text3, (text_w - hw).max(0.0));
+                }
+            } else {
+                let message = self.message.clone();
+                self.field_text(r, t, ib.x + 26.0, r.center(ib, UI, 12.5), &message, UI, 12.5, text_w, focused, self.caret_for(Focus::Message, &message), t.work);
+            }
+            r.text(ib.x + ib.w - 22.0, r.center(ib, MONO, 10.5), "↵", MONO, 10.5, 400, t.text3, 20.0);
+            if ib_hit && self.actions.is_empty() {
+                self.actions.push(Action::Focus(Focus::Message));
+            }
         }
 
         // Terminal section.
@@ -1913,6 +2182,16 @@ impl App {
         }
         let mut x = 12.0;
         let y = r.center(bar, MONO, 10.5);
+        if self.vim {
+            // NORMAL, or INSERT while keys go to a field or the agent.
+            let insert = self.focus != Focus::Normal;
+            let label = if insert { "INSERT" } else { "NORMAL" };
+            let pw = r.measure(MONO, 10.5, 500, label) + 18.0;
+            let pill = Rect::new(0.0, bar.y + 1.0, pw, STATUS_H - 1.0);
+            r.rect(pill, 0.0, if insert { t.work } else { t.raised });
+            r.text(9.0, y, label, MONO, 10.5, 500, if insert { t.on_accent } else { t.text }, pw);
+            x = pw + 12.0;
+        }
         for (i, (sym, label)) in [("■", "need you"), ("●", "running"), ("○", "queued"), ("✓", "done")].iter().enumerate() {
             let c = [t.needs, t.work, t.text3, t.done][i];
             x += r.text(x, y, &format!("{sym} {} {label}", counts[i]), MONO, 10.5, 400, c, 200.0) + 14.0;
@@ -1927,8 +2206,22 @@ impl App {
         } else {
             format!("{} new · {} theme", mod_label("N"), mod_label("T"))
         };
+        let mut right_x = w - 12.0;
+        if self.vim {
+            let keys = Rect::new(right_x - 46.0, bar.y + 3.0, 46.0, 16.0);
+            r.frame(keys, 2.0, t.bg, t.border2);
+            r.text(keys.x + 5.0, r.center(keys, MONO, 10.0), "? keys", MONO, 10.0, 400, t.text2, 46.0);
+            if self.hit(r, keys) {
+                self.help = !self.help;
+            }
+            right_x = keys.x - 12.0;
+            if self.pending_g {
+                r.text(right_x - 10.0, y, "g", MONO, 10.5, 400, t.text2, 20.0);
+                right_x -= 22.0;
+            }
+        }
         let rw = r.measure(MONO, 10.5, 400, &right);
-        r.text(w - 12.0 - rw, y, &right, MONO, 10.5, 400, if lost { t.del } else { t.text3 }, rw + 2.0);
+        r.text(right_x - rw, y, &right, MONO, 10.5, 400, if lost { t.del } else { t.text3 }, rw + 2.0);
     }
 
     /// A one-line text field; returns whether it was clicked.
@@ -1960,8 +2253,9 @@ impl App {
         r.frame(esc, 3.0, t.dialog, t.border2);
         r.text(esc.x + 6.0, r.center(esc, MONO, 10.0), "Esc", MONO, 10.0, 400, t.text3, 30.0);
         let mut acts = Vec::new();
+        let rest = self.rest();
         if self.hit(r, esc) {
-            acts.push(Action::Focus(Focus::Term)); // closes, below
+            acts.push(Action::Focus(rest)); // closes, below
         }
 
         let mut y = dlg.y + 44.0;
@@ -2009,7 +2303,7 @@ impl App {
         } else if self.hit(r, test_b) {
             acts.push(Action::TestHost);
         }
-        if acts.iter().any(|a| matches!(a, Action::Focus(Focus::Term))) {
+        if acts.iter().any(|a| matches!(a, Action::Focus(f) if *f == rest)) {
             self.add_host = None;
         }
         self.actions.extend(acts);
@@ -2102,16 +2396,16 @@ impl App {
         let bw = if base_focus {
             self.field_text(r, t, row.x, r.center(row, MONO, 12.0), &base, MONO, 12.0, 160.0, true, self.caret_for(Focus::Base, &base), a) + 4.0
         } else if base.is_empty() {
-            r.text(row.x, r.center(row, MONO, 12.0), "current branch", MONO, 12.0, 400, t.text3, 160.0)
+            r.text(row.x, r.center(row, MONO, 12.0), "current branch", MONO, 12.0, 400, t.text, 160.0)
         } else {
-            r.text(row.x, r.center(row, MONO, 12.0), &base, MONO, 12.0, 400, t.text3, 160.0)
+            r.text(row.x, r.center(row, MONO, 12.0), &base, MONO, 12.0, 400, t.text, 160.0)
         };
         if self.hit_as(r, Rect::new(row.x - 4.0, row.y, bw + 8.0, row.h), Cursor::Text) {
             self.actions.push(Action::Focus(Focus::Base));
         }
         let arrow_x = row.x + bw + 8.0;
         r.text(arrow_x, r.center(row, MONO, 12.0), "→", MONO, 12.0, 400, t.faint, 20.0);
-        let nw = r.text(arrow_x + 18.0, r.center(row, MONO, 12.0), "arranger/<id>", MONO, 12.0, 400, t.text, 140.0);
+        let nw = r.text(arrow_x + 18.0, r.center(row, MONO, 12.0), "arranger/<id>", MONO, 12.0, 400, t.text3, 140.0);
         let chip = Rect::new(arrow_x + 26.0 + nw, row.y + 6.0, 32.0, 16.0);
         r.frame(chip, 3.0, t.dialog, t.border2);
         r.text(chip.x + 5.0, r.center(chip, UI, 10.0), "auto", UI, 10.0, 400, t.text3, 30.0);

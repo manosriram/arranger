@@ -1,0 +1,32 @@
+{
+  "enable": "Scheme menu (top right) → Vim keys",
+  "modes": {
+    "normal": "Keys move and act. The status bar shows NORMAL.",
+    "insert": "Keys go to a text field or the agent's terminal. The status bar shows INSERT."
+  },
+  "move": {
+    "j / ↓": "Next agent (next file in Review)",
+    "k / ↑": "Previous agent (previous file in Review)",
+    "gg": "First agent",
+    "G": "Last agent",
+    "J": "Next agent that needs you",
+    "K": "Previous agent that needs you",
+    "h": "Previous view (Workspace ← Overview ← Review)",
+    "l": "Next view (Workspace → Overview → Review)",
+    "/": "Filter agents"
+  },
+  "act": {
+    "o / ↵": "Attach to the agent's terminal; from Overview, open its chat in insert mode",
+    "a": "Allow the permission request",
+    "x": "Deny the permission request",
+    "r": "Review the diff",
+    "n": "New task",
+    "m": "Add machine (Workspace)"
+  },
+  "mode": {
+    "i": "Message the selected agent (insert mode), from any view",
+    "esc": "Normal mode, from anywhere; closes the open dialog",
+    "esc esc": "Send Esc to the agent (stops Claude)",
+    "?": "Show these keys"
+  }
+}

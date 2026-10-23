@@ -28,6 +28,8 @@ Run `arranger` inside a git repo. It starts the daemon if needed and opens the w
 
 On Linux use Ctrl+Shift in place of ⌘.
 
+Prefer vim keys? Turn on **Vim keys** in the scheme menu (top right). The bindings are in [vim.json](vim.json), and `?` shows them in the app.
+
 Everything also works from the terminal:
 
 ```sh

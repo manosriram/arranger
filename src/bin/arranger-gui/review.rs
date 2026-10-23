@@ -198,7 +198,7 @@ impl App {
             busy: false,
             discard_armed: false,
         });
-        self.focus = Focus::Term;
+        self.focus = self.rest();
         self.review_action(ReviewAction::Refresh);
     }
 
@@ -255,6 +255,7 @@ impl App {
 
     pub fn review_action(&mut self, action: ReviewAction) {
         let agent = self.review.as_ref().and_then(|rv| self.task((rv.host, rv.task))).map(|t| adapter::kind(&t.agent).to_string());
+        let rest = self.rest();
         let Some(rv) = &mut self.review else { return };
         let (id, host) = (rv.task, rv.host);
         if !matches!(action, ReviewAction::Discard) {
@@ -263,7 +264,7 @@ impl App {
         match action {
             ReviewAction::Close => {
                 self.review = None;
-                self.focus = Focus::Term;
+                self.focus = rest;
             }
             ReviewAction::Refresh => self.spawn_request(host, Tag::Review(id), Request::Review { id }),
             ReviewAction::File(i) => {
@@ -294,7 +295,7 @@ impl App {
             ReviewAction::SaveNote => {
                 rv.editing = None;
                 rv.notes.retain(|n| !n.text.trim().is_empty());
-                self.focus = Focus::Term;
+                self.focus = rest;
             }
             ReviewAction::EditNote(i) => {
                 rv.editing = Some(i);
@@ -305,7 +306,7 @@ impl App {
                     rv.notes.remove(i);
                 }
                 rv.editing = None;
-                self.focus = Focus::Term;
+                self.focus = rest;
             }
             ReviewAction::SendNote(i) => {
                 let Some(note) = rv.notes.get(i).filter(|n| !n.text.trim().is_empty()) else { return };
@@ -314,7 +315,7 @@ impl App {
                 rv.notes.remove(i);
                 rv.editing = None;
                 rv.status = format!("Sending to {}…", agent.unwrap_or_else(|| "the agent".into()));
-                self.focus = Focus::Term;
+                self.focus = rest;
                 self.spawn_request(host, Tag::Note, Request::Prompt { id, text });
             }
             ReviewAction::Commit(pr) => {
@@ -325,7 +326,7 @@ impl App {
                 rv.error = false;
                 rv.status = if pr { "Committing, pushing and opening a PR…".into() } else { "Committing…".into() };
                 let message = rv.message.clone();
-                self.focus = Focus::Term;
+                self.focus = rest;
                 self.spawn_request(host, Tag::Commit, Request::Commit { id, message, pr });
             }
             ReviewAction::FocusMessage => self.focus = Focus::CommitMsg,
