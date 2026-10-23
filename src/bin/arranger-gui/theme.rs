@@ -16,6 +16,32 @@ pub fn alpha(c: Rgba, a: u8) -> Rgba {
     [c[0], c[1], c[2], a]
 }
 
+fn luminance(c: Rgba) -> f32 {
+    let l = |v: u8| (v as f32 / 255.0).powf(2.2);
+    0.2126 * l(c[0]) + 0.7152 * l(c[1]) + 0.0722 * l(c[2])
+}
+
+/// `fg`, pushed towards black or white until it reads on `bg` (contrast ≥ 3:1), like a terminal's
+/// minimum-contrast setting. Agents pick colours for a dark terminal; their white text vanishes on Paper.
+pub fn readable(fg: Rgba, bg: Rgba) -> Rgba {
+    let lb = luminance(bg);
+    let ok = |c: Rgba| {
+        let l = luminance(c);
+        (l.max(lb) + 0.05) / (l.min(lb) + 0.05) >= 3.0
+    };
+    if ok(fg) {
+        return fg;
+    }
+    // Greys flip (white → black, light grey → dark grey) so their emphasis order survives.
+    let neutral = fg.iter().take(3).max().unwrap() - fg.iter().take(3).min().unwrap() < 16;
+    let fg = if neutral { [255 - fg[0], 255 - fg[1], 255 - fg[2], fg[3]] } else { fg };
+    if ok(fg) {
+        return fg;
+    }
+    let target = if lb > 0.18 { [0, 0, 0, 255] } else { [255; 4] };
+    (1..=10).map(|i| blend(fg, target, i as f32 / 10.0)).find(|&c| ok(c)).unwrap_or(target)
+}
+
 pub struct Theme {
     pub name: &'static str,
     pub dark: bool,

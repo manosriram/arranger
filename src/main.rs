@@ -1,6 +1,6 @@
 use arranger::client::{connect, request};
 use arranger::proto::{self, Reply, Request};
-use arranger::{adapter, daemon};
+use arranger::{adapter, daemon, machine};
 use rustix::termios::{self, OptionalActions};
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -15,7 +15,8 @@ use std::{env, thread};
 const USAGE: &str = "usage: arranger            open the workspace window
        arranger [ls [--files] | new <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
                  | approve <id> | deny <id> [reason] | events <id> | diff <id> | revert <id> <path> <hunk#>
-                 | send <id> <text> | commit <id> [--pr] [message] | ping | stop | serve | hook <adapter>]";
+                 | send <id> <text> | commit <id> [--pr] [message] | ping | stop | serve | hook <adapter>
+                 | machine [ls | add <name> <user@host> [repo] | rm <name>] | endpoint]";
 /// Ctrl-\, raw and in kitty keyboard encoding.
 const DETACH: &[&[u8]] = &[b"\x1c", b"\x1b[92;5u"];
 
@@ -36,6 +37,20 @@ fn main() {
         ["events", id] => parse_id(id).and_then(events),
         ["ping"] => request(&Request::Ping).map(|_| println!("pong")),
         ["stop"] => arranger::client::stop(),
+        // Run over ssh by a GUI adding this machine: start the daemon, say where it listens.
+        ["endpoint"] => connect().map(|_| println!("{} {}", proto::VERSION, proto::socket_path().display())),
+        ["machine"] | ["machine", "ls"] => {
+            for m in machine::load() {
+                println!("{:<14} {:<28} {}", m.name, m.ssh, m.repo);
+            }
+            Ok(())
+        }
+        ["machine", "add", name, ssh, ref repo @ ..] => add_machine(name, ssh, &repo.join(" ")),
+        ["machine", "rm", name] => {
+            let mut list = machine::load();
+            list.retain(|m| m.name != name);
+            machine::save(&list)
+        }
         ["diff", id] => parse_id(id).and_then(diff),
         ["revert", id, path, hunk] => parse_id(id).and_then(|id| revert(id, path, hunk)),
         ["send", id, ref text @ ..] => {
@@ -56,6 +71,15 @@ fn main() {
         eprintln!("arranger: {e}");
         std::process::exit(1);
     }
+}
+
+fn add_machine(name: &str, ssh: &str, repo: &str) -> io::Result<()> {
+    let sock = machine::endpoint(ssh)?;
+    println!("{name}: daemon at {}", sock.display());
+    let mut list = machine::load();
+    list.retain(|m| m.name != name);
+    list.push(machine::Machine { name: name.into(), ssh: ssh.into(), repo: repo.into() });
+    machine::save(&list)
 }
 
 /// Replaces this process with `arranger-gui`, found next to this binary or on PATH.

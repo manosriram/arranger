@@ -15,6 +15,8 @@ const NOTE_X: f32 = 110.0;
 
 pub struct ReviewView {
     pub task: u64,
+    /// The machine the task runs on.
+    pub host: usize,
     pub data: Option<proto::Review>,
     pub file: usize,
     pub split: bool,
@@ -69,6 +71,106 @@ fn key(path: &str, header: &str) -> String {
     format!("{path}\0{header}")
 }
 
+/// Inline markdown runs: (text, bold, code). `**`/`__` toggle bold and backticks code; `*`/`_` emphasis
+/// markers are dropped, links keep their text.
+fn spans(line: &str) -> Vec<(String, bool, bool)> {
+    let mut out = vec![(String::new(), false, false)];
+    let (mut bold, mut code) = (false, false);
+    let mut rest = line;
+    while let Some(c) = rest.chars().next() {
+        let link = (!code && c == '[').then(|| rest[1..].split_once("](")).flatten();
+        let link = link.and_then(|(text, a)| Some((text, a.split_once(')')?.1)));
+        if c == '`' || (!code && (rest.starts_with("**") || rest.starts_with("__"))) {
+            let n = if c == '`' { code = !code; 1 } else { bold = !bold; 2 };
+            rest = &rest[n..];
+            out.push((String::new(), bold, code));
+        } else if !code && (c == '*' || c == '_') && {
+            // An emphasis marker opens before a word or closes after one; snake_case keeps its `_`.
+            let prev = out.last().unwrap().0.ends_with(char::is_alphanumeric);
+            let next = rest[1..].chars().next();
+            (!prev && next.is_some_and(|n| !n.is_whitespace())) || (prev && !next.is_some_and(char::is_alphanumeric))
+        } {
+            rest = &rest[1..];
+        } else if let Some((text, after)) = link {
+            out.last_mut().unwrap().0.push_str(text);
+            rest = after;
+        } else {
+            out.last_mut().unwrap().0.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out.retain(|s| !s.0.is_empty());
+    out
+}
+
+/// Markdown as plain text on one line (the sidebar's quoted summary).
+pub fn plain(line: &str) -> String {
+    let line = line.trim_start_matches(['#', '-', '*', '>', ' ']);
+    spans(line).into_iter().map(|s| s.0).collect()
+}
+
+/// Draws an agent's markdown (headings, bullets, code blocks, bold and `code` runs) wrapped to `w`
+/// from `y`, stopping at `max_y`.
+fn draw_markdown(r: &mut Renderer, t: &Theme, text: &str, x: f32, mut y: f32, w: f32, max_y: f32) {
+    let mut fenced = false;
+    for line in text.lines() {
+        if y > max_y {
+            return;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            r.text(x + 8.0, y, &line.replace('\t', "    "), MONO, 12.0, 400, t.tc, w - 8.0);
+            y += 18.0;
+            continue;
+        }
+        if trimmed.is_empty() {
+            y += 8.0;
+            continue;
+        }
+        let heading = trimmed.starts_with('#');
+        let ordered = trimmed.split_once(". ").filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+        let (marker, body) = if heading {
+            (None, trimmed.trim_start_matches('#').trim_start().to_string())
+        } else if let Some(b) = ["- ", "* ", "+ "].iter().find_map(|m| trimmed.strip_prefix(m)) {
+            (Some("•".to_string()), b.to_string())
+        } else if let Some((n, b)) = ordered {
+            (Some(format!("{n}.")), b.to_string())
+        } else {
+            (None, trimmed.to_string())
+        };
+        let indent = if marker.is_some() { 14.0 } else { 0.0 };
+        if let Some(m) = &marker {
+            r.text(x, y, m, UI, 13.0, 400, t.text3, indent);
+        }
+        // Greedy wrap over words, each keeping its run's style.
+        let (mut cx, right) = (x + indent, x + w);
+        for (run, bold, code) in spans(&body) {
+            let (font, size, weight) = if code { (MONO, 12.0, 400) } else { (UI, 13.0, if bold || heading { 600 } else { 400 }) };
+            let color = if code { t.tc } else if bold || heading { t.text } else { t.text2 };
+            let space = r.advance(font, size, weight, ' ');
+            for (i, word) in run.split(' ').enumerate() {
+                let ww = r.measure(font, size, weight, word);
+                if cx + ww > right && cx > x + indent {
+                    (cx, y) = (x + indent, y + 20.0);
+                    if y > max_y {
+                        return;
+                    }
+                }
+                let dy = if code { 1.0 } else { 0.0 };
+                cx += r.text(cx, y + dy, word, font, size, weight, color, right - cx);
+                if i + 1 < run.split(' ').count() {
+                    cx += space;
+                }
+            }
+        }
+        y += if heading { 24.0 } else { 20.0 };
+    }
+}
+
 fn clean(text: &str) -> String {
     text.trim_end_matches(['\n', '\r']).replace('\t', "    ")
 }
@@ -76,13 +178,14 @@ fn clean(text: &str) -> String {
 impl App {
     pub fn open_review(&mut self) {
         let Some(task) = self.current() else { return };
-        if self.review.as_ref().is_some_and(|r| r.task == task.id) {
+        if self.review.as_ref().is_some_and(|r| (r.host, r.task) == (task.machine, task.id)) {
             self.review_action(ReviewAction::Refresh);
             return;
         }
         let message = title(task);
         self.review = Some(ReviewView {
             task: task.id,
+            host: task.machine,
             data: None,
             file: 0,
             split: false,
@@ -100,10 +203,10 @@ impl App {
         self.review_action(ReviewAction::Refresh);
     }
 
-    pub fn spawn_request(&self, tag: Tag, req: Request) {
-        let p = self.proxy.clone();
+    pub fn spawn_request(&self, host: usize, tag: Tag, req: Request) {
+        let (p, sock) = (self.proxy.clone(), self.sock(host));
         thread::spawn(move || {
-            let reply = request(&req).map_err(|e| e.to_string());
+            let reply = request_at(sock.as_deref(), &req).map_err(|e| e.to_string());
             let _ = p.send_event(Msg::Reply(tag, reply));
         });
     }
@@ -152,9 +255,9 @@ impl App {
     }
 
     pub fn review_action(&mut self, action: ReviewAction) {
-        let agent = self.review.as_ref().and_then(|rv| self.task(rv.task)).map(|t| adapter::kind(&t.agent).to_string());
+        let agent = self.review.as_ref().and_then(|rv| self.task((rv.host, rv.task))).map(|t| adapter::kind(&t.agent).to_string());
         let Some(rv) = &mut self.review else { return };
-        let id = rv.task;
+        let (id, host) = (rv.task, rv.host);
         if !matches!(action, ReviewAction::Discard) {
             rv.discard_armed = false;
         }
@@ -163,7 +266,7 @@ impl App {
                 self.review = None;
                 self.focus = Focus::Term;
             }
-            ReviewAction::Refresh => self.spawn_request(Tag::Review(id), Request::Review { id }),
+            ReviewAction::Refresh => self.spawn_request(host, Tag::Review(id), Request::Review { id }),
             ReviewAction::File(i) => {
                 rv.file = i;
                 rv.scroll = 0.0;
@@ -172,7 +275,7 @@ impl App {
             ReviewAction::Revert(path, header) => {
                 rv.status = format!("Reverting a hunk in {path}…");
                 rv.error = false;
-                self.spawn_request(Tag::Revert, Request::Revert { id, path, header });
+                self.spawn_request(host, Tag::Revert, Request::Revert { id, path, header });
             }
             ReviewAction::Accept(k) => {
                 if !rv.accepted.remove(&k) {
@@ -213,7 +316,7 @@ impl App {
                 rv.editing = None;
                 rv.status = format!("Sending to {}…", agent.unwrap_or_else(|| "the agent".into()));
                 self.focus = Focus::Term;
-                self.spawn_request(Tag::Note, Request::Prompt { id, text });
+                self.spawn_request(host, Tag::Note, Request::Prompt { id, text });
             }
             ReviewAction::Commit(pr) => {
                 if rv.busy {
@@ -224,13 +327,13 @@ impl App {
                 rv.status = if pr { "Committing, pushing and opening a PR…".into() } else { "Committing…".into() };
                 let message = rv.message.clone();
                 self.focus = Focus::Term;
-                self.spawn_request(Tag::Commit, Request::Commit { id, message, pr });
+                self.spawn_request(host, Tag::Commit, Request::Commit { id, message, pr });
             }
             ReviewAction::FocusMessage => self.focus = Focus::CommitMsg,
             ReviewAction::Discard => {
                 if rv.discard_armed {
                     rv.status = "Discarding the worktree…".into();
-                    self.spawn_request(Tag::Discard, Request::Kill { id });
+                    self.spawn_request(host, Tag::Discard, Request::Kill { id });
                 } else {
                     rv.discard_armed = true;
                 }
@@ -246,7 +349,7 @@ impl App {
 
     pub fn draw_review(&mut self, r: &mut Renderer, t: &Theme, area: Rect) {
         let Some(rv) = self.review.as_ref() else { return };
-        let task = self.task(rv.task).cloned();
+        let task = self.task((rv.host, rv.task)).cloned();
         let agent = task.as_ref().map(|t| adapter::kind(&t.agent).to_string()).unwrap_or_default();
         let mut acts = Vec::new();
 
@@ -256,7 +359,7 @@ impl App {
         let back = Rect::new(area.x + 24.0, strip.y + 14.0, 28.0, 28.0);
         r.frame(back, 4.0, t.bg, t.border2);
         r.text(back.x + 8.0, r.center(back, MONO, 14.0), "←", MONO, 14.0, 400, t.tc, 20.0);
-        if self.hit(back) {
+        if self.hit(r, back) {
             acts.push(ReviewAction::Close);
         }
         let name = task.as_ref().map(title).unwrap_or_default();
@@ -276,7 +379,7 @@ impl App {
                 r.rect(b, 3.0, t.raised);
             }
             r.text(b.x + 10.0, r.center(b, UI, 12.0), label, UI, 12.0, 400, if on { t.text } else { t.text3 }, bw);
-            if self.hit(b) {
+            if self.hit(r, b) {
                 acts.push(ReviewAction::Split(split));
             }
             sx += bw;
@@ -339,7 +442,7 @@ impl App {
             let ax = row.x + row.w - 10.0 - cw;
             let aw = r.text(ax, r.center(row, MONO, 12.0), &format!("+{}", f.added), MONO, 12.0, 400, t.add, 80.0);
             r.text(ax + aw + r.measure(MONO, 12.0, 400, " "), r.center(row, MONO, 12.0), &format!("−{}", f.removed), MONO, 12.0, 400, t.del, 80.0);
-            if self.hit(row) {
+            if self.hit(r, row) {
                 acts.push(ReviewAction::File(i));
             }
             y += 34.0;
@@ -365,14 +468,7 @@ impl App {
         if let Some(summary) = rv.data.as_ref().map(|d| d.summary.trim()).filter(|s| !s.is_empty()) {
             y += 18.0;
             section(r, y, "AGENT SUMMARY");
-            y += 24.0;
-            for line in wrap(r, summary, UI, 13.0, RAIL_W - 32.0) {
-                if y > rail.y + rail.h - 20.0 {
-                    break;
-                }
-                r.text(rail.x + 16.0, y, &line, UI, 13.0, 400, t.text2, RAIL_W - 32.0);
-                y += 20.0;
-            }
+            draw_markdown(r, t, summary, rail.x + 16.0, y + 24.0, RAIL_W - 32.0, rail.y + rail.h - 20.0);
         }
         r.set_clip(None);
 
@@ -498,9 +594,9 @@ impl App {
                 r.text(revert.x + 8.0, r.center(revert, UI, 12.0), "Revert hunk", UI, 12.0, 400, t.tc, rw);
                 r.frame(accept, 3.0, if accepted { t.panel } else { t.sel }, t.border2);
                 r.text(accept.x + 8.0, r.center(accept, UI, 12.0), accept_label, UI, 12.0, 400, if accepted { t.done } else { t.text }, aw);
-                if self.hit(revert) {
+                if self.hit(r, revert) {
                     acts.push(ReviewAction::Revert(file.path.clone(), h.header.clone()));
-                } else if self.hit(accept) {
+                } else if self.hit(r, accept) {
                     acts.push(ReviewAction::Accept(k.clone()));
                 }
             }
@@ -545,7 +641,7 @@ impl App {
                         r.text(nx + 7.0, base_y, sign, MONO, 12.5, 400, sc, 20.0);
                         r.text(nx + 22.0, base_y, &clean(&l.text), MONO, 12.5, 400, fg, cell.x + cell.w - nx - 30.0);
                     }
-                    if self.hit(row) {
+                    if self.hit(r, row) {
                         let pick = if rv.split { b.or(a) } else { a }.unwrap();
                         let (line, new_side) = anchor(h, pick);
                         acts.push(ReviewAction::Comment { path: file.path.clone(), header: h.header.clone(), line, new_side });
@@ -609,11 +705,11 @@ impl App {
         let other = Rect::new(send.x + sw + 8.0, by, ow, 28.0);
         r.frame(other, 4.0, t.dialog, t.border2);
         r.text(other.x + 10.0, r.center(other, UI, 12.0), second, UI, 12.0, 400, t.tc, ow);
-        if self.hit(send) {
+        if self.hit(r, send) {
             acts.push(ReviewAction::SendNote(i));
-        } else if self.hit(other) {
+        } else if self.hit(r, other) {
             acts.push(if editing { ReviewAction::SaveNote } else { ReviewAction::DeleteNote(i) });
-        } else if self.hit(b) && !editing {
+        } else if self.hit(r, b) && !editing {
             acts.push(ReviewAction::EditNote(i));
         }
     }
@@ -644,7 +740,7 @@ impl App {
         } else {
             self.field_text(r, t, fx, r.center(field, MONO, 12.5), &rv.message, MONO, 12.5, field.w - lw - 34.0, focused, t.work);
         }
-        if self.hit(field) {
+        if self.hit_as(r, field, Cursor::Text) {
             acts.push(ReviewAction::FocusMessage);
         }
 
@@ -657,11 +753,11 @@ impl App {
         let plw = r.text(pr.x + 14.0, r.center(pr, UI, 13.0), pr_label, UI, 13.0, 500, t.primary_fg, pw);
         r.text(pr.x + 24.0 + plw, r.center(pr, MONO, 10.0), pr_key, MONO, 10.0, 400, alpha(t.primary_fg, 150), 60.0);
         if !rv.busy {
-            if self.hit(discard) {
+            if self.hit(r, discard) {
                 acts.push(ReviewAction::Discard);
-            } else if self.hit(commit) {
+            } else if self.hit(r, commit) {
                 acts.push(ReviewAction::Commit(false));
-            } else if self.hit(pr) {
+            } else if self.hit(r, pr) {
                 acts.push(ReviewAction::Commit(true));
             }
         }

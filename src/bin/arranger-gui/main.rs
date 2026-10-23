@@ -7,7 +7,8 @@ mod review;
 mod theme;
 
 use arranger::adapter;
-use arranger::client::{connect, request};
+use arranger::client::{connect, connect_at, request_at};
+use arranger::machine::{self, Machine};
 use arranger::proto::{self, Event, Reply, Request, TaskInfo};
 use arranger::screen::Screen;
 use alacritty_terminal::grid::Dimensions;
@@ -21,27 +22,30 @@ use glutin::display::{GetGlDisplay, GlDisplay};
 use glutin::surface::{GlSurface, Surface, SwapInterval, WindowSurface};
 use glutin_winit::{DisplayBuilder, GlWindow};
 use raw_window_handle::HasWindowHandle;
-use render::{MONO, Rect, Renderer, UI};
+use render::{Cursor, MONO, Rect, Renderer, UI};
 use std::io::{self, Write};
 use std::net::Shutdown;
 use std::num::NonZeroU32;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use review::{ReviewAction, ReviewView, Tag};
-use theme::{AGENTS, GRAPHITE, PAPER, Rgba, Theme, accent, alpha, blend};
+use theme::{AGENTS, GRAPHITE, PAPER, Rgba, Theme, accent, alpha, blend, readable};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 const TITLE_H: f32 = 36.0;
 const STATUS_H: f32 = 22.0;
-const SIDEBAR_W: f32 = 248.0;
+const SIDEBAR_W: f32 = 272.0;
 const HEADER_H: f32 = 40.0;
 const ROW_H: f32 = 28.0;
 /// A row with its second line (what the agent is doing / did).
@@ -49,16 +53,53 @@ const ROW2_H: f32 = 42.0;
 const GROUP_H: f32 = 24.0;
 const TERM_SIZE: f32 = 12.0;
 const LINE_H: f32 = 18.0;
-const GROUPS: [&str; 5] = ["Needs you", "Running", "Queued", "Done", "Ended"];
+
+/// A task across machines: (machine index, task id). Ids repeat between machines.
+pub type TaskKey = (usize, u64);
 
 pub enum Msg {
-    Tasks(Vec<TaskInfo>),
+    Tasks(usize, Vec<TaskInfo>),
     Output(u64, Vec<u8>),
     Exited(u64),
     /// A finished task's recorded PTY output.
-    History(u64, Vec<u8>),
-    Lost,
+    History(TaskKey, Vec<u8>),
+    Link(usize, Link),
     Reply(Tag, Result<Reply, String>),
+    /// The add-machine dialog's connection test.
+    Tested(Result<String, String>),
+}
+
+/// How a machine's daemon is reachable.
+#[derive(Clone, PartialEq)]
+pub enum Link {
+    Connecting,
+    /// Round trip of a ping through the tunnel; 0 for this machine.
+    Up(u32),
+    Down(String),
+}
+
+/// A machine whose daemon this window shows: this one (`cfg` None) or one reached over ssh.
+struct Host {
+    cfg: Option<Machine>,
+    link: Link,
+    tasks: Vec<TaskInfo>,
+    /// Removed this session; kept so other hosts' indices stay valid.
+    removed: bool,
+    /// Wakes the link thread to retry now; dropping it ends the thread.
+    retry: Option<mpsc::Sender<()>>,
+    stop: Arc<AtomicBool>,
+    tunnel: Arc<Mutex<Option<std::process::Child>>>,
+}
+
+impl Host {
+    fn name(&self) -> &str {
+        self.cfg.as_ref().map_or(if cfg!(target_os = "macos") { "This Mac" } else { "This machine" }, |c| &c.name)
+    }
+
+    /// The daemon socket to use; None is the local daemon (started on demand).
+    fn sock(&self) -> Option<PathBuf> {
+        self.cfg.as_ref().map(|c| machine::local_socket(&c.name))
+    }
 }
 
 struct Gfx {
@@ -71,7 +112,7 @@ struct Gfx {
 /// The focused task's attach stream and its local copy of the terminal.
 struct Session {
     seq: u64,
-    task: u64,
+    task: TaskKey,
     writer: UnixStream,
     screen: Screen,
     size: (u16, u16),
@@ -90,19 +131,36 @@ enum Focus {
     Message,
     Prompt,
     Base,
+    Repo,
     Note,
     CommitMsg,
+    HostSsh,
+    HostName,
+    HostRepo,
 }
 
 struct Dialog {
     prompt: String,
     agent: usize,
+    host: usize,
+    /// Repo on the chosen machine.
+    repo: String,
     base: String,
     error: String,
 }
 
+/// Add-machine dialog.
+struct AddHost {
+    ssh: String,
+    name: String,
+    repo: String,
+    /// Connection test: running, or its outcome.
+    test: Option<Result<String, String>>,
+    testing: bool,
+}
+
 enum Action {
-    Select(u64),
+    Select(TaskKey),
     Focus(Focus),
     NewTask,
     ToggleTheme,
@@ -113,37 +171,54 @@ enum Action {
     CloseDialog,
     OpenReview,
     Review(ReviewAction),
+    /// Folds or unfolds a sidebar section ("needs" or "host:<i>").
+    Toggle(String),
+    PickHost(usize),
+    OpenAddHost,
+    TestHost,
+    AddHost,
+    Reconnect(usize),
+    RemoveHost(usize),
 }
 
 struct App {
     proxy: EventLoopProxy<Msg>,
     repo: PathBuf,
     gfx: Option<Gfx>,
-    tasks: Vec<TaskInfo>,
-    selected: Option<u64>,
+    hosts: Vec<Host>,
+    selected: Option<TaskKey>,
     session: Option<Session>,
     seq: u64,
     pane: (u16, u16),
     dark: bool,
+    /// ⌘= / ⌘- / ⌘0: scales the whole window on top of the display's own scale.
+    zoom: f32,
     focus: Focus,
     filter: String,
     message: String,
     dialog: Option<Dialog>,
+    add_host: Option<AddHost>,
+    /// A machine whose Remove was clicked once; the next click removes it.
+    remove_armed: Option<usize>,
     review: Option<ReviewView>,
     /// Replay of a finished task's log, shown in place of a live session.
-    history: Option<(u64, Screen)>,
+    history: Option<(TaskKey, Screen)>,
     /// Wheel movement over the terminal not yet worth a whole line.
     wheel: f32,
     mods: ModifiersState,
     mouse: (f32, f32),
+    /// The click target under the mouse at the last frame, and the cursor shown for it.
+    hot: Option<usize>,
+    cursor: Cursor,
     click: Option<(f32, f32)>,
     actions: Vec<Action>,
     scroll: f32,
+    /// Sidebar sections folded to their header.
+    collapsed: std::collections::HashSet<String>,
     /// ⌘A in a text field: the next edit replaces the whole field.
     select_all: bool,
     caret_on: bool,
     blink_at: Instant,
-    lost: bool,
 }
 
 fn main() {
@@ -161,39 +236,48 @@ fn run() -> io::Result<()> {
     let p = proxy.clone();
     thread::spawn(move || {
         while let Ok(Reply::Tasks(tasks)) = proto::read_msg(&mut watch) {
-            if p.send_event(Msg::Tasks(tasks)).is_err() {
+            if p.send_event(Msg::Tasks(0, tasks)).is_err() {
                 return;
             }
         }
-        let _ = p.send_event(Msg::Lost);
+        let _ = p.send_event(Msg::Link(0, Link::Down("daemon disconnected".into())));
     });
     let mut app = App {
         proxy,
         repo: std::env::current_dir()?,
         gfx: None,
-        tasks: Vec::new(),
+        hosts: Vec::new(),
         selected: None,
         session: None,
         seq: 0,
         pane: (80, 24),
         dark: true,
+        zoom: 1.0,
         focus: Focus::Term,
         filter: String::new(),
         message: String::new(),
         dialog: None,
+        add_host: None,
+        remove_armed: None,
         review: None,
         history: None,
         wheel: 0.0,
         mods: ModifiersState::empty(),
         mouse: (0.0, 0.0),
+        hot: None,
+        cursor: Cursor::Arrow,
         click: None,
         actions: Vec::new(),
         scroll: 0.0,
+        collapsed: Default::default(),
         select_all: false,
         caret_on: true,
         blink_at: Instant::now(),
-        lost: false,
     };
+    app.link_host(None);
+    for m in machine::load() {
+        app.link_host(Some(m));
+    }
     event_loop.run_app(&mut app).map_err(io::Error::other)
 }
 
@@ -260,12 +344,28 @@ impl ApplicationHandler<Msg> for App {
 
     fn user_event(&mut self, _: &ActiveEventLoop, msg: Msg) {
         match msg {
-            Msg::Tasks(tasks) => {
-                self.tasks = tasks;
-                if self.selected.is_none_or(|id| self.task(id).is_none()) {
+            Msg::Tasks(m, tasks) => {
+                self.user_event_tasks(m, tasks);
+                if self.selected.is_none_or(|k| self.task(k).is_none()) {
                     self.selected = self.order().first().copied();
                 }
                 self.sync_session();
+            }
+            Msg::Link(m, link) => {
+                if !matches!(link, Link::Up(_)) && m != 0 {
+                    self.hosts[m].tasks.clear(); // stale once the link is gone
+                }
+                self.hosts[m].link = link;
+                if self.selected.is_some_and(|k| k.0 == m && self.task(k).is_none()) {
+                    self.selected = None;
+                    self.sync_session();
+                }
+            }
+            Msg::Tested(res) => {
+                if let Some(a) = &mut self.add_host {
+                    a.testing = false;
+                    a.test = Some(res);
+                }
             }
             Msg::Output(seq, bytes) => {
                 if let Some(s) = self.session.as_mut().filter(|s| s.seq == seq) {
@@ -291,7 +391,6 @@ impl ApplicationHandler<Msg> for App {
                     self.history = Some((id, screen));
                 }
             }
-            Msg::Lost => self.lost = true,
             Msg::Reply(tag, reply) => self.on_reply(tag, reply),
         }
         self.redraw();
@@ -299,7 +398,17 @@ impl ApplicationHandler<Msg> for App {
 
     fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CloseRequested => {
+                // ponytail: tunnels only die with a clean close; a crash leaves ssh -N running until
+                // its link drops. A watchdog pipe to each ssh would cover that.
+                for h in &self.hosts {
+                    h.stop.store(true, Ordering::Relaxed);
+                    if let Some(mut child) = h.tunnel.lock().unwrap().take() {
+                        let _ = child.kill();
+                    }
+                }
+                el.exit();
+            }
             WindowEvent::Resized(size) => {
                 if let Some(g) = &self.gfx {
                     if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
@@ -311,8 +420,13 @@ impl ApplicationHandler<Msg> for App {
             WindowEvent::ScaleFactorChanged { .. } => self.redraw(),
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::CursorMoved { position, .. } => {
-                let dpi = self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor());
+                let dpi = self.scale() as f64;
                 self.mouse = ((position.x / dpi) as f32, (position.y / dpi) as f32);
+                self.hover_changed();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.mouse = (-1.0, -1.0);
+                self.hover_changed();
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 self.click = Some(self.mouse);
@@ -360,6 +474,63 @@ impl ApplicationHandler<Msg> for App {
 
 // ---------- state ----------
 
+/// A sidebar section and its rows. `host` None is "Needs you", which spans machines.
+struct Section<'a> {
+    key: String,
+    host: Option<usize>,
+    tasks: Vec<&'a TaskInfo>,
+}
+
+/// Keeps machine `m`'s daemon reachable: runs `arranger endpoint` over ssh, forwards its socket,
+/// streams its task list, and on any failure reports why and retries with backoff (or at once
+/// when the window asks). Ends when the machine is removed.
+fn keep_linked(m: usize, cfg: Machine, p: EventLoopProxy<Msg>, retry: mpsc::Receiver<()>, stop: Arc<AtomicBool>, tunnel: Arc<Mutex<Option<std::process::Child>>>) {
+    let local = machine::local_socket(&cfg.name);
+    let mut wait = 2;
+    while !stop.load(Ordering::Relaxed) {
+        let _ = p.send_event(Msg::Link(m, Link::Connecting));
+        let err = match machine::endpoint(&cfg.ssh).and_then(|remote| machine::tunnel(&cfg.ssh, &remote, &local)) {
+            Ok(child) => {
+                *tunnel.lock().unwrap() = Some(child);
+                let watch = || -> io::Result<(UnixStream, u32)> {
+                    let t0 = Instant::now();
+                    request_at(Some(&local), &Request::Ping)?;
+                    let ms = t0.elapsed().as_millis() as u32;
+                    let mut w = connect_at(Some(&local))?;
+                    w.write_all(&proto::frame(&Request::Watch))?;
+                    Ok((w, ms))
+                };
+                let err = match watch() {
+                    Ok((mut w, ms)) => {
+                        let _ = p.send_event(Msg::Link(m, Link::Up(ms.max(1))));
+                        wait = 2;
+                        while let Ok(Reply::Tasks(tasks)) = proto::read_msg(&mut w) {
+                            if p.send_event(Msg::Tasks(m, tasks)).is_err() {
+                                return;
+                            }
+                        }
+                        "connection lost".to_string()
+                    }
+                    Err(e) => e.to_string(),
+                };
+                if let Some(mut child) = tunnel.lock().unwrap().take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                err
+            }
+            Err(e) => e.to_string(),
+        };
+        if stop.load(Ordering::Relaxed) || p.send_event(Msg::Link(m, Link::Down(err))).is_err() {
+            return;
+        }
+        if let Err(mpsc::RecvTimeoutError::Disconnected) = retry.recv_timeout(Duration::from_secs(wait)) {
+            return;
+        }
+        wait = (wait * 2).min(60);
+    }
+}
+
 fn is_live(state: &str) -> bool {
     matches!(state, "running" | "needs-you" | "done")
 }
@@ -372,6 +543,17 @@ fn group(state: &str) -> usize {
         "done" => 3,
         _ => 4, // the agent process is gone: exited, dead, failed
     }
+}
+
+/// A machine's header line: "1 needs you · 2 running · 1 done", or "no tasks".
+fn host_summary(tasks: &[TaskInfo]) -> String {
+    let mut counts = [0; 5];
+    for t in tasks {
+        counts[group(&t.state)] += 1;
+    }
+    let names = ["needs you", "running", "queued", "done", "ended"];
+    let parts: Vec<String> = counts.iter().zip(names).filter(|(n, _)| **n > 0).map(|(n, s)| format!("{n} {s}")).collect();
+    if parts.is_empty() { "no tasks".into() } else { parts.join(" · ") }
 }
 
 fn state_color(t: &Theme, state: &str) -> Rgba {
@@ -418,7 +600,7 @@ fn status_line(task: &TaskInfo, queue_pos: usize) -> String {
         (1, _) => format!("{}{since}", task.action),
         (2, _) => format!("#{queue_pos} in queue"),
         (3, _) if task.summary.is_empty() => "finished its turn".into(),
-        (3, _) => format!("“{}”", task.summary),
+        (3, _) => format!("“{}”", review::plain(&task.summary)),
         _ => match task.state.as_str() {
             "dead" => "died with the daemon · history kept".into(),
             "failed" => "failed to start".into(),
@@ -560,29 +742,130 @@ impl App {
         if self.dark { &GRAPHITE } else { &PAPER }
     }
 
-    fn task(&self, id: u64) -> Option<&TaskInfo> {
-        self.tasks.iter().find(|t| t.id == id)
+    fn task(&self, (m, id): TaskKey) -> Option<&TaskInfo> {
+        self.hosts.get(m)?.tasks.iter().find(|t| t.id == id)
     }
 
     fn current(&self) -> Option<&TaskInfo> {
-        self.selected.and_then(|id| self.task(id))
+        self.selected.and_then(|k| self.task(k))
     }
 
-    fn visible(&self) -> Vec<&TaskInfo> {
+    fn all_tasks(&self) -> impl Iterator<Item = &TaskInfo> {
+        self.hosts.iter().filter(|h| !h.removed).flat_map(|h| &h.tasks)
+    }
+
+    fn sock(&self, m: usize) -> Option<PathBuf> {
+        self.hosts.get(m).and_then(Host::sock)
+    }
+
+    /// Sidebar sections: "Needs you" across every machine, then each machine's other tasks,
+    /// newest first within each state.
+    fn sections(&self) -> Vec<Section<'_>> {
         let f = self.filter.to_lowercase();
-        let mut v: Vec<&TaskInfo> = self
-            .tasks
-            .iter()
-            .filter(|t| f.is_empty() || format!("{} {} {}", title(t), t.agent, t.branch).to_lowercase().contains(&f))
-            .collect();
-        // Done: most recently finished first; everything else in start order.
-        v.sort_by_key(|t| (group(&t.state), if group(&t.state) == 3 { u64::MAX - t.since } else { t.id }));
-        v
+        let shown = |t: &&TaskInfo| {
+            f.is_empty() || format!("{} {} {} {}", title(t), t.agent, t.branch, self.hosts[t.machine].name()).to_lowercase().contains(&f)
+        };
+        let sort = |v: &mut Vec<&TaskInfo>| v.sort_by_key(|t| (group(&t.state), std::cmp::Reverse(t.created), std::cmp::Reverse(t.id)));
+        let mut needs: Vec<&TaskInfo> = self.all_tasks().filter(shown).filter(|t| group(&t.state) == 0).collect();
+        sort(&mut needs);
+        let mut out = vec![Section { key: "needs".into(), host: None, tasks: needs }];
+        for (i, h) in self.hosts.iter().enumerate().filter(|(_, h)| !h.removed) {
+            let mut tasks: Vec<&TaskInfo> = h.tasks.iter().filter(shown).filter(|t| group(&t.state) != 0).collect();
+            sort(&mut tasks);
+            out.push(Section { key: format!("host:{i}"), host: Some(i), tasks });
+        }
+        out
     }
 
-    /// Sidebar order, for keyboard switching.
-    fn order(&self) -> Vec<u64> {
-        self.visible().iter().map(|t| t.id).collect()
+    /// Sidebar order, for keyboard switching: rows of folded sections are skipped.
+    fn order(&self) -> Vec<TaskKey> {
+        let sections = self.sections();
+        let open = sections.iter().filter(|s| !self.collapsed.contains(&s.key));
+        open.flat_map(|s| s.tasks.iter().map(|t| (t.machine, t.id))).collect()
+    }
+
+    /// Adds a machine to the window; a remote one gets a thread that keeps its ssh link up.
+    fn link_host(&mut self, cfg: Option<Machine>) {
+        let i = self.hosts.len();
+        let (tx, rx) = mpsc::channel();
+        let host = Host {
+            cfg: cfg.clone(),
+            link: if cfg.is_some() { Link::Connecting } else { Link::Up(0) },
+            tasks: Vec::new(),
+            removed: false,
+            retry: cfg.is_some().then_some(tx),
+            stop: Arc::default(),
+            tunnel: Arc::default(),
+        };
+        if let Some(cfg) = cfg {
+            let (p, stop, tunnel) = (self.proxy.clone(), host.stop.clone(), host.tunnel.clone());
+            thread::spawn(move || keep_linked(i, cfg, p, rx, stop, tunnel));
+        }
+        self.hosts.push(host);
+    }
+
+    fn user_event_tasks(&mut self, m: usize, mut tasks: Vec<TaskInfo>) {
+        for t in &mut tasks {
+            t.machine = m;
+        }
+        if let Some(h) = self.hosts.get_mut(m).filter(|h| !h.removed) {
+            h.tasks = tasks;
+        }
+    }
+
+    /// The add-machine dialog's Add: saves it and starts linking.
+    fn save_host(&mut self) {
+        let Some(a) = &self.add_host else { return };
+        let ssh = a.ssh.trim().to_string();
+        if ssh.is_empty() {
+            return;
+        }
+        // Default name: the host part of user@host.
+        let name = Some(a.name.trim().to_string()).filter(|n| !n.is_empty()).unwrap_or_else(|| ssh.rsplit('@').next().unwrap_or(&ssh).to_string());
+        if self.hosts.iter().any(|h| !h.removed && h.name() == name) {
+            if let Some(a) = &mut self.add_host {
+                a.test = Some(Err(format!("a machine named {name} is already added")));
+            }
+            return;
+        }
+        let cfg = Machine { name, ssh, repo: a.repo.trim().to_string() };
+        let mut list = machine::load();
+        list.push(cfg.clone());
+        let _ = machine::save(&list);
+        self.add_host = None;
+        self.focus = Focus::Term;
+        self.link_host(Some(cfg));
+    }
+
+    fn remove_host(&mut self, m: usize) {
+        let Some(h) = self.hosts.get_mut(m).filter(|h| h.cfg.is_some()) else { return };
+        h.stop.store(true, Ordering::Relaxed);
+        if let Some(mut child) = h.tunnel.lock().unwrap().take() {
+            let _ = child.kill();
+        }
+        h.retry = None;
+        h.removed = true;
+        h.tasks.clear();
+        let name = h.name().to_string();
+        let mut list = machine::load();
+        list.retain(|c| c.name != name);
+        let _ = machine::save(&list);
+        if self.selected.is_some_and(|k| k.0 == m) {
+            self.selected = None;
+            self.sync_session();
+        }
+    }
+
+    /// Redraws only when the mouse crosses into another target, so moving it costs nothing otherwise.
+    fn hover_changed(&self) {
+        if self.gfx.as_ref().is_some_and(|g| g.r.hot(self.mouse) != self.hot) {
+            self.redraw();
+        }
+    }
+
+    /// Physical pixels per layout pixel: the display's scale times the zoom.
+    fn scale(&self) -> f32 {
+        self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor() as f32) * self.zoom
     }
 
     fn redraw(&self) {
@@ -592,15 +875,15 @@ impl App {
     }
 
     fn sync_session(&mut self) {
-        let want = self.current().filter(|t| is_live(&t.state)).map(|t| t.id);
+        let want = self.current().filter(|t| is_live(&t.state)).map(|t| (t.machine, t.id));
         self.load_history();
         if self.session.as_ref().map(|s| s.task) == want {
             return;
         }
         self.session = None;
-        let Some(id) = want else { return };
+        let Some(key @ (m, id)) = want else { return };
         let (cols, rows) = self.pane;
-        let Ok(mut sock) = connect() else { return };
+        let Ok(mut sock) = connect_at(self.sock(m).as_deref()) else { return };
         if sock.write_all(&proto::frame(&Request::Attach { id, cols, rows, native: false })).is_err() {
             return;
         }
@@ -615,7 +898,7 @@ impl App {
             }
             let _ = p.send_event(Msg::Exited(seq));
         });
-        self.session = Some(Session { seq, task: id, writer: sock, screen: Screen::new(cols, rows), size: (cols, rows) });
+        self.session = Some(Session { seq, task: key, writer: sock, screen: Screen::new(cols, rows), size: (cols, rows) });
     }
 
     /// For a task that is no longer running, replays its PTY log so its chat stays readable.
@@ -624,15 +907,17 @@ impl App {
             self.history = None;
             return;
         };
-        if self.history.as_ref().is_some_and(|h| h.0 == task.id) {
+        let key = (task.machine, task.id);
+        if self.history.as_ref().is_some_and(|h| h.0 == key) {
             return;
         }
-        let (id, p) = (task.id, self.proxy.clone());
+        let (sock, p) = (self.sock(key.0), self.proxy.clone());
         self.history = None;
         thread::spawn(move || {
-            let path = proto::data_dir().join(format!("logs/{id}.zst"));
-            if let Ok(bytes) = std::fs::File::open(path).and_then(zstd::decode_all) {
-                let _ = p.send_event(Msg::History(id, bytes));
+            if let Ok(Reply::Log(zst)) = request_at(sock.as_deref(), &Request::Log { id: key.1 }) {
+                if let Ok(bytes) = zstd::decode_all(&zst[..]) {
+                    let _ = p.send_event(Msg::History(key, bytes));
+                }
             }
         });
     }
@@ -655,39 +940,62 @@ impl App {
     }
 
     fn open_dialog(&mut self) {
-        let base = Command::new("git")
-            .arg("-C")
-            .arg(&self.repo)
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|| "HEAD".into());
-        self.dialog = Some(Dialog { prompt: String::new(), agent: 0, base, error: String::new() });
+        // Starts on the selected task's machine.
+        let host = self.current().map_or(0, |t| t.machine);
+        self.dialog = Some(Dialog { prompt: String::new(), agent: 0, host: 0, repo: String::new(), base: String::new(), error: String::new() });
+        self.pick_host(host);
         self.focus = Focus::Prompt;
         self.select_all = false;
     }
 
+    /// Points the new-task dialog at machine `m`: its default repo, and here the current branch.
+    fn pick_host(&mut self, m: usize) {
+        let Some(h) = self.hosts.get(m).filter(|h| !h.removed) else { return };
+        let (repo, base) = match &h.cfg {
+            Some(c) => (c.repo.clone(), String::new()), // the remote's checked-out branch
+            None => {
+                let base = Command::new("git")
+                    .arg("-C")
+                    .arg(&self.repo)
+                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_else(|| "HEAD".into());
+                (self.repo.display().to_string(), base)
+            }
+        };
+        if let Some(d) = &mut self.dialog {
+            (d.host, d.repo, d.base) = (m, repo, base);
+        }
+    }
+
     /// Starts the dialog's task and switches to it; `attach` puts keys straight into its terminal.
     fn start(&mut self, attach: bool) {
+        let sock = self.dialog.as_ref().and_then(|d| self.sock(d.host));
         let Some(d) = &mut self.dialog else { return };
+        let m = d.host;
+        if d.repo.trim().is_empty() {
+            d.error = "Which repo on that machine? Type its path.".into();
+            return;
+        }
         let req = Request::New {
             agent: AGENTS[d.agent].into(),
-            repo: self.repo.clone(),
+            repo: d.repo.trim().into(),
             base: Some(d.base.trim().to_string()).filter(|b| !b.is_empty()),
             prompt: Some(d.prompt.trim().to_string()).filter(|p| !p.is_empty()),
         };
-        match request(&req) {
+        match request_at(sock.as_deref(), &req) {
             Ok(Reply::Created { id, .. }) => {
                 self.dialog = None;
                 self.focus = if attach { Focus::Term } else { Focus::Message };
                 // Fetch the list now: the watch push may not have the new task yet, and selection
                 // would fall back to the first row.
-                if let Ok(Reply::Tasks(tasks)) = request(&Request::List { files: false }) {
-                    self.tasks = tasks;
+                if let Ok(Reply::Tasks(tasks)) = request_at(sock.as_deref(), &Request::List { files: false }) {
+                    self.user_event_tasks(m, tasks);
                 }
-                self.selected = Some(id);
+                self.selected = Some((m, id));
                 self.sync_session();
             }
             Ok(other) => d.error = format!("{other:?}"),
@@ -713,6 +1021,10 @@ impl App {
                     "1" => self.actions.push(Action::Answer(true)),
                     "2" => self.actions.push(Action::Answer(false)),
                     "t" => self.actions.push(Action::ToggleTheme),
+                    // Rounded to tenths so repeated steps land on the same glyph sizes in the atlas.
+                    "=" | "+" => self.zoom = ((self.zoom + 0.1) * 10.0).round().min(20.0) / 10.0,
+                    "-" | "_" => self.zoom = ((self.zoom - 0.1) * 10.0).round().max(6.0) / 10.0,
+                    "0" | ")" => self.zoom = 1.0,
                     "f" => self.actions.push(Action::Focus(Focus::Filter)),
                     "i" => self.actions.push(Action::Focus(Focus::Message)),
                     "v" => self.paste(),
@@ -735,6 +1047,12 @@ impl App {
             }
             return;
         }
+        if self.add_host.is_some() && ev.logical_key == Key::Named(NamedKey::Tab) {
+            let order = [Focus::HostSsh, Focus::HostName, Focus::HostRepo];
+            let i = order.iter().position(|f| *f == self.focus).map_or(0, |i| (i + 1) % order.len());
+            self.actions.push(Action::Focus(order[i]));
+            return;
+        }
         if self.dialog.is_some() && ev.logical_key == Key::Named(NamedKey::Tab) {
             self.actions.push(Action::PickAgent(usize::MAX));
             return;
@@ -746,7 +1064,8 @@ impl App {
             return; // the agent's terminal isn't on screen
         }
         let typed = ev.text.as_ref().filter(|t| t.chars().any(|c| !c.is_control()) && !m.control_key() && !m.alt_key());
-        if self.focus == Focus::Term && typed.is_some() && self.session.as_ref().and_then(|s| agent_box(&s.screen)).is_some() {
+        let kind = self.current().map(|t| adapter::kind(&t.agent).to_string()).unwrap_or_default();
+        if self.focus == Focus::Term && typed.is_some() && self.session.as_ref().and_then(|s| agent_box(&s.screen, &kind)).is_some() {
             // The agent's own input box is hidden behind ours: typing goes to ours.
             self.focus = Focus::Message;
         }
@@ -766,7 +1085,10 @@ impl App {
         let replace = std::mem::take(&mut self.select_all);
         match &ev.logical_key {
             Key::Named(NamedKey::Escape) => {
-                if self.dialog.is_some() {
+                if self.add_host.is_some() {
+                    self.add_host = None;
+                    self.focus = Focus::Term;
+                } else if self.dialog.is_some() {
                     self.actions.push(Action::CloseDialog);
                 } else if focus == Focus::Note {
                     self.actions.push(Action::Review(ReviewAction::SaveNote));
@@ -779,13 +1101,14 @@ impl App {
             Key::Named(NamedKey::Enter) => match focus {
                 Focus::Message => {
                     let text = std::mem::take(&mut self.message);
-                    if let Some(id) = self.selected.filter(|_| !text.trim().is_empty()) {
-                        self.spawn_request(Tag::Message, Request::Prompt { id, text });
+                    if let Some((m, id)) = self.selected.filter(|_| !text.trim().is_empty()) {
+                        self.spawn_request(m, Tag::Message, Request::Prompt { id, text });
                     }
                 }
                 Focus::Note => self.actions.push(Action::Review(ReviewAction::SaveNote)),
                 Focus::CommitMsg => self.actions.push(Action::Review(ReviewAction::Commit(false))),
-                Focus::Prompt | Focus::Base => self.actions.push(Action::Start(false)),
+                Focus::Prompt | Focus::Base | Focus::Repo => self.actions.push(Action::Start(false)),
+                Focus::HostSsh | Focus::HostName | Focus::HostRepo => self.actions.push(Action::AddHost),
                 _ => self.focus = Focus::Term,
             },
             Key::Named(NamedKey::Backspace) => {
@@ -823,9 +1146,18 @@ impl App {
         if let (Focus::CommitMsg, Some(rv)) = (focus, &mut self.review) {
             return &mut rv.message;
         }
+        if let Some(a) = &mut self.add_host {
+            match focus {
+                Focus::HostSsh => return &mut a.ssh,
+                Focus::HostName => return &mut a.name,
+                Focus::HostRepo => return &mut a.repo,
+                _ => {}
+            }
+        }
         match (focus, &mut self.dialog) {
             (Focus::Prompt, Some(d)) => &mut d.prompt,
             (Focus::Base, Some(d)) => &mut d.base,
+            (Focus::Repo, Some(d)) => &mut d.repo,
             (Focus::Filter, _) => &mut self.filter,
             _ => &mut self.message,
         }
@@ -865,8 +1197,8 @@ impl App {
                 }
                 Action::ToggleTheme => self.dark = !self.dark,
                 Action::Answer(allow) => {
-                    if let Some(id) = self.current().filter(|t| t.asking).map(|t| t.id) {
-                        let _ = request(&Request::Answer { id, allow, message: String::new() });
+                    if let Some((m, id)) = self.current().filter(|t| t.asking).map(|t| (t.machine, t.id)) {
+                        let _ = request_at(self.sock(m).as_deref(), &Request::Answer { id, allow, message: String::new() });
                     }
                 }
                 Action::Input(bytes) => self.send_input(bytes),
@@ -882,6 +1214,42 @@ impl App {
                     }
                 }
                 Action::Review(a) => self.review_action(a),
+                Action::Toggle(key) => {
+                    if !self.collapsed.remove(&key) {
+                        self.collapsed.insert(key);
+                    }
+                }
+                Action::PickHost(m) => self.pick_host(m),
+                Action::OpenAddHost => {
+                    self.add_host = Some(AddHost { ssh: String::new(), name: String::new(), repo: String::new(), test: None, testing: false });
+                    self.focus = Focus::HostSsh;
+                    self.select_all = false;
+                }
+                Action::TestHost => {
+                    if let Some(a) = self.add_host.as_mut().filter(|a| !a.testing && !a.ssh.trim().is_empty()) {
+                        a.testing = true;
+                        a.test = None;
+                        let (ssh, p) = (a.ssh.trim().to_string(), self.proxy.clone());
+                        thread::spawn(move || {
+                            let res = machine::endpoint(&ssh).map(|sock| format!("arranger ok · daemon at {}", sock.display()));
+                            let _ = p.send_event(Msg::Tested(res.map_err(|e| e.to_string())));
+                        });
+                    }
+                }
+                Action::AddHost => self.save_host(),
+                Action::Reconnect(m) => {
+                    if let Some(tx) = self.hosts.get(m).and_then(|h| h.retry.as_ref()) {
+                        let _ = tx.send(());
+                    }
+                }
+                Action::RemoveHost(m) => {
+                    if self.remove_armed == Some(m) {
+                        self.remove_armed = None;
+                        self.remove_host(m);
+                    } else {
+                        self.remove_armed = Some(m);
+                    }
+                }
             }
         }
     }
@@ -898,8 +1266,14 @@ impl App {
         w
     }
 
-    fn hit(&self, r: Rect) -> bool {
-        self.click.is_some_and(|p| r.contains(p))
+    /// A button or row: was it clicked this frame? Hover gives it a tint and a hand cursor.
+    fn hit(&self, r: &mut Renderer, rect: Rect) -> bool {
+        self.hit_as(r, rect, Cursor::Pointer)
+    }
+
+    fn hit_as(&self, r: &mut Renderer, rect: Rect, cursor: Cursor) -> bool {
+        r.target(rect, cursor);
+        self.click.is_some_and(|p| rect.contains(p))
     }
 
     // ---------- drawing ----------
@@ -907,7 +1281,7 @@ impl App {
     fn draw(&mut self) {
         let Some(mut gfx) = self.gfx.take() else { return };
         let size = gfx.window.inner_size();
-        let dpi = gfx.window.scale_factor() as f32;
+        let dpi = gfx.window.scale_factor() as f32 * self.zoom;
         let (w, h) = (size.width as f32 / dpi, size.height as f32 / dpi);
         let t = self.theme();
         let r = &mut gfx.r;
@@ -924,7 +1298,19 @@ impl App {
         if self.dialog.is_some() {
             self.draw_dialog(r, t, w, h);
         }
-        r.finish();
+        if self.add_host.is_some() {
+            self.draw_add_host(r, t, w, h);
+        }
+        let cursor = r.finish(self.mouse);
+        self.hot = r.hot(self.mouse);
+        if cursor != self.cursor {
+            self.cursor = cursor;
+            gfx.window.set_cursor(match cursor {
+                Cursor::Arrow => CursorIcon::Default,
+                Cursor::Pointer => CursorIcon::Pointer,
+                Cursor::Text => CursorIcon::Text,
+            });
+        }
         if let Ok(path) = std::env::var("ARRANGER_SNAPSHOT") {
             let _ = r.snapshot(&path);
         }
@@ -958,7 +1344,7 @@ impl App {
                 r.rect(tab, 3.0, t.raised);
             }
             r.text(tab.x + 8.0, r.center(tab, UI, 12.0), label, UI, 12.0, 400, if on { t.text } else { t.text3 }, tw);
-            if self.hit(tab) && !on {
+            if self.hit(r, tab) && !on {
                 self.actions.push(if label == "Review" { Action::OpenReview } else { Action::Review(ReviewAction::Close) });
             }
             nx += tw + 1.0;
@@ -972,7 +1358,7 @@ impl App {
         r.rect(Rect::new(b.x + 8.0, b.y + 7.0, 6.0, 12.0), 2.0, t.bg);
         r.rect(Rect::new(b.x + 14.0, b.y + 7.0, 6.0, 12.0), 2.0, t.needs);
         r.text(b.x + 28.0, r.center(b, UI, 12.0), t.name, UI, 12.0, 400, t.text2, label_w + 4.0);
-        if self.hit(b) {
+        if self.hit(r, b) {
             self.actions.push(Action::ToggleTheme);
         }
     }
@@ -989,80 +1375,181 @@ impl App {
         for (i, lw) in [16.0, 10.0, 4.0].iter().enumerate() {
             r.rect(Rect::new(f.x + 8.0 + (16.0 - lw) / 2.0 * 0.7, f.y + 8.0 + i as f32 * 4.0, lw * 0.7, 1.4), 0.5, t.text3);
         }
-        let n = self.tasks.len();
+        let n = self.all_tasks().count();
+        let hosts = self.hosts.iter().filter(|h| !h.removed).count();
+        let placeholder = if hosts > 1 { format!("Filter {n} agents on {hosts} machines") } else { format!("Filter {n} agents") };
         if self.filter.is_empty() && !focused {
-            r.text(f.x + 25.0, r.center(f, UI, 12.0), &format!("Filter {n} agents"), UI, 12.0, 400, t.text3, f.w - 50.0);
+            r.text(f.x + 25.0, r.center(f, UI, 12.0), &placeholder, UI, 12.0, 400, t.text3, f.w - 50.0);
         } else {
             self.field_text(r, t, f.x + 25.0, r.center(f, UI, 12.0), &self.filter.clone(), UI, 12.0, f.w - 50.0, focused, t.work);
         }
         r.text(f.x + f.w - 8.0 - r.measure(MONO, 10.0, 400, &mod_label("F")), r.center(f, MONO, 10.0), &mod_label("F"), MONO, 10.0, 400, t.text3, 60.0);
-        if self.hit(f) {
+        if self.hit_as(r, f, Cursor::Text) {
             self.actions.push(Action::Focus(Focus::Filter));
         }
         let plus = Rect::new(SIDEBAR_W - 8.0 - 26.0, f.y, 26.0, 26.0);
         r.rect(plus, 3.0, t.primary_bg);
         r.rect(Rect::new(plus.x + 7.5, plus.y + 12.0, 11.0, 2.0), 1.0, t.primary_fg);
         r.rect(Rect::new(plus.x + 12.0, plus.y + 7.5, 2.0, 11.0), 1.0, t.primary_fg);
-        if self.hit(plus) {
+        if self.hit(r, plus) {
             self.actions.push(Action::NewTask);
         }
 
-        // Grouped rows.
-        let list = Rect::new(0.0, f.y + f.h + 8.0, SIDEBAR_W - 1.0, side.y + side.h - (f.y + f.h + 8.0));
+        // Sections: Needs you (every machine), then one per machine.
+        let add = Rect::new(8.0, side.y + side.h - 8.0 - 28.0, SIDEBAR_W - 16.0, 28.0);
+        let list = Rect::new(0.0, f.y + f.h + 8.0, SIDEBAR_W - 1.0, add.y - 6.0 - (f.y + f.h + 8.0));
         r.set_clip(Some(list));
-        let visible = self.visible();
+        let multi = self.hosts.iter().filter(|h| !h.removed).count() > 1;
+        let clicked = |p: Option<(f32, f32)>| p.is_some_and(|p| list.contains(p));
         let mut y = list.y - self.scroll;
         let mut picks = Vec::new();
-        for (g, label) in GROUPS.iter().enumerate() {
-            let items: Vec<&TaskInfo> = visible.iter().copied().filter(|t| group(&t.state) == g).collect();
-            if items.is_empty() {
+        let sections = self.sections();
+        for (i, sec) in sections.iter().enumerate() {
+            let folded = self.collapsed.contains(&sec.key);
+            let chevron = |r: &mut Renderer, cy: f32| {
+                let (id, path) = if folded { (6, "M24 16L42 32L24 48Z") } else { (5, "M16 24L48 24L32 42Z") };
+                r.path(id, path, None, SIDEBAR_W - 26.0, cy - 5.0, 10.0, t.text3);
+            };
+            let mut host_down = None;
+            match sec.host {
+                None if sec.tasks.is_empty() => continue,
+                None => {
+                    let head = Rect::new(6.0, y + 4.0, SIDEBAR_W - 13.0, GROUP_H - 4.0);
+                    r.rect(Rect::new(12.0, head.y + head.h / 2.0 - 2.5, 5.0, 5.0), 1.0, t.needs);
+                    let lw = r.text(23.0, r.center(head, UI, 10.5), "NEEDS YOU", UI, 10.5, 500, t.text3, 150.0);
+                    r.text(29.0 + lw, r.center(head, MONO, 10.5), &sec.tasks.len().to_string(), MONO, 10.5, 400, t.text3, 40.0);
+                    if multi {
+                        let note = "all machines";
+                        let nw = r.measure(UI, 10.5, 400, note);
+                        r.text(SIDEBAR_W - 34.0 - nw, r.center(head, UI, 10.5), note, UI, 10.5, 400, t.text3, nw + 2.0);
+                    }
+                    chevron(r, head.y + head.h / 2.0);
+                    if self.hit(r, head) && clicked(self.click) {
+                        picks.push(Action::Toggle(sec.key.clone()));
+                    }
+                    y += GROUP_H;
+                }
+                Some(m) => {
+                    let h = &self.hosts[m];
+                    if i > 0 {
+                        r.rect(Rect::new(6.0, y + 4.0, SIDEBAR_W - 13.0, 1.0), 0.0, t.border);
+                    }
+                    let head = Rect::new(6.0, y + 8.0, SIDEBAR_W - 13.0, 38.0);
+                    let (dot, status, sc) = match &h.link {
+                        Link::Up(ms) => {
+                            let mut s = host_summary(&h.tasks);
+                            if h.cfg.is_some() {
+                                s += &format!(" · {ms} ms");
+                            }
+                            (t.done, s, t.text3)
+                        }
+                        Link::Connecting => (t.needs, "connecting…".to_string(), t.text3),
+                        Link::Down(e) => {
+                            host_down = Some(m);
+                            (t.del, format!("unreachable · {e}"), t.del)
+                        }
+                    };
+                    r.rect(Rect::new(head.x + 6.0, head.y + 9.0, 7.0, 7.0), 3.5, dot);
+                    let top = Rect::new(head.x, head.y + 2.0, head.w, 20.0);
+                    let nw = r.text(head.x + 20.0, r.center(top, UI, 12.5), h.name(), UI, 12.5, 600, t.text, 140.0);
+                    let addr = h.cfg.as_ref().map_or("local", |c| c.ssh.as_str());
+                    r.text(head.x + 26.0 + nw, r.center(top, MONO, 10.5), addr, MONO, 10.5, 400, t.text3, head.w - nw - 60.0);
+                    let sub = Rect::new(head.x + 20.0, head.y + 21.0, head.w - 40.0, 15.0);
+                    r.text(sub.x, r.center(sub, UI, 11.0), &status, UI, 11.0, 400, sc, sub.w);
+                    chevron(r, top.y + top.h / 2.0);
+                    if self.hit(r, head) && clicked(self.click) {
+                        picks.push(Action::Toggle(sec.key.clone()));
+                    }
+                    y += 50.0;
+                }
+            }
+            if let Some(m) = host_down {
+                // Reconnect / Remove under an unreachable machine.
+                let mut bx = 26.0;
+                let armed = self.remove_armed == Some(m);
+                for (label, action) in [("Reconnect", Action::Reconnect(m)), (if armed { "Click again to remove" } else { "Remove" }, Action::RemoveHost(m))] {
+                    let bw = r.measure(UI, 11.5, 400, label) + 16.0;
+                    let b = Rect::new(bx, y, bw, 22.0);
+                    r.frame(b, 3.0, t.panel, if armed && bx > 26.0 { t.del } else { t.border2 });
+                    r.text(b.x + 8.0, r.center(b, UI, 11.5), label, UI, 11.5, 400, if bx > 26.0 { t.del } else { t.text }, bw);
+                    if self.hit(r, b) && clicked(self.click) {
+                        picks.push(action);
+                    }
+                    bx += bw + 6.0;
+                }
+                y += 30.0;
                 continue;
             }
-            let color = [t.needs, t.work, t.faint, t.done, t.faint][g];
-            let head = Rect::new(12.0, y + 6.0, SIDEBAR_W, GROUP_H - 6.0);
-            r.rect(Rect::new(12.0, head.y + head.h / 2.0 - 2.5, 5.0, 5.0), 1.0, color);
-            let lw = r.text(23.0, r.center(head, UI, 10.5), &label.to_uppercase(), UI, 10.5, 500, t.text3, 150.0);
-            r.text(29.0 + lw, r.center(head, MONO, 10.5), &items.len().to_string(), MONO, 10.5, 400, t.faint, 40.0);
-            y += GROUP_H;
-            for (pos, task) in items.into_iter().enumerate() {
-                let line = status_line(task, pos + 1);
+            if folded {
+                continue;
+            }
+            if sec.host.is_some_and(|m| self.hosts[m].link == Link::Up(0) || matches!(self.hosts[m].link, Link::Up(_))) && sec.tasks.is_empty() {
+                let note = if self.filter.is_empty() { format!("No tasks · {} to start one", mod_label("N")) } else { "No matches".into() };
+                r.text(26.0, y + 2.0, &note, UI, 11.5, 400, t.text3, SIDEBAR_W - 40.0);
+                y += 24.0;
+            }
+            for task in &sec.tasks {
                 let row = Rect::new(6.0, y, SIDEBAR_W - 13.0, ROW2_H);
-                let top = Rect::new(row.x, row.y + 2.0, row.w, 22.0);
-                let on = self.selected == Some(task.id);
-                let bg = if on { t.sel } else { t.panel };
-                if on {
-                    r.frame(row, 3.0, bg, t.sel_ring);
-                }
-                state_icon(r, t, &task.state, row.x + 8.0, top.y + top.h / 2.0, bg);
-                // Right: how long it's been idle once done, else how long it has existed.
-                let time = if g == 3 && task.since != 0 { ago(task.since) } else { age(task) };
-                let tw = r.measure(MONO, 10.5, 400, &time);
-                let text_x = row.x + 28.0;
-                let ended = g == 4;
-                let tc = if ended { t.text3 } else if on { t.tc_on } else { t.tc };
-                r.text(text_x, r.center(top, UI, 12.5), &title(task), UI, 12.5, 400, tc, row.w - 28.0 - tw - 22.0);
-                r.rect(Rect::new(row.x + row.w - 8.0 - tw - 11.0, top.y + top.h / 2.0 - 2.5, 5.0, 5.0), 1.0, accent(adapter::kind(&task.agent)));
-                r.text(row.x + row.w - 8.0 - tw, r.center(top, MONO, 10.5), &time, MONO, 10.5, 400, t.text3, tw + 2.0);
-                let sub = Rect::new(text_x, top.y + top.h - 3.0, row.w - 36.0, 16.0);
-                let sc = match g {
-                    0 => t.needs,
-                    4 => t.faint,
-                    _ => t.text3,
-                };
-                r.text(sub.x, r.center(sub, UI, 11.5), &line.replace('\n', " "), UI, 11.5, 400, sc, sub.w);
-                if self.hit(row) && list.contains(self.click.unwrap()) {
-                    picks.push(task.id);
+                let chip = (sec.host.is_none() && multi).then(|| self.hosts[task.machine].name());
+                if self.draw_row(r, t, task, row, chip) && clicked(self.click) {
+                    picks.push(Action::Select((task.machine, task.id)));
                 }
                 y += ROW2_H;
             }
         }
+        drop(sections);
         let content_h = y + self.scroll - list.y;
         self.scroll = self.scroll.min((content_h - list.h + 8.0).max(0.0));
         r.set_clip(None);
-        if self.tasks.is_empty() {
-            r.text(16.0, list.y + 10.0, &format!("No tasks yet · {} to start one", mod_label("N")), UI, 12.0, 400, t.text3, SIDEBAR_W - 24.0);
+
+        r.frame(add, 4.0, t.panel, t.border2);
+        let label = "+ Add machine";
+        let lw = r.measure(UI, 12.0, 400, label);
+        r.text(add.x + (add.w - lw) / 2.0, r.center(add, UI, 12.0), label, UI, 12.0, 400, t.text2, add.w);
+        if self.hit(r, add) {
+            picks.push(Action::OpenAddHost);
         }
-        self.actions.extend(picks.into_iter().map(Action::Select));
+        self.actions.extend(picks);
+    }
+
+    /// One task row: state icon, title, agent and age (or the machine, in Needs you), and what
+    /// it's doing. Returns whether it was clicked.
+    fn draw_row(&self, r: &mut Renderer, t: &Theme, task: &TaskInfo, row: Rect, machine: Option<&str>) -> bool {
+        let g = group(&task.state);
+        let queue_pos = self.hosts[task.machine].tasks.iter().filter(|x| x.state == "queued" && x.id <= task.id).count();
+        let line = status_line(task, queue_pos);
+        let top = Rect::new(row.x, row.y + 2.0, row.w, 22.0);
+        let on = self.selected == Some((task.machine, task.id));
+        let bg = if on { t.sel } else { t.panel };
+        if on {
+            r.frame(row, 3.0, bg, t.sel_ring);
+        }
+        state_icon(r, t, &task.state, row.x + 8.0, top.y + top.h / 2.0, bg);
+        let text_x = row.x + 28.0;
+        let right_w = if let Some(name) = machine {
+            let cw = r.measure(MONO, 10.0, 400, name) + 10.0;
+            let chip = Rect::new(row.x + row.w - 8.0 - cw, top.y + 4.0, cw, 15.0);
+            r.frame(chip, 3.0, bg, t.border2);
+            r.text(chip.x + 5.0, r.center(chip, MONO, 10.0), name, MONO, 10.0, 400, t.text2, cw);
+            cw
+        } else {
+            // How long it's been idle once done, else how long it has existed.
+            let time = if g == 3 && task.since != 0 { ago(task.since) } else { age(task) };
+            let tw = r.measure(MONO, 10.5, 400, &time);
+            r.rect(Rect::new(row.x + row.w - 8.0 - tw - 11.0, top.y + top.h / 2.0 - 2.5, 5.0, 5.0), 1.0, accent(adapter::kind(&task.agent)));
+            r.text(row.x + row.w - 8.0 - tw, r.center(top, MONO, 10.5), &time, MONO, 10.5, 400, t.text3, tw + 2.0);
+            tw + 11.0
+        };
+        let tc = if g == 4 { t.text3 } else if on { t.tc_on } else { t.tc };
+        r.text(text_x, r.center(top, UI, 12.5), &title(task), UI, 12.5, 400, tc, row.w - 28.0 - right_w - 14.0);
+        let sub = Rect::new(text_x, top.y + top.h - 3.0, row.w - 36.0, 16.0);
+        let sc = match g {
+            0 => t.needs,
+            4 => t.faint,
+            _ => t.text3,
+        };
+        r.text(sub.x, r.center(sub, UI, 11.5), &line.replace('\n', " "), UI, 11.5, 400, sc, sub.w);
+        self.hit(r, row)
     }
 
     fn draw_main(&mut self, r: &mut Renderer, t: &Theme, area: Rect) {
@@ -1086,7 +1573,10 @@ impl App {
         r.rect(Rect::new(pill.x + 6.0, pill.y + 7.5, 5.0, 5.0), 1.0, color);
         r.text(pill.x + 16.0, r.center(pill, UI, 11.0), &why, UI, 11.0, 500, color, pw - 20.0);
         let kind = adapter::kind(&task.agent);
-        let meta = format!("· {} · {}", task.branch, age(&task));
+        // Remote tasks name their machine and repo first.
+        let host = &self.hosts[task.machine];
+        let place = host.cfg.as_ref().map(|_| format!("{} · ", host.name())).unwrap_or_default();
+        let meta = format!("· {}{} · {}", place, task.branch, age(&task));
         let meta_w = r.measure(MONO, 11.0, 400, kind) + r.measure(MONO, 11.0, 400, &meta) + 4.0;
         let review_label = "Review";
         let review_key = mod_label("R");
@@ -1095,7 +1585,7 @@ impl App {
         r.rect(review, 3.0, t.primary_bg);
         let rlw = r.text(review.x + 10.0, r.center(review, UI, 12.0), review_label, UI, 12.0, 500, t.primary_fg, bw);
         r.text(review.x + 18.0 + rlw, r.center(review, MONO, 10.5), &review_key, MONO, 10.5, 400, alpha(t.primary_fg, 160), 60.0);
-        if self.hit(review) {
+        if self.hit(r, review) {
             self.actions.push(Action::OpenReview);
         }
         let tx = pill.x + pw + 10.0;
@@ -1110,35 +1600,39 @@ impl App {
         let ib = Rect::new(area.x + 10.0, input_area.y + 9.0, area.w - 20.0, 32.0);
         let focused = self.focus == Focus::Message;
         r.frame(ib, 4.0, t.panel, if focused { t.work } else { t.border2 });
+        let ib_hit = self.hit_as(r, ib, Cursor::Text); // before the chip, so the chip is on top
         r.text(ib.x + 10.0, r.center(ib, MONO, 12.5), "›", MONO, 12.5, 400, t.text3, 20.0);
         // The agent's mode (read from its hidden footer); click or ⇧Tab cycles it.
         let mut text_w = ib.w - 60.0;
-        if let Some((_, mode)) = self.session.as_ref().filter(|s| s.task == task.id).and_then(|s| agent_box(&s.screen)) {
+        if let Some((_, mode)) = self.session.as_ref().filter(|s| s.task == (task.machine, task.id)).and_then(|s| agent_box(&s.screen, kind)) {
             let label = if mode.is_empty() { "default mode".to_string() } else { mode };
             let cw = r.measure(MONO, 10.5, 400, &label) + r.measure(UI, 10.0, 400, "⇧Tab") + 26.0;
             let chip = Rect::new(ib.x + ib.w - 34.0 - cw, ib.y + 6.0, cw, 20.0);
             r.rect(chip, 3.0, t.raised);
             let lw = r.text(chip.x + 8.0, r.center(chip, MONO, 10.5), &label, MONO, 10.5, 400, t.text2, cw);
             r.text(chip.x + 16.0 + lw, r.center(chip, UI, 10.0), "⇧Tab", UI, 10.0, 400, t.text3, 40.0);
-            if self.hit(chip) {
+            if self.hit(r, chip) {
                 self.actions.push(Action::Input(b"\x1b[Z".to_vec()));
             }
             text_w -= cw + 8.0;
         }
         if self.message.is_empty() && !focused {
-            r.text(ib.x + 26.0, r.center(ib, UI, 12.5), &format!("Message {kind}  ·  {}", mod_label("I")), UI, 12.5, 400, t.text3, text_w);
+            r.text(ib.x + 26.0, r.center(ib, UI, 12.5), &match &host.cfg {
+                Some(_) => format!("Message {kind} on {}  ·  {}", host.name(), mod_label("I")),
+                None => format!("Message {kind}  ·  {}", mod_label("I")),
+            }, UI, 12.5, 400, t.text3, text_w);
         } else {
             self.field_text(r, t, ib.x + 26.0, r.center(ib, UI, 12.5), &self.message.clone(), UI, 12.5, text_w, focused, t.work);
         }
         r.text(ib.x + ib.w - 22.0, r.center(ib, MONO, 10.5), "↵", MONO, 10.5, 400, t.text3, 20.0);
-        if self.hit(ib) && self.actions.is_empty() {
+        if ib_hit && self.actions.is_empty() {
             self.actions.push(Action::Focus(Focus::Message));
         }
 
         // Terminal section.
         let sec = Rect::new(area.x, area.y + HEADER_H, area.w, input_area.y - area.y - HEADER_H);
         r.rect(sec, 0.0, t.term);
-        if self.hit(sec) {
+        if self.hit_as(r, sec, Cursor::Text) {
             self.actions.push(Action::Focus(Focus::Term));
         }
         let bar_h = if task.need.is_some() { 48.0 } else { 0.0 };
@@ -1148,7 +1642,7 @@ impl App {
         self.pane = size;
         let term_focus = self.focus == Focus::Term && self.dialog.is_none();
         let screen = match (&mut self.session, &mut self.history) {
-            (Some(s), _) if s.task == task.id => {
+            (Some(s), _) if s.task == (task.machine, task.id) => {
                 if s.size != size {
                     s.size = size;
                     s.screen.resize(size.0, size.1);
@@ -1156,13 +1650,13 @@ impl App {
                 }
                 Some(&s.screen)
             }
-            (_, Some((id, screen))) if *id == task.id => Some(&*screen), // kept at the size it was drawn for
+            (_, Some((key, screen))) if *key == (task.machine, task.id) => Some(&*screen), // kept at the size it was drawn for
             _ => None,
         };
         match screen {
             Some(screen) => {
                 // Stop above the agent's own input box: ours below replaces it.
-                let rows = agent_box(screen).map_or(screen.grid().screen_lines(), |(row, _)| row) as f32;
+                let rows = agent_box(screen, kind).map_or(screen.grid().screen_lines(), |(row, _)| row) as f32;
                 // A replay taller than the pane keeps its last text in view.
                 let last = (0..rows as usize).rev().find(|&row| (0..screen.grid().columns()).any(|c| screen.grid()[Line(row as i32)][Column(c)].c != ' '));
                 let lift = (last.map_or(0.0, |l| l as f32 + 1.0) * LINE_H - grid.h).max(0.0);
@@ -1246,7 +1740,7 @@ impl App {
         let font = if matches!(need, Event::PermissionRequest { .. }) { MONO } else { UI };
         r.text(bar.x + 20.0 + lw, r.center(bar, font, 12.0), &text.replace('\n', " "), font, 12.0, 400, t.text, bx - (bar.x + 28.0 + lw));
         for (i, (_, _, action)) in buttons.into_iter().enumerate() {
-            if rects.iter().any(|(j, b)| *j == i && self.hit(*b)) {
+            if rects.iter().any(|(j, b)| *j == i && self.hit(r, *b)) {
                 self.actions.push(action);
             }
         }
@@ -1256,7 +1750,7 @@ impl App {
         let bar = Rect::new(0.0, h - STATUS_H, w, STATUS_H);
         r.rect(Rect::new(0.0, bar.y, w, 1.0), 0.0, t.border);
         let mut counts = [0; 4];
-        for task in &self.tasks {
+        for task in self.all_tasks() {
             counts[group(&task.state).min(3)] += 1;
         }
         let mut x = 12.0;
@@ -1265,22 +1759,121 @@ impl App {
             let c = [t.needs, t.work, t.text3, t.done][i];
             x += r.text(x, y, &format!("{sym} {} {label}", counts[i]), MONO, 10.5, 400, c, 200.0) + 14.0;
         }
-        let right = if self.lost { "daemon disconnected".to_string() } else { format!("{} new · {} theme", mod_label("N"), mod_label("T")) };
+        let lost = matches!(self.hosts[0].link, Link::Down(_));
+        let remotes: Vec<&Host> = self.hosts.iter().filter(|h| h.cfg.is_some() && !h.removed).collect();
+        let right = if lost {
+            "daemon disconnected".to_string()
+        } else if !remotes.is_empty() {
+            let up = 1 + remotes.iter().filter(|h| matches!(h.link, Link::Up(_))).count();
+            format!("{up}/{} machines connected", remotes.len() + 1)
+        } else {
+            format!("{} new · {} theme", mod_label("N"), mod_label("T"))
+        };
         let rw = r.measure(MONO, 10.5, 400, &right);
-        r.text(w - 12.0 - rw, y, &right, MONO, 10.5, 400, if self.lost { t.del } else { t.text3 }, rw + 2.0);
+        r.text(w - 12.0 - rw, y, &right, MONO, 10.5, 400, if lost { t.del } else { t.text3 }, rw + 2.0);
+    }
+
+    /// A one-line text field; returns whether it was clicked.
+    fn input(&self, r: &mut Renderer, t: &Theme, b: Rect, value: &str, placeholder: &str, focus: Focus, font: usize) -> bool {
+        let focused = self.focus == focus;
+        r.frame(b, 4.0, t.bg, if focused { t.work } else { t.border2 });
+        let y = r.center(b, font, 12.5);
+        if value.is_empty() && !focused {
+            r.text(b.x + 10.0, y, placeholder, font, 12.5, 400, t.text3, b.w - 20.0);
+        } else {
+            self.field_text(r, t, b.x + 10.0, y, value, font, 12.5, b.w - 20.0, focused, t.work);
+        }
+        self.hit_as(r, b, Cursor::Text)
+    }
+
+    fn draw_add_host(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
+        let Some(a) = &self.add_host else { return };
+        let (ssh, name, repo, test, testing) = (a.ssh.clone(), a.name.clone(), a.repo.clone(), a.test.clone(), a.testing);
+        r.rect(Rect::new(0.0, 0.0, w, h), 0.0, t.scrim);
+        r.target(Rect::new(0.0, 0.0, w, h), Cursor::Arrow);
+        let dw = (w - 32.0).min(560.0);
+        let dlg = Rect::new((w - dw) / 2.0, 100.0, dw, 300.0);
+        r.frame(dlg, 8.0, t.dialog, t.border2);
+        r.rect(Rect::new(dlg.x + 1.0, dlg.y + 1.0, dlg.w - 2.0, 2.0), 1.0, t.work);
+        let x = dlg.x + 18.0;
+        let fw = dlg.w - 36.0;
+        r.text(x, dlg.y + 16.0, "ADD MACHINE", UI, 11.0, 500, t.text3, 200.0);
+        let esc = Rect::new(dlg.x + dlg.w - 48.0, dlg.y + 14.0, 30.0, 16.0);
+        r.frame(esc, 3.0, t.dialog, t.border2);
+        r.text(esc.x + 6.0, r.center(esc, MONO, 10.0), "Esc", MONO, 10.0, 400, t.text3, 30.0);
+        let mut acts = Vec::new();
+        if self.hit(r, esc) {
+            acts.push(Action::Focus(Focus::Term)); // closes, below
+        }
+
+        let mut y = dlg.y + 44.0;
+        r.text(x, y, "SSH target", UI, 11.0, 400, t.text2, 200.0);
+        if self.input(r, t, Rect::new(x, y + 18.0, fw, 32.0), &ssh, "user@host", Focus::HostSsh, MONO) {
+            acts.push(Action::Focus(Focus::HostSsh));
+        }
+        r.text(x, y + 56.0, "user@host or a Host from ~/.ssh/config. Uses your SSH keys and agent.", UI, 11.0, 400, t.text3, fw);
+        y += 84.0;
+        let half = (fw - 12.0) / 2.0;
+        r.text(x, y, "Name", UI, 11.0, 400, t.text2, 200.0);
+        r.text(x + half + 12.0, y, "Default repo", UI, 11.0, 400, t.text2, 200.0);
+        let default_name = ssh.trim().rsplit('@').next().unwrap_or("").to_string();
+        if self.input(r, t, Rect::new(x, y + 18.0, half, 32.0), &name, if default_name.is_empty() { "gpu-box" } else { &default_name }, Focus::HostName, UI) {
+            acts.push(Action::Focus(Focus::HostName));
+        }
+        if self.input(r, t, Rect::new(x + half + 12.0, y + 18.0, half, 32.0), &repo, "~/src/project", Focus::HostRepo, MONO) {
+            acts.push(Action::Focus(Focus::HostRepo));
+        }
+        y += 66.0;
+
+        let (icon, msg, color) = match (&test, testing) {
+            (_, true) => ("…", "Connecting over ssh…".to_string(), t.text3),
+            (Some(Ok(m)), _) => ("✓", m.clone(), t.add),
+            (Some(Err(e)), _) => ("✗", e.clone(), t.del),
+            (None, _) => ("", "The machine needs arranger installed, the same release as this app.".to_string(), t.text3),
+        };
+        let line = Rect::new(x, y, fw, 22.0);
+        let iw = if icon.is_empty() { 0.0 } else { r.text(x, r.center(line, MONO, 12.0), icon, MONO, 12.0, 600, color, 20.0) + 8.0 };
+        r.text(x + iw, r.center(line, MONO, 12.0), &msg, MONO, 12.0, 400, if icon == "✓" { t.text } else { color }, fw - iw);
+
+        let foot = Rect::new(dlg.x + 1.0, dlg.y + dlg.h - 58.0, dlg.w - 2.0, 57.0);
+        r.rect(Rect::new(foot.x, foot.y, foot.w, 1.0), 0.0, t.border);
+        let add_label = "Add machine ↵";
+        let aw = r.measure(UI, 13.0, 500, add_label) + 32.0;
+        let add = Rect::new(foot.x + foot.w - 14.0 - aw, foot.y + 12.0, aw, 34.0);
+        r.rect(add, 4.0, if ssh.trim().is_empty() { alpha(t.work, 110) } else { t.work });
+        r.text(add.x + 16.0, r.center(add, UI, 13.0), add_label, UI, 13.0, 500, t.on_accent, aw);
+        let tw = r.measure(UI, 13.0, 400, "Test connection") + 28.0;
+        let test_b = Rect::new(add.x - 8.0 - tw, add.y, tw, 34.0);
+        r.frame(test_b, 4.0, t.panel, t.border2);
+        r.text(test_b.x + 14.0, r.center(test_b, UI, 13.0), "Test connection", UI, 13.0, 400, t.text, tw);
+        if self.hit(r, add) {
+            acts.push(Action::AddHost);
+        } else if self.hit(r, test_b) {
+            acts.push(Action::TestHost);
+        }
+        if acts.iter().any(|a| matches!(a, Action::Focus(Focus::Term))) {
+            self.add_host = None;
+        }
+        self.actions.extend(acts);
     }
 
     fn draw_dialog(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
         let Some(d) = &self.dialog else { return };
         let (prompt, agent_i, base, error) = (d.prompt.clone(), d.agent, d.base.clone(), d.error.clone());
+        let (host_i, repo_path) = (d.host, d.repo.clone());
+        // Machine | Repo row, once there is more than one machine to choose.
+        let hosts: Vec<(usize, String, bool)> =
+            self.hosts.iter().enumerate().filter(|(_, h)| !h.removed).map(|(i, h)| (i, h.name().to_string(), matches!(h.link, Link::Up(_)))).collect();
+        let host_row = if hosts.len() > 1 { 78.0 } else { 0.0 };
         let agent = AGENTS[agent_i];
         let a = accent(agent);
         r.rect(Rect::new(0.0, 0.0, w, h), 0.0, t.scrim);
+        r.target(Rect::new(0.0, 0.0, w, h), Cursor::Arrow); // nothing under the scrim reacts
         let dw = (w - 32.0).min(680.0);
         let dx = (w - dw) / 2.0;
         let prompt_lines = wrap(r, &prompt, UI, 18.0, dw - 36.0);
         let text_h = (prompt_lines.len().max(3) as f32) * 27.0;
-        let dh = 2.0 + 34.0 + 12.0 + text_h + 16.0 + 78.0 + 58.0;
+        let dh = 2.0 + 34.0 + 12.0 + text_h + 16.0 + 78.0 + host_row + 58.0;
         let dlg = Rect::new(dx, 88.0, dw, dh);
         r.rect(Rect::new(dlg.x - 1.0, dlg.y - 1.0, dlg.w + 2.0, dlg.h + 2.0), 9.0, alpha(a, 0x33));
         r.frame(dlg, 8.0, t.dialog, t.border2);
@@ -1290,12 +1883,13 @@ impl App {
         let hy = dlg.y + 12.0;
         let head = Rect::new(dlg.x + 18.0, hy, dlg.w - 36.0, 20.0);
         let lw = r.text(head.x, r.center(head, UI, 11.0), "NEW TASK", UI, 11.0, 500, t.text3, 100.0);
-        let repo = self.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let repo_name = std::path::Path::new(repo_path.trim()).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let repo = if hosts.len() > 1 { format!("{} · {repo_name}", self.hosts[host_i].name()) } else { repo_name };
         r.text(head.x + lw + 10.0, r.center(head, MONO, 11.0), &repo, MONO, 11.0, 400, t.faint, 200.0);
         let esc = Rect::new(head.x + head.w - 30.0, head.y + 2.0, 30.0, 16.0);
         r.frame(esc, 3.0, t.dialog, t.border2);
         r.text(esc.x + 6.0, r.center(esc, MONO, 10.0), "Esc", MONO, 10.0, 400, t.text3, 30.0);
-        if self.hit(esc) {
+        if self.hit(r, esc) {
             self.actions.push(Action::CloseDialog);
         }
         let pw = r.measure(MONO, 11.0, 400, agent) + 21.0;
@@ -1323,7 +1917,7 @@ impl App {
             }
         }
         let prompt_area = Rect::new(dlg.x, ty, dlg.w, text_h + 16.0);
-        if self.hit(prompt_area) {
+        if self.hit_as(r, prompt_area, Cursor::Text) {
             self.actions.push(Action::Focus(Focus::Prompt));
         }
 
@@ -1344,7 +1938,7 @@ impl App {
             }
             r.rect(Rect::new(b.x + 10.0, b.y + 11.0, 6.0, 6.0), 1.0, if on { c } else { alpha(c, 140) });
             r.text(b.x + 23.0, r.center(b, MONO, 12.0), name, MONO, 12.0, 400, if on { c } else { t.tc }, bw);
-            if self.hit(b) {
+            if self.hit(r, b) {
                 self.actions.push(Action::PickAgent(i));
             }
             ax += bw + 4.0;
@@ -1355,10 +1949,12 @@ impl App {
         let base_focus = self.focus == Focus::Base;
         let bw = if base_focus {
             self.field_text(r, t, row.x, r.center(row, MONO, 12.0), &base, MONO, 12.0, 160.0, true, a) + 4.0
+        } else if base.is_empty() {
+            r.text(row.x, r.center(row, MONO, 12.0), "current branch", MONO, 12.0, 400, t.text3, 160.0)
         } else {
             r.text(row.x, r.center(row, MONO, 12.0), &base, MONO, 12.0, 400, t.text3, 160.0)
         };
-        if self.hit(Rect::new(row.x - 4.0, row.y, bw + 8.0, row.h)) {
+        if self.hit_as(r, Rect::new(row.x - 4.0, row.y, bw + 8.0, row.h), Cursor::Text) {
             self.actions.push(Action::Focus(Focus::Base));
         }
         let arrow_x = row.x + bw + 8.0;
@@ -1368,8 +1964,41 @@ impl App {
         r.frame(chip, 3.0, t.dialog, t.border2);
         r.text(chip.x + 5.0, r.center(chip, UI, 10.0), "auto", UI, 10.0, 400, t.text3, 30.0);
 
+        // Machine | Repo.
+        if host_row > 0.0 {
+            let my = gy + 78.0;
+            r.rect(Rect::new(dlg.x + 1.0, my, dlg.w - 2.0, 1.0), 0.0, t.border);
+            r.rect(Rect::new(dlg.x + dlg.w / 2.0, my, 1.0, 78.0), 0.0, t.border);
+            r.text(dlg.x + 18.0, my + 14.0, "Machine", UI, 11.0, 400, t.text3, 100.0);
+            let mut mx = dlg.x + 18.0;
+            for (i, name, up) in &hosts {
+                let on = *i == host_i;
+                let bw = r.measure(UI, 12.0, 400, name) + 30.0;
+                if mx + bw > dlg.x + dlg.w / 2.0 - 10.0 {
+                    break; // ponytail: chips that don't fit are hidden; a dropdown if people add many machines
+                }
+                let b = Rect::new(mx, my + 36.0, bw, 28.0);
+                r.frame(b, 4.0, t.dialog, if on { a } else { t.border2 });
+                if on {
+                    r.rect(b.inset(1.0), 3.0, alpha(a, 0x1F));
+                }
+                r.rect(Rect::new(b.x + 10.0, b.y + 11.0, 6.0, 6.0), 3.0, if *up { t.done } else { t.del });
+                r.text(b.x + 22.0, r.center(b, UI, 12.0), name, UI, 12.0, 400, if on { t.text } else { t.tc }, bw);
+                if self.hit(r, b) {
+                    self.actions.push(Action::PickHost(*i));
+                }
+                mx += bw + 4.0;
+            }
+            let rx = dlg.x + dlg.w / 2.0 + 18.0;
+            r.text(rx, my + 14.0, "Repo on that machine", UI, 11.0, 400, t.text3, 200.0);
+            let field = Rect::new(rx - 8.0, my + 34.0, dlg.w / 2.0 - 20.0, 32.0);
+            if self.input(r, t, field, &repo_path, "~/path/to/repo", Focus::Repo, MONO) {
+                self.actions.push(Action::Focus(Focus::Repo));
+            }
+        }
+
         // Footer.
-        let fy = gy + 78.0;
+        let fy = gy + 78.0 + host_row;
         let foot = Rect::new(dlg.x + 1.0, fy, dlg.w - 2.0, dlg.y + dlg.h - fy - 1.0);
         r.rect(Rect::new(dlg.x + 1.0, fy, dlg.w - 2.0, 1.0), 0.0, t.border);
         r.rect(Rect::new(foot.x, foot.y + 1.0, foot.w, foot.h - 1.0), 7.0, t.panel);
@@ -1388,10 +2017,10 @@ impl App {
         if !error.is_empty() {
             r.text(foot.x + 18.0, r.center(start, UI, 12.0), &error, UI, 12.0, 400, t.del, attach.x - foot.x - 30.0);
         }
-        if self.hit(start) {
+        if self.hit(r, start) {
             self.actions.push(Action::Start(false));
         }
-        if self.hit(attach) {
+        if self.hit(r, attach) {
             self.actions.push(Action::Start(true));
         }
     }
@@ -1425,24 +2054,44 @@ fn last_size(log: &[u8]) -> Option<(u16, u16)> {
     Some((cols.parse().ok()?, rows.parse().ok()?))
 }
 
-/// The agent's own input box at the bottom of its screen (Claude Code: a rule, `❯ input`, a rule,
-/// then a footer). Returns the box's first row and the mode named in the footer ("" if none).
-/// None when the screen is scrolled back or shows something else there (a menu, a dialog).
-fn agent_box(screen: &Screen) -> Option<(usize, String)> {
+/// The agent's own input box at the bottom of its screen, which ours replaces. Returns the box's
+/// first row and the mode its footer shows ("" if none). None when the screen is scrolled back or
+/// shows something else there (a menu, a dialog), so those stay on screen.
+fn agent_box(screen: &Screen, kind: &str) -> Option<(usize, String)> {
     let grid = screen.grid();
     if grid.display_offset() != 0 {
         return None;
     }
     let rows: Vec<String> = (0..grid.screen_lines())
-        .map(|row| (0..grid.columns()).map(|c| grid[Line(row as i32)][Column(c)].c).collect())
+        .map(|row| (0..grid.columns()).map(|c| grid[Line(row as i32)][Column(c)].c).collect::<String>().trim_end().to_string())
         .collect();
+    if kind == "codex" {
+        // `› draft`, a blank row, then `model effort · cwd … Plan mode` and a hints row. Menus use `› 1. …`.
+        let top = rows.iter().rposition(|r| r.starts_with("› "))?;
+        let numbered = rows[top][4..].split_once('.').is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+        let below: Vec<&String> = rows[top + 1..].iter().filter(|r| !r.is_empty()).collect();
+        if numbered || below.len() > 8 || !below.iter().any(|r| r.contains(" · ")) {
+            return None;
+        }
+        let plan = below.iter().any(|r| r.ends_with("Plan mode"));
+        return Some((top, if plan { "plan mode".into() } else { String::new() }));
+    }
     let rule = |s: &String| s.trim().chars().count() >= 20 && s.trim().chars().all(|c| c == '─');
     let lower = rows.iter().rposition(rule)?;
     let upper = rows[..lower].iter().rposition(rule)?;
-    if lower - upper > 12 || !rows[upper + 1].trim_start().starts_with(['❯', '>']) {
+    if lower - upper > 12 || rows[lower + 1..].iter().filter(|r| !r.is_empty()).count() > 4 {
         return None;
     }
-    // Footer: "-- INSERT --  ⏵⏵ auto mode on (shift+tab to cycle) · …"
+    if kind == "pi" {
+        // Input between two rules; the footer's last row ends with the model and thinking level.
+        let last = rows[lower + 1..].iter().rfind(|r| !r.is_empty());
+        let mode = last.and_then(|r| r.trim().rsplit("  ").next()).filter(|m| *m != "unknown").unwrap_or("");
+        return Some((upper, mode.trim().to_string()));
+    }
+    // Claude Code: `❯ draft` between two rules; footer "-- INSERT --  ⏵⏵ auto mode on (shift+tab to cycle) · …"
+    if !rows[upper + 1].trim_start().starts_with(['❯', '>']) {
+        return None;
+    }
     let mode = rows[lower + 1..]
         .iter()
         .find_map(|r| r.find("(shift+tab to cycle)").map(|i| r[..i].rsplit("--").next().unwrap_or("").trim_matches(|c: char| !c.is_alphanumeric()).to_string()))
@@ -1490,6 +2139,7 @@ fn draw_term(r: &mut Renderer, t: &Theme, screen: &Screen, area: Rect, cell_w: f
             if cell.flags.contains(Flags::INVERSE) {
                 (fg, bg) = (bg.unwrap_or(t.term), Some(fg));
             }
+            fg = readable(fg, bg.unwrap_or(t.term));
             if cell.flags.contains(Flags::DIM) {
                 fg = alpha(fg, 150);
             }
@@ -1531,15 +2181,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn markdown_runs() {
+        assert_eq!(review::plain("## Fixed **the** `bug` in [docs](http://x) _now_"), "Fixed the bug in docs now");
+        assert_eq!(review::plain("- snake_case stays"), "snake_case stays");
+    }
+
+    #[test]
     fn finds_claude_input_box_and_mode() {
         let rule = "─".repeat(40);
         let mut s = Screen::new(60, 8);
         s.feed(format!("chat\r\n\r\n{rule}\r\n❯ draft\r\n{rule}\r\n-- INSERT --  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents").as_bytes());
-        assert_eq!(agent_box(&s), Some((2, "auto mode on".to_string())));
+        assert_eq!(agent_box(&s, "claude"), Some((2, "auto mode on".to_string())));
 
         let mut menu = Screen::new(60, 8);
         menu.feed(format!("{rule}\r\nAccessing workspace:\r\n❯ 1. Yes\r\n{rule}\r\n").as_bytes());
-        assert_eq!(agent_box(&menu), None);
+        assert_eq!(agent_box(&menu, "claude"), None);
+
+        let mut codex = Screen::new(80, 8);
+        codex.feed("  >_ OpenAI Codex\r\n\r\n› fix it\r\n\r\n  GPT medium · ~/repo     Plan mode\r\n  ? for shortcuts".as_bytes());
+        assert_eq!(agent_box(&codex, "codex"), Some((2, "plan mode".to_string())));
+        let mut trust = Screen::new(80, 8);
+        trust.feed("  Trust this folder?\r\n\r\n› 1. Trust and continue\r\n  2. Quit\r\n\r\n  enter continue · esc quit".as_bytes());
+        assert_eq!(agent_box(&trust, "codex"), None);
+
+        let mut pi = Screen::new(60, 8);
+        pi.feed(format!("chat\r\n{rule}\r\ndraft\r\n{rule}\r\n~/repo\r\n0.0%/0 (auto)        sonnet • high").as_bytes());
+        assert_eq!(agent_box(&pi, "pi"), Some((1, "sonnet • high".to_string())));
         assert_eq!(last_size(b"x\x1b[8;24;80tyy\x1b[8;62;236tzz"), Some((236, 62)));
+    }
+
+    #[test]
+    fn agent_white_text_stays_readable_on_paper() {
+        let white = [255; 4];
+        assert_eq!(readable(white, GRAPHITE.term), white);
+        assert_ne!(readable(white, PAPER.term), white);
+        let grey = [153, 153, 153, 255];
+        assert!(readable(grey, PAPER.term)[0] > readable(white, PAPER.term)[0], "white stays darker than grey");
+        assert_eq!(readable(grey, GRAPHITE.term), grey);
     }
 }

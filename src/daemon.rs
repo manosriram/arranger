@@ -118,6 +118,10 @@ pub fn run() -> io::Result<()> {
     let mut listener = UnixListener::bind(&sock)?;
     fs::set_permissions(&sock, Permissions::from_mode(0o600))?;
     fs::write(data.join("daemon.pid"), std::process::id().to_string())?;
+    // Don't keep the starting client's directory: if it's deleted later (a removed worktree, a temp
+    // dir), anything that resolves paths against the cwd fails, e.g. gix::discover in `create`.
+    let data = fs::canonicalize(&data)?;
+    std::env::set_current_dir(&data)?;
 
     let db = Connection::open(data.join("arranger.db")).map_err(io::Error::other)?;
     db.execute_batch(
@@ -362,6 +366,10 @@ impl Daemon {
             Request::New { agent, repo, base, prompt } => match self.create(&agent, &repo, base.as_deref(), prompt.as_deref().unwrap_or("")) {
                 Ok(id) => Reply::Created { id, state: self.state(id) },
                 Err(e) => Reply::Error(e),
+            },
+            Request::Log { id } => match fs::read(self.data.join(format!("logs/{id}.zst"))) {
+                Ok(bytes) => Reply::Log(bytes),
+                Err(e) => Reply::Error(format!("no log for task {id}: {e}")),
             },
             Request::Review { id } => match self.review(id) {
                 Ok(r) => Reply::Review(r),
@@ -669,7 +677,10 @@ impl Daemon {
     }
 
     fn create(&mut self, agent: &str, dir: &Path, base: Option<&str>, prompt: &str) -> Result<u64, String> {
-        let repo = gix::discover(dir).map_err(e2s)?;
+        // A repo typed on another machine (`~/src/api`): the daemon's own home.
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let dir = dir.strip_prefix("~").map_or(dir.to_path_buf(), |rest| home.join(rest));
+        let repo = gix::discover(&dir).map_err(e2s)?;
         let top = repo.workdir().ok_or("not a git work tree")?.to_path_buf();
         let base_name = base.map_or_else(|| review::current_branch(&top), str::to_string);
         let base_commit = review::resolve(&top, base.unwrap_or("HEAD"))?;
@@ -805,6 +816,7 @@ impl Daemon {
                 asking: false,
                 since: 0,
                 summary: r.get(7)?,
+                machine: 0,
             })
         });
         let mut tasks: Vec<TaskInfo> = rows.and_then(Iterator::collect).map_err(e2s)?;

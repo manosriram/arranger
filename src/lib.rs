@@ -4,6 +4,7 @@
 pub mod adapter;
 pub mod client;
 pub mod daemon;
+pub mod machine;
 pub mod proto;
 pub mod pty;
 pub mod review;

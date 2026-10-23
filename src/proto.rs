@@ -9,7 +9,7 @@ use std::path::PathBuf;
 const MAX_FRAME: usize = 64 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -41,6 +41,8 @@ pub enum Request {
     Prompt { id: u64, text: String },
     /// Commit everything in the worktree; with `pr`, push and open a PR. Replied to with JobDone.
     Commit { id: u64, message: String, pr: bool },
+    /// The task's recorded PTY output (zstd), for replaying a finished task's chat.
+    Log { id: u64 },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -59,6 +61,7 @@ pub enum Reply {
     Version(u32),
     Review(Review),
     JobDone { ok: bool, output: String },
+    Log(Vec<u8>),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -83,6 +86,9 @@ pub struct TaskInfo {
     pub since: u64,
     /// First line of the agent's last reply, or "".
     pub summary: String,
+    /// Which machine the GUI got this task from (an index into its machine list); not sent.
+    #[serde(skip)]
+    pub machine: usize,
 }
 
 /// A task's changes against the commit its worktree branched from.

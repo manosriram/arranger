@@ -3,6 +3,7 @@
 
 use super::theme::Rgba;
 use glow::HasContext;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use swash::scale::{Render, ScaleContext, Source};
 use swash::zeno::{Cap, Fill, Format, Mask, Stroke, Transform};
@@ -101,6 +102,14 @@ impl Rect {
     }
 }
 
+/// The mouse cursor over a click target.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Cursor {
+    Arrow,
+    Pointer,
+    Text,
+}
+
 pub struct Renderer {
     gl: glow::Context,
     program: glow::Program,
@@ -115,6 +124,13 @@ pub struct Renderer {
     pub dpi: f32,
     size: (u32, u32),
     clip: Option<Rect>,
+    /// Layout lookups, cached: parsing the font and its variation tables on every call was most
+    /// of a frame in text-heavy views (the diff). Keys: (font, char), (font, char, weight, size), (font, size).
+    resolved: RefCell<HashMap<(usize, char), (usize, u16)>>,
+    advances: RefCell<HashMap<(usize, char, u16, u32), f32>>,
+    vmetrics: RefCell<HashMap<(usize, u32), (f32, f32)>>,
+    /// This frame's click targets in draw order, with the clip they were drawn under.
+    targets: Vec<(Rect, Option<Rect>, Cursor)>,
 }
 
 /// Added to every requested weight: Geist at its nominal weights reads too thin on screen.
@@ -207,6 +223,10 @@ impl Renderer {
                 dpi: 1.0,
                 size: (1, 1),
                 clip: None,
+                resolved: RefCell::default(),
+                advances: RefCell::default(),
+                vmetrics: RefCell::default(),
+                targets: Vec::new(),
             })
         }
     }
@@ -214,6 +234,7 @@ impl Renderer {
     pub fn begin(&mut self, width: u32, height: u32, dpi: f32, clear: Rgba) {
         self.size = (width.max(1), height.max(1));
         self.dpi = dpi;
+        self.targets.clear();
         unsafe {
             self.gl.viewport(0, 0, self.size.0 as i32, self.size.1 as i32);
             let c = clear.map(|v| v as f32 / 255.0);
@@ -222,9 +243,27 @@ impl Renderer {
         }
     }
 
-    pub fn finish(&mut self) {
+    /// Draws the hover tint on the target under `mouse` and returns its cursor.
+    pub fn finish(&mut self, mouse: (f32, f32)) -> Cursor {
+        let hot = self.hot(mouse).map(|i| self.targets[i]);
+        if let Some((r, clip, Cursor::Pointer)) = hot {
+            self.set_clip(clip);
+            // Mid grey: lightens dark buttons and darkens light ones, in either theme.
+            self.rect(r, 3.0, [128, 128, 128, 0x24]);
+        }
         self.flush();
         self.set_clip(None);
+        hot.map_or(Cursor::Arrow, |t| t.2)
+    }
+
+    /// Registers a click target; the topmost one under the mouse gets the hover tint and its cursor.
+    pub fn target(&mut self, r: Rect, cursor: Cursor) {
+        self.targets.push((r, self.clip, cursor));
+    }
+
+    /// Index of the topmost target under `p` in the last frame.
+    pub fn hot(&self, p: (f32, f32)) -> Option<usize> {
+        self.targets.iter().rposition(|(r, clip, _)| r.contains(p) && clip.is_none_or(|c| c.contains(p)))
     }
 
     /// Dev aid: writes the frame as a binary PPM (`ARRANGER_SNAPSHOT=file`).
@@ -317,9 +356,11 @@ impl Renderer {
 
     /// (ascent, descent) in logical px.
     pub fn vmetrics(&self, font_i: usize, size: f32) -> (f32, f32) {
-        let f = font(font_i);
-        let m = f.metrics(&coords(&f, 400)).scale(size);
-        (m.ascent, m.descent)
+        *self.vmetrics.borrow_mut().entry((font_i, size.to_bits())).or_insert_with(|| {
+            let f = font(font_i);
+            let m = f.metrics(&coords(&f, 400)).scale(size);
+            (m.ascent, m.descent)
+        })
     }
 
     /// Top y that vertically centres a line of `size` text in `r`.
@@ -329,9 +370,18 @@ impl Renderer {
     }
 
     pub fn advance(&self, font_i: usize, size: f32, weight: u16, ch: char) -> f32 {
-        let (fi, id) = resolve(font_i, ch);
+        if let Some(&a) = self.advances.borrow().get(&(font_i, ch, weight, size.to_bits())) {
+            return a;
+        }
+        let (fi, id) = self.resolve(font_i, ch);
         let f = font(fi);
-        f.glyph_metrics(&coords(&f, weight)).scale(size).advance_width(id)
+        let a = f.glyph_metrics(&coords(&f, weight)).scale(size).advance_width(id);
+        self.advances.borrow_mut().insert((font_i, ch, weight, size.to_bits()), a);
+        a
+    }
+
+    fn resolve(&self, font_i: usize, ch: char) -> (usize, u16) {
+        *self.resolved.borrow_mut().entry((font_i, ch)).or_insert_with(|| resolve(font_i, ch))
     }
 
     pub fn measure(&self, font_i: usize, size: f32, weight: u16, s: &str) -> f32 {
@@ -362,7 +412,7 @@ impl Renderer {
     }
 
     pub fn glyph_char(&mut self, font_i: usize, ch: char, x: f32, baseline: f32, size: f32, weight: u16, color: Rgba) {
-        let (fi, id) = resolve(font_i, ch);
+        let (fi, id) = self.resolve(font_i, ch);
         if id != 0 {
             self.glyph(fi, id, x, baseline, size, weight, color);
         }

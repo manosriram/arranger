@@ -5,13 +5,22 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use std::{env, thread};
 
-/// Connects to the daemon (starting it if needed) and checks it speaks this build's protocol.
+/// Connects to the local daemon (starting it if needed) and checks it speaks this build's protocol.
 pub fn connect() -> io::Result<UnixStream> {
-    let mut s = connect_or_start()?;
+    connect_at(None)
+}
+
+/// Connects to the daemon at `sock` (a remote machine's forwarded socket), or the local one when None.
+pub fn connect_at(sock: Option<&Path>) -> io::Result<UnixStream> {
+    let mut s = match sock {
+        Some(path) => UnixStream::connect(path)?,
+        None => connect_or_start()?,
+    };
     s.set_read_timeout(Some(Duration::from_secs(5)))?;
     s.write_all(&proto::frame(&Request::Version))?;
     match proto::read_msg(&mut s) {
@@ -71,7 +80,11 @@ fn connect_or_start() -> io::Result<UnixStream> {
 }
 
 pub fn request(req: &Request) -> io::Result<Reply> {
-    let mut s = connect()?;
+    request_at(None, req)
+}
+
+pub fn request_at(sock: Option<&Path>, req: &Request) -> io::Result<Reply> {
+    let mut s = connect_at(sock)?;
     s.write_all(&proto::frame(req))?;
     match proto::read_msg(&mut s)? {
         Reply::Error(e) => Err(io::Error::other(e)),
