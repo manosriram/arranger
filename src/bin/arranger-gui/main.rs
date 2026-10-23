@@ -3,6 +3,7 @@
 //! that triggered it. Redraws happen only on input or daemon pushes, so idle CPU is zero.
 
 mod render;
+mod review;
 mod theme;
 
 use arranger::adapter;
@@ -29,7 +30,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use theme::{AGENTS, GRAPHITE, PAPER, Rgba, Theme, accent, alpha};
+use review::{ReviewAction, ReviewView, Tag};
+use theme::{AGENTS, GRAPHITE, PAPER, Rgba, Theme, accent, alpha, blend};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
@@ -42,16 +44,21 @@ const STATUS_H: f32 = 22.0;
 const SIDEBAR_W: f32 = 248.0;
 const HEADER_H: f32 = 40.0;
 const ROW_H: f32 = 28.0;
+/// A row with its second line (what the agent is doing / did).
+const ROW2_H: f32 = 42.0;
 const GROUP_H: f32 = 24.0;
 const TERM_SIZE: f32 = 12.0;
 const LINE_H: f32 = 18.0;
-const GROUPS: [&str; 4] = ["Needs you", "Running", "Queued", "Done"];
+const GROUPS: [&str; 5] = ["Needs you", "Running", "Queued", "Done", "Ended"];
 
 pub enum Msg {
     Tasks(Vec<TaskInfo>),
     Output(u64, Vec<u8>),
     Exited(u64),
+    /// A finished task's recorded PTY output.
+    History(u64, Vec<u8>),
     Lost,
+    Reply(Tag, Result<Reply, String>),
 }
 
 struct Gfx {
@@ -83,6 +90,8 @@ enum Focus {
     Message,
     Prompt,
     Base,
+    Note,
+    CommitMsg,
 }
 
 struct Dialog {
@@ -102,6 +111,8 @@ enum Action {
     PickAgent(usize),
     Start(bool),
     CloseDialog,
+    OpenReview,
+    Review(ReviewAction),
 }
 
 struct App {
@@ -118,6 +129,11 @@ struct App {
     filter: String,
     message: String,
     dialog: Option<Dialog>,
+    review: Option<ReviewView>,
+    /// Replay of a finished task's log, shown in place of a live session.
+    history: Option<(u64, Screen)>,
+    /// Wheel movement over the terminal not yet worth a whole line.
+    wheel: f32,
     mods: ModifiersState,
     mouse: (f32, f32),
     click: Option<(f32, f32)>,
@@ -165,6 +181,9 @@ fn run() -> io::Result<()> {
         filter: String::new(),
         message: String::new(),
         dialog: None,
+        review: None,
+        history: None,
+        wheel: 0.0,
         mods: ModifiersState::empty(),
         mouse: (0.0, 0.0),
         click: None,
@@ -179,7 +198,12 @@ fn run() -> io::Result<()> {
 }
 
 fn init_gfx(el: &ActiveEventLoop) -> Result<Gfx, String> {
-    let attrs = WindowAttributes::default().with_title("arranger").with_inner_size(LogicalSize::new(1280.0, 800.0));
+    let snapshot = std::env::var_os("ARRANGER_SNAPSHOT").is_some();
+    let attrs = WindowAttributes::default()
+        .with_title("arranger")
+        .with_inner_size(LogicalSize::new(1280.0, 800.0))
+        .with_visible(!snapshot) // dev snapshots render without showing a window or taking focus
+        .with_active(!snapshot);
     let (window, config) = DisplayBuilder::new()
         .with_window_attributes(Some(attrs))
         .build(el, ConfigTemplateBuilder::new(), |mut configs| configs.next().expect("a GL config"))
@@ -256,7 +280,19 @@ impl ApplicationHandler<Msg> for App {
                     self.session = None;
                 }
             }
+            Msg::History(id, bytes) => {
+                if self.selected == Some(id) {
+                    // Full-screen agents (Claude Code) leave the alternate screen on exit, wiping the
+                    // chat; stop at that point to keep their last frame.
+                    let end = bytes.windows(8).rposition(|w| w == b"\x1b[?1049l").unwrap_or(bytes.len());
+                    let (cols, rows) = last_size(&bytes[..end]).unwrap_or(self.pane);
+                    let mut screen = Screen::new(cols, rows);
+                    screen.feed(&bytes[..end]);
+                    self.history = Some((id, screen));
+                }
+            }
             Msg::Lost => self.lost = true,
+            Msg::Reply(tag, reply) => self.on_reply(tag, reply),
         }
         self.redraw();
     }
@@ -287,9 +323,26 @@ impl ApplicationHandler<Msg> for App {
                     MouseScrollDelta::LineDelta(_, y) => y * ROW_H,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32,
                 };
-                if self.mouse.0 < SIDEBAR_W {
+                if let Some(rv) = self.review.as_mut().filter(|_| self.mouse.1 > TITLE_H + 56.0) {
+                    rv.scroll = (rv.scroll - dy).max(0.0);
+                    self.redraw();
+                } else if self.mouse.0 < SIDEBAR_W {
                     self.scroll = (self.scroll - dy).max(0.0);
                     self.redraw();
+                } else if self.review.is_none() {
+                    self.wheel += dy / LINE_H;
+                    let lines = self.wheel.trunc();
+                    self.wheel -= lines;
+                    let id = self.selected;
+                    let screen = match (&mut self.session, &mut self.history) {
+                        (Some(s), _) if Some(s.task) == id => Some(&mut s.screen),
+                        (_, Some((h, screen))) if Some(*h) == id => Some(screen),
+                        _ => None,
+                    };
+                    if let Some(screen) = screen.filter(|_| lines != 0.0) {
+                        screen.scroll(lines as i32);
+                        self.redraw();
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -316,12 +369,13 @@ fn group(state: &str) -> usize {
         "needs-you" => 0,
         "running" => 1,
         "queued" => 2,
-        _ => 3,
+        "done" => 3,
+        _ => 4, // the agent process is gone: exited, dead, failed
     }
 }
 
 fn state_color(t: &Theme, state: &str) -> Rgba {
-    [t.needs, t.work, t.faint, t.done][group(state)]
+    [t.needs, t.work, t.faint, t.done, t.faint][group(state)]
 }
 
 fn title(task: &TaskInfo) -> String {
@@ -333,13 +387,43 @@ fn age(task: &TaskInfo) -> String {
     if task.state == "queued" || task.created == 0 {
         return "—".into();
     }
+    ago(task.created)
+}
+
+/// "40s", "6m", "2h", "3d" since unix second `t`.
+fn ago(t: u64) -> String {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let s = now.saturating_sub(task.created);
+    let s = now.saturating_sub(t);
     match s {
         0..60 => format!("{s}s"),
         60..3600 => format!("{}m", s / 60),
         3600..86400 => format!("{}h", s / 3600),
         _ => format!("{}d", s / 86400),
+    }
+}
+
+/// The sidebar row's second line: what the agent is doing now, or what it last did.
+fn status_line(task: &TaskInfo, queue_pos: usize) -> String {
+    let since = if task.since == 0 { String::new() } else { format!(" · {}", ago(task.since)) };
+    let waiting = if task.since == 0 { String::new() } else { format!(" · waiting {}", ago(task.since)) };
+    match (group(&task.state), &task.need) {
+        (0, Some(Event::PermissionRequest { tool, detail })) => match detail.strip_prefix("running ") {
+            Some(cmd) => format!("$ {cmd}?{waiting}"),
+            None => format!("{tool} · {detail}?{waiting}"),
+        },
+        (0, Some(Event::Question { text, .. })) => format!("{text}{waiting}"),
+        (0, Some(Event::Error { message })) => message.clone(),
+        (0, _) => format!("needs you{waiting}"),
+        (1, _) if task.action.is_empty() => format!("working{since}"),
+        (1, _) => format!("{}{since}", task.action),
+        (2, _) => format!("#{queue_pos} in queue"),
+        (3, _) if task.summary.is_empty() => "finished its turn".into(),
+        (3, _) => format!("“{}”", task.summary),
+        _ => match task.state.as_str() {
+            "dead" => "died with the daemon · history kept".into(),
+            "failed" => "failed to start".into(),
+            _ => "exited · history kept".into(),
+        },
     }
 }
 
@@ -491,7 +575,8 @@ impl App {
             .iter()
             .filter(|t| f.is_empty() || format!("{} {} {}", title(t), t.agent, t.branch).to_lowercase().contains(&f))
             .collect();
-        v.sort_by_key(|t| (group(&t.state), t.id));
+        // Done: most recently finished first; everything else in start order.
+        v.sort_by_key(|t| (group(&t.state), if group(&t.state) == 3 { u64::MAX - t.since } else { t.id }));
         v
     }
 
@@ -508,6 +593,7 @@ impl App {
 
     fn sync_session(&mut self) {
         let want = self.current().filter(|t| is_live(&t.state)).map(|t| t.id);
+        self.load_history();
         if self.session.as_ref().map(|s| s.task) == want {
             return;
         }
@@ -530,6 +616,25 @@ impl App {
             let _ = p.send_event(Msg::Exited(seq));
         });
         self.session = Some(Session { seq, task: id, writer: sock, screen: Screen::new(cols, rows), size: (cols, rows) });
+    }
+
+    /// For a task that is no longer running, replays its PTY log so its chat stays readable.
+    fn load_history(&mut self) {
+        let Some(task) = self.current().filter(|t| !is_live(&t.state) && t.state != "queued") else {
+            self.history = None;
+            return;
+        };
+        if self.history.as_ref().is_some_and(|h| h.0 == task.id) {
+            return;
+        }
+        let (id, p) = (task.id, self.proxy.clone());
+        self.history = None;
+        thread::spawn(move || {
+            let path = proto::data_dir().join(format!("logs/{id}.zst"));
+            if let Ok(bytes) = std::fs::File::open(path).and_then(zstd::decode_all) {
+                let _ = p.send_event(Msg::History(id, bytes));
+            }
+        });
     }
 
     fn send_input(&mut self, bytes: Vec<u8>) {
@@ -561,6 +666,7 @@ impl App {
         self.select_all = false;
     }
 
+    /// Starts the dialog's task and switches to it; `attach` puts keys straight into its terminal.
     fn start(&mut self, attach: bool) {
         let Some(d) = &mut self.dialog else { return };
         let req = Request::New {
@@ -572,11 +678,14 @@ impl App {
         match request(&req) {
             Ok(Reply::Created { id, .. }) => {
                 self.dialog = None;
-                self.focus = Focus::Term;
-                if attach {
-                    self.selected = Some(id);
-                    self.sync_session();
+                self.focus = if attach { Focus::Term } else { Focus::Message };
+                // Fetch the list now: the watch push may not have the new task yet, and selection
+                // would fall back to the first row.
+                if let Ok(Reply::Tasks(tasks)) = request(&Request::List { files: false }) {
+                    self.tasks = tasks;
                 }
+                self.selected = Some(id);
+                self.sync_session();
             }
             Ok(other) => d.error = format!("{other:?}"),
             Err(e) => d.error = e.to_string(),
@@ -589,6 +698,13 @@ impl App {
             match &ev.logical_key {
                 Key::Character(c) => match c.to_lowercase().as_str() {
                     "n" => self.actions.push(Action::NewTask),
+                    "r" => self.actions.push(Action::OpenReview),
+                    "j" | "k" if self.review.is_some() => {
+                        let files = self.review.as_ref().and_then(|rv| rv.data.as_ref()).map_or(0, |d| d.files.len());
+                        let cur = self.review.as_ref().map_or(0, |rv| rv.file);
+                        let next = if c.to_lowercase() == "j" { (cur + 1).min(files.saturating_sub(1)) } else { cur.saturating_sub(1) };
+                        self.actions.push(Action::Review(ReviewAction::File(next)));
+                    }
                     "j" => self.move_selection(1),
                     "k" => self.move_selection(-1),
                     "1" => self.actions.push(Action::Answer(true)),
@@ -608,6 +724,10 @@ impl App {
                 Key::Named(NamedKey::ArrowDown) => self.move_selection(1),
                 Key::Named(NamedKey::ArrowUp) => self.move_selection(-1),
                 Key::Named(NamedKey::Enter) if self.dialog.is_some() => self.actions.push(Action::Start(true)),
+                Key::Named(NamedKey::Enter) if self.review.is_some() => {
+                    let note = self.review.as_ref().and_then(|rv| rv.editing).filter(|_| self.focus == Focus::Note);
+                    self.actions.push(Action::Review(note.map_or(ReviewAction::Commit(true), ReviewAction::SendNote)));
+                }
                 _ => {}
             }
             return;
@@ -615,6 +735,17 @@ impl App {
         if self.dialog.is_some() && ev.logical_key == Key::Named(NamedKey::Tab) {
             self.actions.push(Action::PickAgent(usize::MAX));
             return;
+        }
+        if self.focus == Focus::Term && self.review.is_some() && self.dialog.is_none() {
+            if ev.logical_key == Key::Named(NamedKey::Escape) {
+                self.actions.push(Action::Review(ReviewAction::Close));
+            }
+            return; // the agent's terminal isn't on screen
+        }
+        let typed = ev.text.as_ref().filter(|t| t.chars().any(|c| !c.is_control()) && !m.control_key() && !m.alt_key());
+        if self.focus == Focus::Term && typed.is_some() && self.session.as_ref().and_then(|s| agent_box(&s.screen)).is_some() {
+            // The agent's own input box is hidden behind ours: typing goes to ours.
+            self.focus = Focus::Message;
         }
         if self.focus == Focus::Term {
             let app_cursor = self.session.as_ref().is_some_and(|s| s.screen.mode().contains(TermMode::APP_CURSOR));
@@ -634,16 +765,23 @@ impl App {
             Key::Named(NamedKey::Escape) => {
                 if self.dialog.is_some() {
                     self.actions.push(Action::CloseDialog);
+                } else if focus == Focus::Note {
+                    self.actions.push(Action::Review(ReviewAction::SaveNote));
                 } else {
                     self.focus = Focus::Term;
                 }
             }
-            Key::Named(NamedKey::Enter) if focus == Focus::Prompt && m.shift_key() => self.field(focus).push('\n'),
+            Key::Named(NamedKey::Tab) if focus == Focus::Message && m.shift_key() => self.send_input(b"\x1b[Z".to_vec()), // cycles the agent's mode
+            Key::Named(NamedKey::Enter) if matches!(focus, Focus::Prompt | Focus::Note) && m.shift_key() => self.field(focus).push('\n'),
             Key::Named(NamedKey::Enter) => match focus {
                 Focus::Message => {
                     let text = std::mem::take(&mut self.message);
-                    self.send_input(format!("{text}\r").into_bytes());
+                    if let Some(id) = self.selected.filter(|_| !text.trim().is_empty()) {
+                        self.spawn_request(Tag::Message, Request::Prompt { id, text });
+                    }
                 }
+                Focus::Note => self.actions.push(Action::Review(ReviewAction::SaveNote)),
+                Focus::CommitMsg => self.actions.push(Action::Review(ReviewAction::Commit(false))),
                 Focus::Prompt | Focus::Base => self.actions.push(Action::Start(false)),
                 _ => self.focus = Focus::Term,
             },
@@ -676,6 +814,12 @@ impl App {
     }
 
     fn field(&mut self, focus: Focus) -> &mut String {
+        if focus == Focus::Note && self.note_text().is_some() {
+            return self.note_text().unwrap();
+        }
+        if let (Focus::CommitMsg, Some(rv)) = (focus, &mut self.review) {
+            return &mut rv.message;
+        }
         match (focus, &mut self.dialog) {
             (Focus::Prompt, Some(d)) => &mut d.prompt,
             (Focus::Base, Some(d)) => &mut d.base,
@@ -729,6 +873,12 @@ impl App {
                     }
                 }
                 Action::Start(attach) => self.start(attach),
+                Action::OpenReview => {
+                    if self.dialog.is_none() {
+                        self.open_review();
+                    }
+                }
+                Action::Review(a) => self.review_action(a),
             }
         }
     }
@@ -761,8 +911,12 @@ impl App {
         r.begin(size.width, size.height, dpi, t.bg);
 
         self.draw_title(r, t, w);
-        self.draw_sidebar(r, t, h);
-        self.draw_main(r, t, Rect::new(SIDEBAR_W, TITLE_H, w - SIDEBAR_W, h - TITLE_H - STATUS_H));
+        if self.review.is_some() {
+            self.draw_review(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H - STATUS_H));
+        } else {
+            self.draw_sidebar(r, t, h);
+            self.draw_main(r, t, Rect::new(SIDEBAR_W, TITLE_H, w - SIDEBAR_W, h - TITLE_H - STATUS_H));
+        }
         self.draw_status(r, t, w, h);
         if self.dialog.is_some() {
             self.draw_dialog(r, t, w, h);
@@ -784,16 +938,28 @@ impl App {
 
     fn draw_title(&mut self, r: &mut Renderer, t: &Theme, w: f32) {
         r.rect(Rect::new(0.0, TITLE_H - 1.0, w, 1.0), 0.0, t.border);
-        let s = 14.0 / 16.0;
-        for (y, bw, c) in [(3.0, 12.0, t.text), (7.0, 8.0, t.needs), (11.0, 10.0, t.faint)] {
-            r.rect(Rect::new(12.0 + 2.0 * s, 11.0 + y * s, bw * s, 2.0 * s), 0.5, c);
-        }
+        logo(r, 12.0, 10.0, 16.0, t.text, t.needs);
         let bar = Rect::new(0.0, 0.0, w, TITLE_H);
         let x = 33.0 + r.text(33.0, r.center(bar, UI, 13.0), "arranger", UI, 13.0, 600, t.text, 200.0);
         let home = std::env::var("HOME").unwrap_or_default();
         let repo = self.repo.display().to_string();
         let repo = repo.strip_prefix(&home).map_or(repo.clone(), |rest| format!("~{rest}"));
-        r.text(x + 10.0, r.center(bar, MONO, 11.0), &repo, MONO, 11.0, 400, t.text3, 400.0);
+        let rw = r.text(x + 10.0, r.center(bar, MONO, 11.0), &repo, MONO, 11.0, 400, t.text3, 400.0);
+
+        // Views: Workspace | Review.
+        let mut nx = x + 26.0 + rw;
+        for (label, on) in [("Workspace", self.review.is_none()), ("Review", self.review.is_some())] {
+            let tw = r.measure(UI, 12.0, 400, label) + 16.0;
+            let tab = Rect::new(nx, 7.0, tw, 22.0);
+            if on {
+                r.rect(tab, 3.0, t.raised);
+            }
+            r.text(tab.x + 8.0, r.center(tab, UI, 12.0), label, UI, 12.0, 400, if on { t.text } else { t.text3 }, tw);
+            if self.hit(tab) && !on {
+                self.actions.push(if label == "Review" { Action::OpenReview } else { Action::Review(ReviewAction::Close) });
+            }
+            nx += tw + 1.0;
+        }
 
         // Scheme toggle: [swatch] Graphite
         let label_w = r.measure(UI, 12.0, 400, t.name);
@@ -849,37 +1015,42 @@ impl App {
             if items.is_empty() {
                 continue;
             }
-            let color = [t.needs, t.work, t.faint, t.done][g];
+            let color = [t.needs, t.work, t.faint, t.done, t.faint][g];
             let head = Rect::new(12.0, y + 6.0, SIDEBAR_W, GROUP_H - 6.0);
             r.rect(Rect::new(12.0, head.y + head.h / 2.0 - 2.5, 5.0, 5.0), 1.0, color);
             let lw = r.text(23.0, r.center(head, UI, 10.5), &label.to_uppercase(), UI, 10.5, 500, t.text3, 150.0);
             r.text(29.0 + lw, r.center(head, MONO, 10.5), &items.len().to_string(), MONO, 10.5, 400, t.faint, 40.0);
             y += GROUP_H;
-            for task in items {
-                let row = Rect::new(6.0, y, SIDEBAR_W - 13.0, ROW_H);
+            for (pos, task) in items.into_iter().enumerate() {
+                let line = status_line(task, pos + 1);
+                let row = Rect::new(6.0, y, SIDEBAR_W - 13.0, ROW2_H);
+                let top = Rect::new(row.x, row.y + 2.0, row.w, 22.0);
                 let on = self.selected == Some(task.id);
                 let bg = if on { t.sel } else { t.panel };
                 if on {
                     r.frame(row, 3.0, bg, t.sel_ring);
                 }
-                state_icon(r, t, &task.state, row.x + 8.0, row.y + ROW_H / 2.0, bg);
-                let time = age(task);
+                state_icon(r, t, &task.state, row.x + 8.0, top.y + top.h / 2.0, bg);
+                // Right: how long it's been idle once done, else how long it has existed.
+                let time = if g == 3 && task.since != 0 { ago(task.since) } else { age(task) };
                 let tw = r.measure(MONO, 10.5, 400, &time);
                 let text_x = row.x + 28.0;
-                let avail = row.w - 28.0 - tw - 22.0;
-                let tc = if on { t.tc_on } else { t.tc };
-                let has_action = !task.action.is_empty() && matches!(task.state.as_str(), "running" | "needs-you");
-                let title_w = r.text(text_x, r.center(row, UI, 12.5), &title(task), UI, 12.5, 400, tc, if has_action { avail * 0.62 } else { avail });
-                if has_action {
-                    let action = task.action.replace('\n', " ");
-                    r.text(text_x + title_w + 6.0, r.center(row, UI, 11.5), &action, UI, 11.5, 400, t.text3, avail - title_w - 6.0);
-                }
-                r.rect(Rect::new(row.x + row.w - 8.0 - tw - 11.0, row.y + ROW_H / 2.0 - 2.5, 5.0, 5.0), 1.0, accent(adapter::kind(&task.agent)));
-                r.text(row.x + row.w - 8.0 - tw, r.center(row, MONO, 10.5), &time, MONO, 10.5, 400, t.text3, tw + 2.0);
+                let ended = g == 4;
+                let tc = if ended { t.text3 } else if on { t.tc_on } else { t.tc };
+                r.text(text_x, r.center(top, UI, 12.5), &title(task), UI, 12.5, 400, tc, row.w - 28.0 - tw - 22.0);
+                r.rect(Rect::new(row.x + row.w - 8.0 - tw - 11.0, top.y + top.h / 2.0 - 2.5, 5.0, 5.0), 1.0, accent(adapter::kind(&task.agent)));
+                r.text(row.x + row.w - 8.0 - tw, r.center(top, MONO, 10.5), &time, MONO, 10.5, 400, t.text3, tw + 2.0);
+                let sub = Rect::new(text_x, top.y + top.h - 3.0, row.w - 36.0, 16.0);
+                let sc = match g {
+                    0 => t.needs,
+                    4 => t.faint,
+                    _ => t.text3,
+                };
+                r.text(sub.x, r.center(sub, UI, 11.5), &line.replace('\n', " "), UI, 11.5, 400, sc, sub.w);
                 if self.hit(row) && list.contains(self.click.unwrap()) {
                     picks.push(task.id);
                 }
-                y += ROW_H;
+                y += ROW2_H;
             }
         }
         let content_h = y + self.scroll - list.y;
@@ -895,6 +1066,7 @@ impl App {
         let Some(task) = self.current().cloned() else {
             let msg = format!("Start a task with {}", mod_label("N"));
             let mw = r.measure(UI, 13.0, 400, &msg);
+            logo(r, area.x + (area.w - 64.0) / 2.0, area.y + area.h / 2.0 - 84.0, 64.0, t.faint, t.needs);
             r.text(area.x + (area.w - mw) / 2.0, area.y + area.h / 2.0 - 8.0, &msg, UI, 13.0, 400, t.text3, area.w);
             return;
         };
@@ -913,8 +1085,18 @@ impl App {
         let kind = adapter::kind(&task.agent);
         let meta = format!("· {} · {}", task.branch, age(&task));
         let meta_w = r.measure(MONO, 11.0, 400, kind) + r.measure(MONO, 11.0, 400, &meta) + 4.0;
+        let review_label = "Review";
+        let review_key = mod_label("R");
+        let bw = r.measure(UI, 12.0, 500, review_label) + r.measure(MONO, 10.5, 400, &review_key) + 28.0;
+        let review = Rect::new(head.x + head.w - 12.0 - bw, head.y + 7.0, bw, 26.0);
+        r.rect(review, 3.0, t.primary_bg);
+        let rlw = r.text(review.x + 10.0, r.center(review, UI, 12.0), review_label, UI, 12.0, 500, t.primary_fg, bw);
+        r.text(review.x + 18.0 + rlw, r.center(review, MONO, 10.5), &review_key, MONO, 10.5, 400, alpha(t.primary_fg, 160), 60.0);
+        if self.hit(review) {
+            self.actions.push(Action::OpenReview);
+        }
         let tx = pill.x + pw + 10.0;
-        let title_w = r.text(tx, r.center(head, UI, 13.5), &title(&task), UI, 13.5, 500, t.text, (head.w - (tx - head.x) - meta_w - 26.0).max(40.0));
+        let title_w = r.text(tx, r.center(head, UI, 13.5), &title(&task), UI, 13.5, 500, t.text, (head.w - (tx - head.x) - meta_w - 26.0 - bw).max(40.0));
         let mx = tx + title_w + 10.0;
         let kw = r.text(mx, r.center(head, MONO, 11.0), kind, MONO, 11.0, 400, accent(kind), 100.0);
         r.text(mx + kw + 4.0, r.center(head, MONO, 11.0), &meta, MONO, 11.0, 400, t.text3, meta_w);
@@ -926,13 +1108,27 @@ impl App {
         let focused = self.focus == Focus::Message;
         r.frame(ib, 4.0, t.panel, if focused { t.work } else { t.border2 });
         r.text(ib.x + 10.0, r.center(ib, MONO, 12.5), "›", MONO, 12.5, 400, t.text3, 20.0);
+        // The agent's mode (read from its hidden footer); click or ⇧Tab cycles it.
+        let mut text_w = ib.w - 60.0;
+        if let Some((_, mode)) = self.session.as_ref().filter(|s| s.task == task.id).and_then(|s| agent_box(&s.screen)) {
+            let label = if mode.is_empty() { "default mode".to_string() } else { mode };
+            let cw = r.measure(MONO, 10.5, 400, &label) + r.measure(UI, 10.0, 400, "⇧Tab") + 26.0;
+            let chip = Rect::new(ib.x + ib.w - 34.0 - cw, ib.y + 6.0, cw, 20.0);
+            r.rect(chip, 3.0, t.raised);
+            let lw = r.text(chip.x + 8.0, r.center(chip, MONO, 10.5), &label, MONO, 10.5, 400, t.text2, cw);
+            r.text(chip.x + 16.0 + lw, r.center(chip, UI, 10.0), "⇧Tab", UI, 10.0, 400, t.text3, 40.0);
+            if self.hit(chip) {
+                self.actions.push(Action::Input(b"\x1b[Z".to_vec()));
+            }
+            text_w -= cw + 8.0;
+        }
         if self.message.is_empty() && !focused {
-            r.text(ib.x + 26.0, r.center(ib, UI, 12.5), &format!("Message {kind}  ·  {}", mod_label("I")), UI, 12.5, 400, t.text3, ib.w - 60.0);
+            r.text(ib.x + 26.0, r.center(ib, UI, 12.5), &format!("Message {kind}  ·  {}", mod_label("I")), UI, 12.5, 400, t.text3, text_w);
         } else {
-            self.field_text(r, t, ib.x + 26.0, r.center(ib, UI, 12.5), &self.message.clone(), UI, 12.5, ib.w - 60.0, focused, t.work);
+            self.field_text(r, t, ib.x + 26.0, r.center(ib, UI, 12.5), &self.message.clone(), UI, 12.5, text_w, focused, t.work);
         }
         r.text(ib.x + ib.w - 22.0, r.center(ib, MONO, 10.5), "↵", MONO, 10.5, 400, t.text3, 20.0);
-        if self.hit(ib) {
+        if self.hit(ib) && self.actions.is_empty() {
             self.actions.push(Action::Focus(Focus::Message));
         }
 
@@ -948,22 +1144,34 @@ impl App {
         let size = (((grid.w / cell_w) as u16).max(2), ((grid.h / LINE_H) as u16).max(1));
         self.pane = size;
         let term_focus = self.focus == Focus::Term && self.dialog.is_none();
-        match &mut self.session {
-            Some(s) if s.task == task.id => {
+        let screen = match (&mut self.session, &mut self.history) {
+            (Some(s), _) if s.task == task.id => {
                 if s.size != size {
                     s.size = size;
                     s.screen.resize(size.0, size.1);
                     let _ = s.writer.write_all(&proto::frame(&Request::Resize { cols: size.0, rows: size.1 }));
                 }
-                r.set_clip(Some(Rect::new(sec.x, sec.y, sec.w, sec.h - bar_h)));
-                draw_term(r, t, &s.screen, grid, cell_w, term_focus);
+                Some(&s.screen)
+            }
+            (_, Some((id, screen))) if *id == task.id => Some(&*screen), // kept at the size it was drawn for
+            _ => None,
+        };
+        match screen {
+            Some(screen) => {
+                // Stop above the agent's own input box: ours below replaces it.
+                let rows = agent_box(screen).map_or(screen.grid().screen_lines(), |(row, _)| row) as f32;
+                // A replay taller than the pane keeps its last text in view.
+                let last = (0..rows as usize).rev().find(|&row| (0..screen.grid().columns()).any(|c| screen.grid()[Line(row as i32)][Column(c)].c != ' '));
+                let lift = (last.map_or(0.0, |l| l as f32 + 1.0) * LINE_H - grid.h).max(0.0);
+                r.set_clip(Some(Rect::new(sec.x, sec.y, sec.w, (sec.h - bar_h).min(grid.y - sec.y + rows * LINE_H - lift))));
+                draw_term(r, t, screen, Rect { y: grid.y - lift, ..grid }, cell_w, term_focus);
                 r.set_clip(None);
             }
-            _ => {
+            None => {
                 let note = match task.state.as_str() {
                     "queued" => "Queued · starts when a slot frees up".to_string(),
                     "exited" => "Agent exited".into(),
-                    "dead" => "Agent died with the daemon".into(),
+                    "dead" => "Agent died with the daemon (no output recorded)".into(),
                     "failed" => "Agent failed to start".into(),
                     _ => "Connecting…".into(),
                 };
@@ -1046,7 +1254,7 @@ impl App {
         r.rect(Rect::new(0.0, bar.y, w, 1.0), 0.0, t.border);
         let mut counts = [0; 4];
         for task in &self.tasks {
-            counts[group(&task.state)] += 1;
+            counts[group(&task.state).min(3)] += 1;
         }
         let mut x = 12.0;
         let y = r.center(bar, MONO, 10.5);
@@ -1205,13 +1413,66 @@ fn state_icon(r: &mut Renderer, t: &Theme, state: &str, x: f32, cy: f32, bg: Rgb
     }
 }
 
+/// The last terminal size recorded in a task log (the daemon writes `ESC [8;rows;cols t` on resize).
+fn last_size(log: &[u8]) -> Option<(u16, u16)> {
+    let at = log.windows(4).rposition(|w| w == b"\x1b[8;")?;
+    let rest = &log[at + 4..];
+    let end = rest.iter().take(12).position(|&b| b == b't')?;
+    let (rows, cols) = std::str::from_utf8(&rest[..end]).ok()?.split_once(';')?;
+    Some((cols.parse().ok()?, rows.parse().ok()?))
+}
+
+/// The agent's own input box at the bottom of its screen (Claude Code: a rule, `❯ input`, a rule,
+/// then a footer). Returns the box's first row and the mode named in the footer ("" if none).
+/// None when the screen is scrolled back or shows something else there (a menu, a dialog).
+fn agent_box(screen: &Screen) -> Option<(usize, String)> {
+    let grid = screen.grid();
+    if grid.display_offset() != 0 {
+        return None;
+    }
+    let rows: Vec<String> = (0..grid.screen_lines())
+        .map(|row| (0..grid.columns()).map(|c| grid[Line(row as i32)][Column(c)].c).collect())
+        .collect();
+    let rule = |s: &String| s.trim().chars().count() >= 20 && s.trim().chars().all(|c| c == '─');
+    let lower = rows.iter().rposition(rule)?;
+    let upper = rows[..lower].iter().rposition(rule)?;
+    if lower - upper > 12 || !rows[upper + 1].trim_start().starts_with(['❯', '>']) {
+        return None;
+    }
+    // Footer: "-- INSERT --  ⏵⏵ auto mode on (shift+tab to cycle) · …"
+    let mode = rows[lower + 1..]
+        .iter()
+        .find_map(|r| r.find("(shift+tab to cycle)").map(|i| r[..i].rsplit("--").next().unwrap_or("").trim_matches(|c: char| !c.is_alphanumeric()).to_string()))
+        .unwrap_or_default();
+    Some((upper, mode))
+}
+
+/// The arranger mark (docs: "Ensemble"): three arcs of players around an amber conductor.
+/// `size` is the mark's box; below 24 px it uses the solid two-arc variant.
+fn logo(r: &mut Renderer, x: f32, y: f32, size: f32, ink: Rgba, amber: Rgba) {
+    let k = size / 64.0;
+    let mut dot = |cx: f32, cy: f32, d: f32, c: Rgba| r.rect(Rect::new(x + (cx - d / 2.0) * k, y + (cy - d / 2.0) * k, d * k, d * k), d * k / 2.0, c);
+    let solid = size < 24.0;
+    let (arcs, stroke): (&[(f32, usize)], f32) = if solid { (&[(27.0, 54), (13.0, 26)], 7.0) } else { (&[(28.0, 10), (19.0, 7), (10.0, 4)], 5.5) };
+    // n + 1 dots from end to end; the solid arcs pack them tight enough to read as a stroke.
+    for &(radius, n) in arcs {
+        for i in 0..=n {
+            let a = std::f32::consts::PI * (1.0 - i as f32 / n as f32);
+            dot(32.0 + radius * a.cos(), 45.0 - radius * a.sin(), stroke, ink);
+        }
+    }
+    let (cy, cr) = if solid { (46.0, 6.0) } else { (45.0, 4.5) };
+    dot(32.0, cy, cr * 2.0, amber);
+}
+
 fn draw_term(r: &mut Renderer, t: &Theme, screen: &Screen, area: Rect, cell_w: f32, focused: bool) {
     let grid = screen.grid();
     let mode = screen.mode();
     let (asc, desc) = r.vmetrics(MONO, TERM_SIZE);
     let base = (LINE_H - (asc + desc)) / 2.0 + asc;
+    let offset = grid.display_offset() as i32;
     for row in 0..grid.screen_lines() {
-        let line = &grid[Line(row as i32)];
+        let line = &grid[Line(row as i32 - offset)];
         let y = area.y + row as f32 * LINE_H;
         for col in 0..grid.columns() {
             let cell = &line[Column(col)];
@@ -1240,7 +1501,7 @@ fn draw_term(r: &mut Renderer, t: &Theme, screen: &Screen, area: Rect, cell_w: f
             }
         }
     }
-    if mode.contains(TermMode::SHOW_CURSOR) {
+    if mode.contains(TermMode::SHOW_CURSOR) && offset == 0 {
         let p = grid.cursor.point;
         let cur = Rect::new(area.x + p.column.0 as f32 * cell_w, area.y + p.line.0 as f32 * LINE_H, cell_w, LINE_H);
         if focused {
@@ -1256,5 +1517,23 @@ fn draw_term(r: &mut Renderer, t: &Theme, screen: &Screen, area: Rect, cell_w: f
                 r.rect(side, 0.0, c);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_claude_input_box_and_mode() {
+        let rule = "─".repeat(40);
+        let mut s = Screen::new(60, 8);
+        s.feed(format!("chat\r\n\r\n{rule}\r\n❯ draft\r\n{rule}\r\n-- INSERT --  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents").as_bytes());
+        assert_eq!(agent_box(&s), Some((2, "auto mode on".to_string())));
+
+        let mut menu = Screen::new(60, 8);
+        menu.feed(format!("{rule}\r\nAccessing workspace:\r\n❯ 1. Yes\r\n{rule}\r\n").as_bytes());
+        assert_eq!(agent_box(&menu), None);
+        assert_eq!(last_size(b"x\x1b[8;24;80tyy\x1b[8;62;236tzz"), Some((236, 62)));
     }
 }

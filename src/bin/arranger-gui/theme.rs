@@ -6,6 +6,12 @@ const fn hex(v: u32) -> Rgba {
     [(v >> 16) as u8, (v >> 8) as u8, v as u8, 255]
 }
 
+/// `a` moved `k` (0..1) of the way towards `b`.
+pub fn blend(a: Rgba, b: Rgba, k: f32) -> Rgba {
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * k) as u8;
+    [mix(a[0], b[0]), mix(a[1], b[1]), mix(a[2], b[2]), 255]
+}
+
 pub fn alpha(c: Rgba, a: u8) -> Rgba {
     [c[0], c[1], c[2], a]
 }

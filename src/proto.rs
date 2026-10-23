@@ -9,7 +9,7 @@ use std::path::PathBuf;
 const MAX_FRAME: usize = 64 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -34,6 +34,13 @@ pub enum Request {
     Resize { cols: u16, rows: u16 },
     /// Sent first on every client connection; see `VERSION`.
     Version,
+    Review { id: u64 },
+    /// Undo one hunk (identified by its header) in the task's worktree.
+    Revert { id: u64, path: String, header: String },
+    /// Type `text` into the agent and submit it, as a new prompt.
+    Prompt { id: u64, text: String },
+    /// Commit everything in the worktree; with `pr`, push and open a PR. Replied to with JobDone.
+    Commit { id: u64, message: String, pr: bool },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -50,6 +57,8 @@ pub enum Reply {
     Exited,
     Error(String),
     Version(u32),
+    Review(Review),
+    JobDone { ok: bool, output: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -70,6 +79,51 @@ pub struct TaskInfo {
     pub need: Option<Event>,
     /// A permission ask is waiting on Answer.
     pub asking: bool,
+    /// Unix seconds when `state`/`action` last changed (live tasks only, else 0).
+    pub since: u64,
+    /// First line of the agent's last reply, or "".
+    pub summary: String,
+}
+
+/// A task's changes against the commit its worktree branched from.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Review {
+    pub branch: String,
+    pub base: String,
+    /// The agent's last reply.
+    pub summary: String,
+    /// Check-like commands the agent ran (test, build, lint…): ok is None while running.
+    pub checks: Vec<(String, Option<bool>)>,
+    pub files: Vec<FileDiff>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileDiff {
+    pub path: String,
+    /// 'A' added, 'M' modified, 'D' deleted.
+    pub status: char,
+    pub added: u32,
+    pub removed: u32,
+    pub binary: bool,
+    pub hunks: Vec<Hunk>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Hunk {
+    /// `@@ -a,b +c,d @@  scope`, also the hunk's identity for Revert.
+    pub header: String,
+    pub lines: Vec<DiffLine>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DiffLine {
+    /// ' ', '+' or '-'.
+    pub kind: char,
+    /// 1-based; 0 when the line doesn't exist on that side.
+    pub old: u32,
+    pub new: u32,
+    /// Includes its line terminator, if any.
+    pub text: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
@@ -97,6 +151,8 @@ pub enum Event {
     /// OSC 9/777 terminal notification.
     Attention { text: String },
     TurnDone,
+    /// The agent's closing reply for a turn.
+    Summary { text: String },
     Error { message: String },
     /// Session totals so far.
     Usage { tokens: u64, cost: Option<f64> },
@@ -123,6 +179,7 @@ impl Event {
             Event::Question { text, .. } => format!("asks: {text}"),
             Event::Attention { text } => format!("notice: {text}"),
             Event::TurnDone => "done".into(),
+            Event::Summary { text } => format!("summary: {text}"),
             Event::Error { message } => format!("error: {message}"),
             Event::Usage { tokens, cost: Some(cost) } => format!("{tokens} tokens, ${cost:.4}"),
             Event::Usage { tokens, cost: None } => format!("{tokens} tokens"),

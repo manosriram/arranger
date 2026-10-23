@@ -117,8 +117,11 @@ pub struct Renderer {
     clip: Option<Rect>,
 }
 
+/// Added to every requested weight: Geist at its nominal weights reads too thin on screen.
+const WEIGHT_BOOST: f32 = 100.0;
+
 fn coords(font: &FontRef, weight: u16) -> Vec<NormalizedCoord> {
-    font.variations().normalized_coords([("wght", weight as f32)]).collect()
+    font.variations().normalized_coords([("wght", weight as f32 + WEIGHT_BOOST)]).collect()
 }
 
 fn fonts() -> &'static [&'static [u8]] {
@@ -300,8 +303,9 @@ impl Renderer {
     /// Filled rect with corner radius.
     pub fn rect(&mut self, r: Rect, radius: f32, color: Rgba) {
         let d = self.dpi;
+        // Round both edges, not the size, so neighbouring rects (terminal cell backgrounds) meet without seams.
         let (x, y) = ((r.x * d).round(), (r.y * d).round());
-        let (w, h) = ((r.w * d).round(), (r.h * d).round());
+        let (w, h) = (((r.x + r.w) * d).round() - x, ((r.y + r.h) * d).round() - y);
         self.quad(x, y, w, h, [0.0; 4], (radius * d).min(w / 2.0).min(h / 2.0).max(0.0), color);
     }
 

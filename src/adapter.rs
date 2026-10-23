@@ -116,6 +116,8 @@ pub fn parse(adapter: &str, v: &Value, totals: &mut Totals) -> (Vec<Event>, bool
         },
         "Stop" | "AfterAgent" => {
             let mut events: Vec<Event> = v["transcript_path"].as_str().and_then(transcript_usage).into_iter().collect();
+            let summary = [&v["last_assistant_message"], &v["prompt_response"]].into_iter().map(str).find(|s| !s.is_empty());
+            events.extend(summary.map(|text| Event::Summary { text }));
             events.push(Event::TurnDone);
             events
         }

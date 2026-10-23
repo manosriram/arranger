@@ -6,4 +6,5 @@ pub mod client;
 pub mod daemon;
 pub mod proto;
 pub mod pty;
+pub mod review;
 pub mod screen;

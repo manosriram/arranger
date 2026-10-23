@@ -14,7 +14,8 @@ use std::{env, thread};
 
 const USAGE: &str = "usage: arranger            open the workspace window
        arranger [ls [--files] | new <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
-                 | approve <id> | deny <id> [reason] | events <id> | ping | stop | serve | hook <adapter>]";
+                 | approve <id> | deny <id> [reason] | events <id> | diff <id> | revert <id> <path> <hunk#>
+                 | send <id> <text> | commit <id> [--pr] [message] | ping | stop | serve | hook <adapter>]";
 /// Ctrl-\, raw and in kitty keyboard encoding.
 const DETACH: &[&[u8]] = &[b"\x1c", b"\x1b[92;5u"];
 
@@ -35,6 +36,13 @@ fn main() {
         ["events", id] => parse_id(id).and_then(events),
         ["ping"] => request(&Request::Ping).map(|_| println!("pong")),
         ["stop"] => arranger::client::stop(),
+        ["diff", id] => parse_id(id).and_then(diff),
+        ["revert", id, path, hunk] => parse_id(id).and_then(|id| revert(id, path, hunk)),
+        ["send", id, ref text @ ..] => {
+            parse_id(id).and_then(|id| request(&Request::Prompt { id, text: text.join(" ") }).map(drop))
+        }
+        ["commit", id, "--pr", ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, true)),
+        ["commit", id, ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, false)),
         ["new", agent, "--branch", base, ref prompt @ ..] => new(agent, Some(base), prompt),
         ["new", agent, ref prompt @ ..] => new(agent, None, prompt),
         ["attach", id] => parse_id(id).and_then(attach),
@@ -77,6 +85,50 @@ fn ls(files: bool) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn diff(id: u64) -> io::Result<()> {
+    let reply = request(&Request::Review { id })?;
+    let Reply::Review(r) = reply else { return Err(unexpected(reply)) };
+    println!("{} -> {}", r.branch, r.base);
+    for f in r.files {
+        println!("\n{} {}  +{} -{}{}", f.status, f.path, f.added, f.removed, if f.binary { "  (binary)" } else { "" });
+        for (i, h) in f.hunks.iter().enumerate() {
+            println!("[{}] {}", i + 1, h.header);
+            for l in &h.lines {
+                print!("{}{}", l.kind, l.text);
+                if !l.text.ends_with('\n') {
+                    println!("\n\\ No newline at end of file");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `hunk` is the 1-based number `diff` prints.
+fn revert(id: u64, path: &str, hunk: &str) -> io::Result<()> {
+    let reply = request(&Request::Review { id })?;
+    let Reply::Review(r) = reply else { return Err(unexpected(reply)) };
+    let n: usize = hunk.parse().map_err(|_| io::Error::other("hunk is the number diff prints"))?;
+    let header = r
+        .files
+        .iter()
+        .find(|f| f.path == path)
+        .and_then(|f| f.hunks.get(n.wrapping_sub(1)))
+        .map(|h| h.header.clone())
+        .ok_or_else(|| io::Error::other(format!("no hunk {n} in {path}")))?;
+    request(&Request::Revert { id, path: path.into(), header }).map(drop)
+}
+
+fn commit(id: u64, message: &[&str], pr: bool) -> io::Result<()> {
+    match request(&Request::Commit { id, message: message.join(" "), pr })? {
+        Reply::JobDone { ok, output } => {
+            println!("{output}");
+            if ok { Ok(()) } else { Err(io::Error::other("commit failed")) }
+        }
+        reply => Err(unexpected(reply)),
+    }
 }
 
 fn answer(id: u64, allow: bool, message: String) -> io::Result<()> {

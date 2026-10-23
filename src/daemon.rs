@@ -3,6 +3,8 @@
 use crate::adapter::{self, Osc};
 use crate::proto::{self, Event, Reply, Request, TaskInfo};
 use crate::pty::{self, Pty};
+use crate::review;
+use alacritty_terminal::term::TermMode;
 use crate::screen::Screen;
 use mio::net::{UnixListener, UnixStream};
 use mio::unix::SourceFd;
@@ -26,6 +28,8 @@ const CHILD: Token = Token(1);
 const STOP: Token = Token(2);
 /// Task PTYs use `Token(TASK + id)`; client connections count up from 3.
 const TASK: usize = 1 << 40;
+/// Commit/PR jobs use `Token(JOB + n)`.
+const JOB: usize = 1 << 39;
 const LOG_CHUNK: usize = 64 * 1024;
 const MAX_OUTBUF: usize = 16 << 20;
 
@@ -41,6 +45,8 @@ struct Task {
     need: Option<Event>,
     /// Live action line, e.g. "editing src/pty.rs".
     action: String,
+    /// Unix seconds when `activity`/`action` last changed.
+    since: u64,
 }
 
 /// What a running agent is up to, derived from its events.
@@ -72,6 +78,14 @@ struct Conn {
     writable: bool,
 }
 
+/// A commit/PR script running in a task's worktree; its output goes back to `conn`.
+struct Job {
+    child: std::process::Child,
+    out: std::io::PipeReader,
+    buf: Vec<u8>,
+    conn: Token,
+}
+
 struct Daemon {
     poll: Poll,
     listener: UnixListener,
@@ -88,6 +102,8 @@ struct Daemon {
     max_live: usize,
     /// Some task changed; push the list to watchers after this loop turn.
     dirty: bool,
+    jobs: HashMap<usize, Job>,
+    next_job: usize,
 }
 
 pub fn run() -> io::Result<()> {
@@ -117,7 +133,11 @@ pub fn run() -> io::Result<()> {
     )
     .map_err(io::Error::other)?;
     // Columns added after Phase 1; errors just mean they're already there.
-    for col in ["created INTEGER NOT NULL DEFAULT 0", "title TEXT NOT NULL DEFAULT ''", "prompt TEXT NOT NULL DEFAULT ''"] {
+    for col in ["created INTEGER NOT NULL DEFAULT 0", "title TEXT NOT NULL DEFAULT ''", "prompt TEXT NOT NULL DEFAULT ''",
+        "base TEXT NOT NULL DEFAULT ''",
+        "base_commit TEXT NOT NULL DEFAULT ''",
+        "summary TEXT NOT NULL DEFAULT ''",
+    ] {
         let _ = db.execute(&format!("ALTER TABLE tasks ADD COLUMN {col}"), []);
     }
 
@@ -142,6 +162,8 @@ pub fn run() -> io::Result<()> {
         next_conn: 3,
         max_live: std::env::var("ARRANGER_MAX_AGENTS").ok().and_then(|v| v.parse().ok()).unwrap_or(20),
         dirty: false,
+        jobs: HashMap::new(),
+        next_job: 0,
     };
     d.start_queued();
 
@@ -162,6 +184,7 @@ pub fn run() -> io::Result<()> {
                     return Ok(());
                 }
                 Token(t) if t >= TASK => d.read_task((t - TASK) as u64),
+                Token(t) if t >= JOB => d.read_job(t - JOB),
                 t => d.conn_event(t, ev.is_readable(), ev.is_writable()),
             }
         }
@@ -196,6 +219,16 @@ fn git_in(dir: &Path) -> Command {
     cmd
 }
 
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Logged with every resize so a replay knows the size the output was drawn for. It is the
+/// xterm "resize window" sequence, so `zstd -dc log | cat` in a terminal stays faithful too.
+fn size_mark(cols: u16, rows: u16) -> Vec<u8> {
+    format!("\x1b[8;{rows};{cols}t").into_bytes()
+}
+
 /// Concatenated zstd frames are a valid zstd file, so each chunk is compressed on its own.
 fn flush_log(data: &Path, id: u64, log: &mut Vec<u8>, zstd: &mut zstd::bulk::Compressor) {
     if log.is_empty() {
@@ -220,6 +253,35 @@ fn write_pty(master: &OwnedFd, mut bytes: &[u8]) {
             Err(_) => return,
         }
     }
+}
+
+/// The latest result of each check-like command (tests, builds, linters) the agent ran.
+fn checks(events: &[(u64, Event)]) -> Vec<(String, Option<bool>)> {
+    const WORDS: &[&str] = &["test", "build", "check", "lint", "clippy", "fmt", "tsc", "eslint", "vet", "bench", "make"];
+    let mut out: Vec<(String, Option<bool>)> = Vec::new();
+    let mut running: Option<String> = None;
+    for (_, e) in events {
+        match e {
+            Event::ToolStart { kind: proto::ToolKind::Bash, target } => {
+                let lower = target.to_lowercase();
+                running = WORDS.iter().any(|w| lower.contains(w)).then(|| target.clone());
+                if let Some(cmd) = &running {
+                    out.retain(|(c, _)| c != cmd);
+                    out.push((cmd.clone(), None));
+                }
+            }
+            Event::ToolEnd { ok } => {
+                if let Some(cmd) = running.take() {
+                    if let Some(c) = out.iter_mut().find(|(c, _)| *c == cmd) {
+                        c.1 = Some(*ok);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let skip = out.len().saturating_sub(6);
+    out.split_off(skip)
 }
 
 fn now_secs() -> u64 {
@@ -299,6 +361,35 @@ impl Daemon {
             },
             Request::New { agent, repo, base, prompt } => match self.create(&agent, &repo, base.as_deref(), prompt.as_deref().unwrap_or("")) {
                 Ok(id) => Reply::Created { id, state: self.state(id) },
+                Err(e) => Reply::Error(e),
+            },
+            Request::Review { id } => match self.review(id) {
+                Ok(r) => Reply::Review(r),
+                Err(e) => Reply::Error(e),
+            },
+            Request::Revert { id, path, header } => {
+                let reverted = self.task_paths(id).and_then(|(wt, base)| review::revert(Path::new(&wt), &base, &path, &header));
+                match reverted {
+                    Ok(()) => Reply::Ok,
+                    Err(e) => Reply::Error(e),
+                }
+            }
+            Request::Prompt { id, text } => match self.tasks.get(&id) {
+                Some(task) => {
+                    let mut bytes = if task.screen.mode().contains(TermMode::BRACKETED_PASTE) {
+                        format!("\x1b[200~{text}\x1b[201~").into_bytes()
+                    } else {
+                        text.replace('\n', "\r").into_bytes()
+                    };
+                    bytes.push(b'\r');
+                    write_pty(&task.pty.master, &bytes);
+                    self.resume(id);
+                    Reply::Ok
+                }
+                None => Reply::Error(format!("task {id} isn't running")),
+            },
+            Request::Commit { id, message, pr } => match self.commit(t, id, &message, pr) {
+                Ok(()) => return, // JobDone comes when the script finishes
                 Err(e) => Reply::Error(e),
             },
             Request::Kill { id } => match self.kill(id) {
@@ -433,6 +524,7 @@ impl Daemon {
         if let Some(task) = self.tasks.get_mut(&id) {
             let _ = pty::resize(&task.pty.master, cols, rows);
             task.screen.resize(cols, rows);
+            task.log.extend(size_mark(cols, rows));
         }
     }
 
@@ -480,6 +572,12 @@ impl Daemon {
             eprintln!("task {id}: {e}");
         }
         let (activity, action) = match &event {
+            Event::Summary { text } => {
+                let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+                let line: String = line.chars().take(200).collect();
+                let _ = self.db.execute("UPDATE tasks SET summary = ?1 WHERE id = ?2", params![line, id]);
+                return;
+            }
             Event::Usage { .. } => return,
             // Agents with hooks also ping the terminal when idle; that's not a new ask.
             Event::Attention { .. } if task.activity == Activity::Done => return,
@@ -491,6 +589,9 @@ impl Daemon {
             Event::Prompt { .. } | Event::ToolEnd { .. } => (Activity::Running, "working".into()),
         };
         task.need = (activity == Activity::NeedsYou).then(|| event.clone());
+        if (task.activity, &task.action) != (activity, &action) {
+            task.since = now();
+        }
         task.activity = activity;
         task.action = action;
         if let Event::Prompt { text } = &event {
@@ -522,6 +623,7 @@ impl Daemon {
                 task.activity = Activity::Running;
                 task.action = "working".into();
                 task.need = None;
+                task.since = now();
                 self.dirty = true;
             }
         }
@@ -567,7 +669,10 @@ impl Daemon {
     }
 
     fn create(&mut self, agent: &str, dir: &Path, base: Option<&str>, prompt: &str) -> Result<u64, String> {
-        let top = PathBuf::from(git(git_in(dir).args(["rev-parse", "--show-toplevel"]))?);
+        let repo = gix::discover(dir).map_err(e2s)?;
+        let top = repo.workdir().ok_or("not a git work tree")?.to_path_buf();
+        let base_name = base.map_or_else(|| review::current_branch(&top), str::to_string);
+        let base_commit = review::resolve(&top, base.unwrap_or("HEAD"))?;
         let repo_name = top.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         self.db
             .execute(
@@ -580,15 +685,15 @@ impl Daemon {
         let branch = format!("arranger/{id}");
         let wt = self.data.join("worktrees").join(repo_name).join(id.to_string());
         // ponytail: git runs inside the event loop; move it off-loop if large repos stall other agents
-        let added = git(git_in(&top).args(["worktree", "add", "-b", &branch]).arg(&wt).arg(base.unwrap_or("HEAD")));
+        let added = git(git_in(&top).args(["worktree", "add", "-b", &branch]).arg(&wt).arg(&base_commit));
         if let Err(e) = added {
             let _ = self.db.execute("DELETE FROM tasks WHERE id = ?1", [id]);
             return Err(e);
         }
         self.db
             .execute(
-                "UPDATE tasks SET branch = ?1, worktree = ?2, state = 'queued' WHERE id = ?3",
-                params![branch, wt.to_string_lossy(), id],
+                "UPDATE tasks SET branch = ?1, worktree = ?2, state = 'queued', base = ?3, base_commit = ?4 WHERE id = ?5",
+                params![branch, wt.to_string_lossy(), base_name, base_commit, id],
             )
             .map_err(e2s)?;
         self.start_queued();
@@ -646,12 +751,13 @@ impl Daemon {
         let task = Task {
             pty,
             screen: Screen::new(cols, rows),
-            log: Vec::new(),
+            log: size_mark(cols, rows),
             viewers: Vec::new(),
             osc: Osc::default(),
             activity: Activity::Running,
             need: None,
             action: String::new(),
+            since: now(),
         };
         self.tasks.insert(id, task);
         self.set_state(id, "running");
@@ -683,7 +789,7 @@ impl Daemon {
 
     fn list(&self, with_files: bool) -> Result<Vec<TaskInfo>, String> {
         let mut stmt =
-            self.db.prepare("SELECT id, agent, branch, worktree, state, title, created FROM tasks ORDER BY id").map_err(e2s)?;
+            self.db.prepare("SELECT id, agent, branch, worktree, state, title, created, summary FROM tasks ORDER BY id").map_err(e2s)?;
         let rows = stmt.query_map([], |r| {
             Ok(TaskInfo {
                 id: r.get(0)?,
@@ -697,6 +803,8 @@ impl Daemon {
                 created: r.get(6)?,
                 need: None,
                 asking: false,
+                since: 0,
+                summary: r.get(7)?,
             })
         });
         let mut tasks: Vec<TaskInfo> = rows.and_then(Iterator::collect).map_err(e2s)?;
@@ -706,6 +814,7 @@ impl Daemon {
                 info.action = task.action.clone();
                 info.need = task.need.clone();
                 info.asking = self.asks.iter().any(|a| a.0 == info.id);
+                info.since = task.since;
             }
             if with_files {
                 info.files = self.files(info.id).map_err(e2s)?;
@@ -721,6 +830,88 @@ impl Daemon {
              WHERE task = ?1 AND json_extract(event, '$.ToolStart.kind') = 'Edit' ORDER BY 1",
         )?;
         stmt.query_map([id], |r| r.get(0))?.collect()
+    }
+
+    /// (worktree, base commit). Tasks from before base_commit was stored fall back to the fork point.
+    fn task_paths(&self, id: u64) -> Result<(String, String), String> {
+        let (repo, wt, base_commit): (String, String, String) = self
+            .db
+            .query_row("SELECT repo, worktree, base_commit FROM tasks WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()
+            .map_err(e2s)?
+            .ok_or(format!("no task {id}"))?;
+        if !Path::new(&wt).exists() {
+            return Err(format!("task {id} has no worktree"));
+        }
+        let base = if base_commit.is_empty() { review::fork_point(Path::new(&wt), Path::new(&repo))? } else { base_commit };
+        Ok((wt, base))
+    }
+
+    fn review(&self, id: u64) -> Result<proto::Review, String> {
+        let (wt, base_commit) = self.task_paths(id)?;
+        let (branch, base): (String, String) = self
+            .db
+            .query_row("SELECT branch, base FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(e2s)?;
+        let events = self.events(id)?;
+        let summary = events.iter().rev().find_map(|(_, e)| match e {
+            Event::Summary { text } => Some(text.clone()),
+            _ => None,
+        });
+        Ok(proto::Review {
+            branch,
+            base: if base.is_empty() { "HEAD".into() } else { base },
+            summary: summary.unwrap_or_default(),
+            checks: checks(&events),
+            files: review::diff(Path::new(&wt), &base_commit, None)?,
+        })
+    }
+
+    fn commit(&mut self, conn: Token, id: u64, message: &str, pr: bool) -> Result<(), String> {
+        let (wt, _) = self.task_paths(id)?;
+        let (title, base): (String, String) = self
+            .db
+            .query_row("SELECT title, base FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(e2s)?;
+        let message = if message.trim().is_empty() { title.lines().next().unwrap_or("arranger task").to_string() } else { message.to_string() };
+        let summary = self.review(id).map(|r| r.summary).unwrap_or_default();
+        let base = if base == "HEAD" { String::new() } else { base };
+        let (out, write) = std::io::pipe().map_err(e2s)?;
+        let child = Command::new("sh")
+            .args(["-c", review::COMMIT_SCRIPT, "arranger-commit", &message, if pr { "pr" } else { "" }, &summary, &base])
+            .current_dir(&wt)
+            .stdin(std::process::Stdio::null())
+            .stdout(write.try_clone().map_err(e2s)?)
+            .stderr(write)
+            .spawn()
+            .map_err(e2s)?; // the Command, and with it our copies of the write end, drop here
+        rustix::fs::fcntl_setfl(&out, rustix::fs::OFlags::NONBLOCK).map_err(e2s)?;
+        let n = self.next_job;
+        self.next_job += 1;
+        self.poll.registry().register(&mut SourceFd(&out.as_raw_fd()), Token(JOB + n), Interest::READABLE).map_err(e2s)?;
+        self.jobs.insert(n, Job { child, out, buf: Vec::new(), conn });
+        Ok(())
+    }
+
+    fn read_job(&mut self, n: usize) {
+        let Some(job) = self.jobs.get_mut(&n) else { return };
+        let mut buf = [0u8; 8192];
+        loop {
+            match (&job.out).read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => job.buf.extend_from_slice(&buf[..k]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        // EOF: the script closed its output, so it's exiting.
+        let mut job = self.jobs.remove(&n).unwrap();
+        let ok = job.child.wait().is_ok_and(|s| s.success());
+        let output = String::from_utf8_lossy(&job.buf).trim().to_string();
+        self.send(job.conn, &proto::frame(&Reply::JobDone { ok, output }));
     }
 
     fn events(&self, id: u64) -> Result<Vec<(u64, Event)>, String> {

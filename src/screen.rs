@@ -1,7 +1,7 @@
 //! Per-task terminal state, and the escape sequences that redraw it for a new viewer.
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
@@ -67,6 +67,11 @@ impl Screen {
 
     pub fn mode(&self) -> TermMode {
         *self.term.mode()
+    }
+
+    /// Moves the view `lines` into the scrollback (positive = up); 0 rows back is live.
+    pub fn scroll(&mut self, lines: i32) {
+        self.term.scroll_display(Scroll::Delta(lines));
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
