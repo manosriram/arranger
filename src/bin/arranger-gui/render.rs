@@ -6,7 +6,7 @@ use glow::HasContext;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use swash::scale::{Render, ScaleContext, Source};
-use swash::zeno::{Cap, Fill, Format, Mask, Stroke, Transform};
+use swash::zeno::{Cap, Fill, Format, Mask, Stroke, Transform, Vector};
 use swash::{FontRef, NormalizedCoord};
 
 pub const UI: usize = 0;
@@ -80,6 +80,7 @@ struct GlyphKey {
     id: u16,
     px: u32, // physical size * 64
     weight: u16,
+    sub: u8, // x offset in quarter pixels, so glyph spacing stays even
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -422,7 +423,11 @@ impl Renderer {
 
     fn glyph(&mut self, font_i: usize, id: u16, x: f32, baseline: f32, size: f32, weight: u16, color: Rgba) {
         let d = self.dpi;
-        let key = GlyphKey { font: font_i, id, px: (size * d * 64.0) as u32, weight };
+        let (mut col, mut sub) = ((x * d).floor(), ((x * d).fract() * 4.0).round() as u8);
+        if sub == 4 {
+            (col, sub) = (col + 1.0, 0);
+        }
+        let key = GlyphKey { font: font_i, id, px: (size * d * 64.0) as u32, weight, sub };
         let g = match self.glyphs.get(&key) {
             Some(g) => *g,
             None => {
@@ -432,7 +437,7 @@ impl Renderer {
             }
         };
         if let Some(g) = g {
-            let (px, py) = ((x * d).round() + g.left, (baseline * d).round() - g.top);
+            let (px, py) = (col + g.left, (baseline * d).round() - g.top);
             self.quad(px, py, g.w, g.h, g.uv, -1.0, color);
         }
     }
@@ -441,7 +446,7 @@ impl Renderer {
     /// stroked `stroke` units wide with round caps. Rasterised once per (id, size) into the atlas.
     pub fn path(&mut self, id: u16, data: &str, stroke: Option<f32>, x: f32, y: f32, size: f32, color: Rgba) {
         let d = self.dpi;
-        let key = GlyphKey { font: usize::MAX, id, px: (size * d * 64.0) as u32, weight: 0 };
+        let key = GlyphKey { font: usize::MAX, id, px: (size * d * 64.0) as u32, weight: 0, sub: 0 };
         let g = match self.glyphs.get(&key) {
             Some(g) => *g,
             None => {
@@ -473,7 +478,10 @@ impl Renderer {
         let f = font(key.font);
         let c = coords(&f, key.weight);
         let mut scaler = self.scaler.builder(f).size(key.px as f32 / 64.0).hint(true).normalized_coords(&c).build();
-        let img = Render::new(&[Source::Outline]).format(Format::Alpha).render(&mut scaler, key.id)?;
+        let img = Render::new(&[Source::Outline])
+            .format(Format::Alpha)
+            .offset(Vector::new(key.sub as f32 / 4.0, 0.0))
+            .render(&mut scaler, key.id)?;
         let p = img.placement;
         let uv = self.upload(p.width as i32, p.height as i32, &img.data)?;
         Some(Glyph { uv, left: p.left as f32, top: p.top as f32, w: p.width as f32, h: p.height as f32 })

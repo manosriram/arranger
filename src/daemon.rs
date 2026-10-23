@@ -556,6 +556,10 @@ impl Daemon {
             flush_log(&self.data, id, &mut task.log, &mut self.zstd);
         }
         let notices = task.osc.feed(bytes);
+        if let Some(name) = task.osc.title.take() {
+            let _ = self.db.execute("UPDATE tasks SET title = ?1 WHERE id = ?2", params![name, id]);
+            self.dirty = true;
+        }
         let replies = task.screen.feed(bytes);
         if task.viewers.is_empty() {
             // Attached viewers' own terminals answer queries; answer only when nobody is.
@@ -764,7 +768,7 @@ impl Daemon {
             screen: Screen::new(cols, rows),
             log: size_mark(cols, rows),
             viewers: Vec::new(),
-            osc: Osc::default(),
+            osc: Osc::named(agent == "claude"), // ponytail: claude only; other agents' titles are status, not names
             activity: Activity::Running,
             need: None,
             action: String::new(),

@@ -246,6 +246,11 @@ fn transcript_usage(path: &str) -> Option<Event> {
 pub struct Osc {
     state: u8, // 0 ground, 1 ESC, 2 in OSC body, 3 ESC inside body
     body: Vec<u8>,
+    /// Also watch the window title (OSC 0/2): Claude Code names the session there in a few words.
+    pub titles: bool,
+    last_title: String,
+    /// A new session name, once it changes.
+    pub title: Option<String>,
 }
 
 impl Osc {
@@ -260,6 +265,9 @@ impl Osc {
                 }
                 (2, 0x07) | (3, b'\\') => {
                     found.extend(notification(&self.body));
+                    if self.titles {
+                        self.window_title();
+                    }
                     0
                 }
                 (2, 0x1b) => 3,
@@ -273,6 +281,23 @@ impl Osc {
             };
         }
         found
+    }
+}
+
+impl Osc {
+    pub fn named(titles: bool) -> Osc {
+        Osc { titles, ..Default::default() }
+    }
+
+    fn window_title(&mut self) {
+        let Some(rest) = self.body.strip_prefix(b"0;").or_else(|| self.body.strip_prefix(b"2;")) else { return };
+        // Claude animates a spinner glyph in front of the name.
+        let name = String::from_utf8_lossy(rest).trim_start_matches(|c: char| !c.is_alphanumeric()).trim().to_string();
+        if name.is_empty() || name == "Claude Code" || name == self.last_title {
+            return;
+        }
+        self.last_title = name.clone();
+        self.title = Some(name);
     }
 }
 
@@ -298,6 +323,16 @@ mod tests {
         assert_eq!(osc.feed(b"hi\x1b]9;Need input\x07 \x1b]0;title\x07"), ["Need input"]);
         assert_eq!(osc.feed(b"\x1b]777;notify;Codex;Appr"), Vec::<String>::new());
         assert_eq!(osc.feed(b"ove?\x1b\\\x1b]9;4;1;50\x07"), ["Codex: Approve?"]);
+        assert_eq!(osc.title, None);
+    }
+
+    #[test]
+    fn osc_titles() {
+        let mut osc = Osc { titles: true, ..Default::default() };
+        osc.feed("\x1b]0;Claude Code\x07\x1b]0;✳ Machine Stats\x07".as_bytes());
+        assert_eq!(osc.title.take().as_deref(), Some("Machine Stats"));
+        osc.feed("\x1b]0;⠂ Machine Stats\x07".as_bytes());
+        assert_eq!(osc.title, None); // only the spinner moved
     }
 
     #[test]

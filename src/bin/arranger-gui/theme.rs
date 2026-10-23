@@ -329,6 +329,17 @@ pub fn accent(agent: &str) -> Rgba {
     }
 }
 
+/// The agent colour deep enough to fill a button under white text on a light theme.
+pub fn accent_deep(agent: &str) -> Rgba {
+    match agent {
+        "claude" => hex(0xC4552B),
+        "codex" => hex(0x0B7F69),
+        "pi" => hex(0x7445C7),
+        "gemini" => hex(0x2C66D6),
+        _ => hex(0x565C66),
+    }
+}
+
 impl Theme {
     /// ANSI 0-15, derived from the theme's own tokens (the mockups define no terminal palette).
     pub fn ansi(&self, i: u8) -> Rgba {

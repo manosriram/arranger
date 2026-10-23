@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use review::{ReviewAction, ReviewView, Tag};
-use theme::{AGENTS, Rgba, THEMES, Theme, accent, alpha, blend, readable};
+use theme::{AGENTS, Rgba, THEMES, Theme, accent, accent_deep, alpha, blend, readable};
 #[cfg(test)]
 use theme::{GRAPHITE, PAPER};
 use winit::application::ApplicationHandler;
@@ -151,6 +151,10 @@ struct Dialog {
     /// Repo on the chosen machine.
     repo: String,
     base: String,
+    /// Local branches, most recent first; empty on other machines, where the base is typed.
+    branches: Vec<String>,
+    /// The branch list is open, and where it was drawn last frame.
+    list: Option<Rect>,
     error: String,
 }
 
@@ -184,7 +188,6 @@ enum Action {
     AddHost,
     Reconnect(usize),
     RemoveHost(usize),
-    ShowEnded(usize),
     PickTheme(usize),
     ToggleMenu,
     ToggleVim,
@@ -257,8 +260,6 @@ struct App {
     sidebar_w: f32,
     rail_w: f32,
     dragging: Option<Divider>,
-    /// Machines whose ended tasks are listed; they're folded into one row otherwise.
-    show_ended: std::collections::HashSet<usize>,
     caret_on: bool,
     blink_at: Instant,
 }
@@ -326,7 +327,6 @@ fn run() -> io::Result<()> {
         sidebar_w: SIDEBAR_W,
         rail_w: 280.0,
         dragging: None,
-        show_ended: Default::default(),
         caret_on: true,
         blink_at: Instant::now(),
     };
@@ -575,7 +575,7 @@ struct Section<'a> {
     key: String,
     host: Option<usize>,
     tasks: Vec<&'a TaskInfo>,
-    /// Tasks whose agent has ended, listed last; folded out of `tasks` unless shown.
+    /// Tasks whose agent has ended; left out of `tasks` (Overview lists them) unless filtering or selected.
     ended: usize,
 }
 
@@ -871,8 +871,8 @@ impl App {
             let mut tasks: Vec<&TaskInfo> = h.tasks.iter().filter(shown).filter(|t| group(&t.state) != 0).collect();
             sort(&mut tasks);
             let ended = tasks.iter().filter(|t| group(&t.state) == 4).count();
-            if f.is_empty() && !self.show_ended.contains(&i) {
-                tasks.truncate(tasks.len() - ended);
+            if f.is_empty() {
+                tasks.retain(|t| group(&t.state) != 4 || self.selected == Some((t.machine, t.id)));
             }
             out.push(Section { key: format!("host:{i}"), host: Some(i), tasks, ended });
         }
@@ -1204,7 +1204,7 @@ impl App {
     fn open_dialog(&mut self) {
         // Starts on the selected task's machine.
         let host = self.current().map_or(0, |t| t.machine);
-        self.dialog = Some(Dialog { prompt: String::new(), agent: 0, host: 0, repo: String::new(), base: String::new(), error: String::new() });
+        self.dialog = Some(Dialog { prompt: String::new(), agent: 0, host: 0, repo: String::new(), base: String::new(), branches: Vec::new(), list: None, error: String::new() });
         self.pick_host(host);
         self.focus = Focus::Prompt;
         self.select_all = false;
@@ -1213,8 +1213,8 @@ impl App {
     /// Points the new-task dialog at machine `m`: its default repo, and here the current branch.
     fn pick_host(&mut self, m: usize) {
         let Some(h) = self.hosts.get(m).filter(|h| !h.removed) else { return };
-        let (repo, base) = match &h.cfg {
-            Some(c) => (c.repo.clone(), String::new()), // the remote's checked-out branch
+        let (repo, base, branches) = match &h.cfg {
+            Some(c) => (c.repo.clone(), String::new(), Vec::new()), // the remote's checked-out branch
             None => {
                 let base = Command::new("git")
                     .arg("-C")
@@ -1225,11 +1225,18 @@ impl App {
                     .filter(|o| o.status.success())
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                     .unwrap_or_else(|| "HEAD".into());
-                (self.repo.display().to_string(), base)
+                let branches = Command::new("git")
+                    .arg("-C")
+                    .arg(&self.repo)
+                    .args(["for-each-ref", "--sort=-committerdate", "--format=%(refname:short)", "refs/heads"])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
+                    .unwrap_or_default();
+                (self.repo.display().to_string(), base, branches)
             }
         };
         if let Some(d) = &mut self.dialog {
-            (d.host, d.repo, d.base) = (m, repo, base);
+            (d.host, d.repo, d.base, d.branches, d.list) = (m, repo, base, branches, None);
         }
     }
 
@@ -1612,11 +1619,6 @@ impl App {
                         let _ = tx.send(());
                     }
                 }
-                Action::ShowEnded(m) => {
-                    if !self.show_ended.remove(&m) {
-                        self.show_ended.insert(m);
-                    }
-                }
                 Action::RemoveHost(m) => {
                     if self.remove_armed == Some(m) {
                         self.remove_armed = None;
@@ -1859,9 +1861,28 @@ impl App {
                     let addr = h.cfg.as_ref().map_or("local", |c| c.ssh.as_str());
                     r.text(head.x + 26.0 + nw, r.center(top, MONO, 10.5), addr, MONO, 10.5, 400, t.text3, head.w - nw - 60.0);
                     let sub = Rect::new(head.x + 20.0, head.y + 21.0, head.w - 40.0, 15.0);
-                    r.text(sub.x, r.center(sub, UI, 11.0), &status, UI, 11.0, 400, sc, sub.w);
+                    let sy = r.center(sub, UI, 11.0);
+                    // "N ended" is a link to them in Overview.
+                    let ended = h.tasks.iter().filter(|t| group(&t.state) == 4).count();
+                    let label = format!("{ended} ended");
+                    let mut link = Rect::default();
+                    match status.find(&label).filter(|_| ended > 0 && matches!(h.link, Link::Up(_))) {
+                        Some(at) => {
+                            let x = sub.x + r.text(sub.x, sy, &status[..at], UI, 11.0, 400, sc, sub.w);
+                            let lw = r.text(x, sy, &label, UI, 11.0, 400, t.text2, sub.x + sub.w - x);
+                            r.rect(Rect::new(x, sy + 13.0, lw, 1.0), 0.0, alpha(t.text2, 0x60));
+                            r.text(x + lw, sy, &status[at + label.len()..], UI, 11.0, 400, sc, sub.x + sub.w - x - lw);
+                            link = Rect::new(x - 2.0, sub.y, lw + 4.0, sub.h);
+                            if self.hit(r, link) && clicked(self.click) {
+                                picks.extend([Action::Overview(true), Action::OvGroup(Some(4))]);
+                            }
+                        }
+                        None => {
+                            r.text(sub.x, sy, &status, UI, 11.0, 400, sc, sub.w);
+                        }
+                    }
                     chevron(r, top.y + top.h / 2.0);
-                    if self.hit(r, head) && clicked(self.click) {
+                    if self.hit(r, head) && clicked(self.click) && !self.click.is_some_and(|p| link.contains(p)) {
                         picks.push(Action::Toggle(sec.key.clone()));
                     }
                     y += 50.0;
@@ -1892,21 +1913,7 @@ impl App {
                 r.text(26.0, y + 2.0, &note, UI, 11.5, 400, t.text3, self.sidebar_w - 40.0);
                 y += 24.0;
             }
-            // Ended tasks sit behind one row, so they don't crowd out live ones but aren't lost.
-            let live = sec.tasks.iter().take_while(|t| group(&t.state) != 4).count();
             for k in 0..=sec.tasks.len() {
-                if let Some(m) = sec.host.filter(|_| k == live && sec.ended > 0 && self.filter.is_empty()) {
-                    let open = self.show_ended.contains(&m);
-                    let row = Rect::new(6.0, y, self.sidebar_w - 13.0, 26.0);
-                    let label = if open { format!("Hide {} ended", sec.ended) } else { format!("{} ended · click to show", sec.ended) };
-                    let (id, path) = if open { (5, "M16 24L48 24L32 42Z") } else { (6, "M24 16L42 32L24 48Z") };
-                    r.path(id, path, None, row.x + 9.0, row.y + 8.0, 10.0, t.text3);
-                    r.text(row.x + 28.0, r.center(row, UI, 11.5), &label, UI, 11.5, 400, t.text3, row.w - 36.0);
-                    if self.hit(r, row) && clicked(self.click) {
-                        picks.push(Action::ShowEnded(m));
-                    }
-                    y += 28.0;
-                }
                 let Some(task) = sec.tasks.get(k) else { break };
                 let row = Rect::new(6.0, y, self.sidebar_w - 13.0, ROW2_H);
                 let chip = (sec.host.is_none() && multi).then(|| self.hosts[task.machine].name());
@@ -2312,6 +2319,12 @@ impl App {
     fn draw_dialog(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
         let Some(d) = &self.dialog else { return };
         let (prompt, agent_i, base, error) = (d.prompt.clone(), d.agent, d.base.clone(), d.error.clone());
+        let (branches, list) = (d.branches.clone(), d.list);
+        // A click on the open branch list is the list's alone, whatever lies under it.
+        let list_click = self.click.filter(|p| list.is_some_and(|l| l.contains(*p)));
+        if list_click.is_some() {
+            self.click = None;
+        }
         let (host_i, repo_path) = (d.host, d.repo.clone());
         // Machine | Repo row, once there is more than one machine to choose.
         let hosts: Vec<(usize, String, bool)> =
@@ -2390,22 +2403,35 @@ impl App {
             ax += bw + 4.0;
         }
         let bx = dlg.x + dlg.w / 2.0 + 18.0;
-        r.text(bx, gy + 14.0, "Branch", UI, 11.0, 400, t.text3, 100.0);
+        r.text(bx, gy + 14.0, "Base branch", UI, 11.0, 400, t.text3, 100.0);
         let row = Rect::new(bx, gy + 36.0, dlg.w / 2.0 - 36.0, 28.0);
         let base_focus = self.focus == Focus::Base;
-        let bw = if base_focus {
-            self.field_text(r, t, row.x, r.center(row, MONO, 12.0), &base, MONO, 12.0, 160.0, true, self.caret_for(Focus::Base, &base), a) + 4.0
-        } else if base.is_empty() {
-            r.text(row.x, r.center(row, MONO, 12.0), "current branch", MONO, 12.0, 400, t.text, 160.0)
+        let shown = if base.is_empty() && !base_focus { "current branch" } else { &base };
+        let pick = !branches.is_empty();
+        let bfw = (r.measure(MONO, 12.0, 400, shown) + if pick { 38.0 } else { 20.0 }).clamp(90.0, 160.0);
+        let bfield = Rect::new(bx - 8.0, row.y, bfw, row.h);
+        r.frame(bfield, 4.0, t.dialog, if base_focus || list.is_some() { a } else { t.border2 });
+        let fy = r.center(bfield, MONO, 12.0);
+        if base_focus {
+            self.field_text(r, t, bfield.x + 10.0, fy, &base, MONO, 12.0, bfw - 20.0, true, self.caret_for(Focus::Base, &base), a);
         } else {
-            r.text(row.x, r.center(row, MONO, 12.0), &base, MONO, 12.0, 400, t.text, 160.0)
-        };
-        if self.hit_as(r, Rect::new(row.x - 4.0, row.y, bw + 8.0, row.h), Cursor::Text) {
+            r.text(bfield.x + 10.0, fy, shown, MONO, 12.0, 400, t.text, bfw - if pick { 38.0 } else { 20.0 });
+        }
+        if pick {
+            r.path(9, "M18 26L32 40L46 26", Some(6.0), bfield.x + bfw - 22.0, bfield.y + 8.0, 12.0, t.text3);
+            if self.hit(r, bfield) {
+                let d = self.dialog.as_mut().unwrap();
+                d.list = if list.is_some() { None } else { Some(Rect::default()) };
+            }
+        } else if self.hit_as(r, bfield, Cursor::Text) {
             self.actions.push(Action::Focus(Focus::Base));
         }
+        let bw = bfield.x + bfw - row.x;
         let arrow_x = row.x + bw + 8.0;
         r.text(arrow_x, r.center(row, MONO, 12.0), "→", MONO, 12.0, 400, t.faint, 20.0);
-        let nw = r.text(arrow_x + 18.0, r.center(row, MONO, 12.0), "arranger/<id>", MONO, 12.0, 400, t.text3, 140.0);
+        // ponytail: a guess; the daemon picks the id, so a skipped id or a racing `arranger new` makes it one higher
+        let next = self.hosts[host_i].tasks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+        let nw = r.text(arrow_x + 18.0, r.center(row, MONO, 12.0), &format!("arranger/{next}"), MONO, 12.0, 400, t.text3, 140.0);
         let chip = Rect::new(arrow_x + 26.0 + nw, row.y + 6.0, 32.0, 16.0);
         r.frame(chip, 3.0, t.dialog, t.border2);
         r.text(chip.x + 5.0, r.center(chip, UI, 10.0), "auto", UI, 10.0, 400, t.text3, 30.0);
@@ -2451,7 +2477,7 @@ impl App {
         let start_label = format!("Start {agent}");
         let sw = r.measure(UI, 13.0, 500, &start_label) + 40.0;
         let start = Rect::new(foot.x + foot.w - 14.0 - sw, foot.y + 12.0, sw, 34.0);
-        r.rect(start, 4.0, a);
+        r.rect(start, 4.0, if t.dark { a } else { accent_deep(agent) });
         let slw = r.text(start.x + 14.0, r.center(start, UI, 13.0), &start_label, UI, 13.0, 500, t.on_accent, sw);
         r.text(start.x + 20.0 + slw, r.center(start, MONO, 10.0), "↵", MONO, 10.0, 400, alpha(t.on_accent, 150), 20.0);
         let attach_key = mod_label("↵");
@@ -2468,6 +2494,38 @@ impl App {
         }
         if self.hit(r, attach) {
             self.actions.push(Action::Start(true));
+        }
+
+        // The branch list, over everything else. ponytail: the 8 most recent branches; scroll or type-to-filter if that's too few
+        let Some(d) = self.dialog.as_mut() else { return };
+        if d.list.is_none() {
+            return;
+        }
+        if self.click.is_some_and(|p| !bfield.contains(p)) {
+            d.list = None; // a click anywhere else closes it
+            return;
+        }
+        let shown: Vec<&String> = branches.iter().take(8).collect();
+        let lw = shown.iter().map(|b| r.measure(MONO, 12.0, 400, b)).fold(bfw, |m, x| m.max(x + 44.0)).min(dlg.w / 2.0 - 20.0);
+        let lr = Rect::new(bfield.x, bfield.y + bfield.h + 4.0, lw, 8.0 + shown.len() as f32 * 28.0);
+        d.list = Some(lr);
+        r.rect(Rect::new(lr.x - 1.0, lr.y + 3.0, lr.w + 2.0, lr.h + 2.0), 8.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
+        r.frame(lr, 6.0, t.dialog, t.border2);
+        r.target(lr, Cursor::Arrow);
+        for (i, b) in shown.iter().enumerate() {
+            let row = Rect::new(lr.x + 4.0, lr.y + 4.0 + i as f32 * 28.0, lr.w - 8.0, 28.0);
+            let on = **b == base;
+            if on {
+                r.rect(row, 3.0, t.sel);
+            }
+            r.text(row.x + 8.0, r.center(row, MONO, 12.0), b, MONO, 12.0, 400, t.text, row.w - 36.0);
+            if on {
+                r.path(8, "M14 33.6L25.6 45.2L50 18.8", Some(7.0), row.x + row.w - 20.0, row.y + 8.0, 12.0, t.text);
+            }
+            r.target(row, Cursor::Pointer);
+            if list_click.is_some_and(|p| row.contains(p)) {
+                (d.base, d.list) = ((*b).clone(), None);
+            }
         }
     }
 }
