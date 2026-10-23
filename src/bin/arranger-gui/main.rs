@@ -532,7 +532,8 @@ impl ApplicationHandler<Msg> for App {
                     MouseScrollDelta::PixelDelta(p) => p.y as f32,
                 };
                 if let Some(rv) = self.review.as_mut().filter(|_| self.mouse.1 > TITLE_H + 56.0) {
-                    rv.scroll = (rv.scroll - dy).max(0.0);
+                    let scroll = if self.mouse.0 < self.rail_w { &mut rv.rail_scroll } else { &mut rv.scroll };
+                    *scroll = (*scroll - dy).max(0.0);
                     self.redraw();
                 } else if self.overview {
                     self.ov_scroll = (self.ov_scroll - dy).max(0.0);
