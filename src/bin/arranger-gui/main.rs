@@ -1447,22 +1447,25 @@ fn agent_box(screen: &Screen) -> Option<(usize, String)> {
     Some((upper, mode))
 }
 
-/// The arranger mark (docs: "Ensemble"): three arcs of players around an amber conductor.
-/// `size` is the mark's box; below 24 px it uses the solid two-arc variant.
+/// The arranger mark ("Ensemble"): arcs of players around an amber conductor, from the logo's SVG.
+/// `size` is the mark's box; below 24 px it uses the solid two-arc variant, above it the dotted one.
 fn logo(r: &mut Renderer, x: f32, y: f32, size: f32, ink: Rgba, amber: Rgba) {
-    let k = size / 64.0;
-    let mut dot = |cx: f32, cy: f32, d: f32, c: Rgba| r.rect(Rect::new(x + (cx - d / 2.0) * k, y + (cy - d / 2.0) * k, d * k, d * k), d * k / 2.0, c);
-    let solid = size < 24.0;
-    let (arcs, stroke): (&[(f32, usize)], f32) = if solid { (&[(27.0, 54), (13.0, 26)], 7.0) } else { (&[(28.0, 10), (19.0, 7), (10.0, 4)], 5.5) };
-    // n + 1 dots from end to end; the solid arcs pack them tight enough to read as a stroke.
-    for &(radius, n) in arcs {
+    if size < 24.0 {
+        r.path(1, "M5 45A27 27 0 0 1 59 45M19 45A13 13 0 0 1 45 45", Some(7.0), x, y, size, ink);
+        r.path(2, "M26 46a6 6 0 1 0 12 0a6 6 0 1 0 -12 0", None, x, y, size, amber);
+        return;
+    }
+    // Dots of 5.5 units spaced evenly along each arc: what the SVG's `stroke-dasharray="0 …"` draws.
+    let mut dots = String::new();
+    for (radius, n) in [(28.0f32, 10), (19.0, 7), (10.0, 4)] {
         for i in 0..=n {
             let a = std::f32::consts::PI * (1.0 - i as f32 / n as f32);
-            dot(32.0 + radius * a.cos(), 45.0 - radius * a.sin(), stroke, ink);
+            let (cx, cy) = (32.0 + radius * a.cos(), 45.0 - radius * a.sin());
+            dots += &format!("M{} {cy}a2.75 2.75 0 1 0 5.5 0a2.75 2.75 0 1 0 -5.5 0", cx - 2.75);
         }
     }
-    let (cy, cr) = if solid { (46.0, 6.0) } else { (45.0, 4.5) };
-    dot(32.0, cy, cr * 2.0, amber);
+    r.path(3, &dots, None, x, y, size, ink);
+    r.path(4, "M27.5 45a4.5 4.5 0 1 0 9 0a4.5 4.5 0 1 0 -9 0", None, x, y, size, amber);
 }
 
 fn draw_term(r: &mut Renderer, t: &Theme, screen: &Screen, area: Rect, cell_w: f32, focused: bool) {

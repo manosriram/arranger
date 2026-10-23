@@ -5,7 +5,7 @@ use super::theme::Rgba;
 use glow::HasContext;
 use std::collections::HashMap;
 use swash::scale::{Render, ScaleContext, Source};
-use swash::zeno::Format;
+use swash::zeno::{Cap, Fill, Format, Mask, Stroke, Transform};
 use swash::{FontRef, NormalizedCoord};
 
 pub const UI: usize = 0;
@@ -385,12 +385,50 @@ impl Renderer {
         }
     }
 
+    /// Draws an SVG path laid out in a 64-unit box, `size` logical px square at (x, y): filled, or
+    /// stroked `stroke` units wide with round caps. Rasterised once per (id, size) into the atlas.
+    pub fn path(&mut self, id: u16, data: &str, stroke: Option<f32>, x: f32, y: f32, size: f32, color: Rgba) {
+        let d = self.dpi;
+        let key = GlyphKey { font: usize::MAX, id, px: (size * d * 64.0) as u32, weight: 0 };
+        let g = match self.glyphs.get(&key) {
+            Some(g) => *g,
+            None => {
+                let scale = size * d / 64.0;
+                let mut mask = Mask::new(data);
+                mask.transform(Some(Transform::scale(scale, scale)));
+                match stroke {
+                    Some(w) => mask.style(*Stroke::new(w).cap(Cap::Round)),
+                    None => mask.style(Fill::NonZero),
+                };
+                let (img, at) = mask.render();
+                let g = self.upload(at.width as i32, at.height as i32, &img).map(|uv| Glyph {
+                    uv,
+                    left: at.left as f32,
+                    top: -at.top as f32,
+                    w: at.width as f32,
+                    h: at.height as f32,
+                });
+                self.glyphs.insert(key, g);
+                g
+            }
+        };
+        if let Some(g) = g {
+            self.quad((x * d).round() + g.left, (y * d).round() - g.top, g.w, g.h, g.uv, -1.0, color);
+        }
+    }
+
     fn rasterize(&mut self, key: GlyphKey) -> Option<Glyph> {
         let f = font(key.font);
         let c = coords(&f, key.weight);
         let mut scaler = self.scaler.builder(f).size(key.px as f32 / 64.0).hint(true).normalized_coords(&c).build();
         let img = Render::new(&[Source::Outline]).format(Format::Alpha).render(&mut scaler, key.id)?;
-        let (w, h) = (img.placement.width as i32, img.placement.height as i32);
+        let p = img.placement;
+        let uv = self.upload(p.width as i32, p.height as i32, &img.data)?;
+        Some(Glyph { uv, left: p.left as f32, top: p.top as f32, w: p.width as f32, h: p.height as f32 })
+    }
+
+    /// Copies an alpha bitmap into the atlas; returns its uv rect.
+    fn upload(&mut self, w: i32, h: i32, data: &[u8]) -> Option<[f32; 4]> {
         if w == 0 || h == 0 {
             return None;
         }
@@ -416,18 +454,12 @@ impl Renderer {
                 h,
                 glow::RED,
                 glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&img.data)),
+                glow::PixelUnpackData::Slice(Some(data)),
             );
         }
         self.shelf = (x + w + 1, y, row.max(h));
         let s = ATLAS as f32;
-        Some(Glyph {
-            uv: [x as f32 / s, y as f32 / s, (x + w) as f32 / s, (y + h) as f32 / s],
-            left: img.placement.left as f32,
-            top: img.placement.top as f32,
-            w: w as f32,
-            h: h as f32,
-        })
+        Some([x as f32 / s, y as f32 / s, (x + w) as f32 / s, (y + h) as f32 / s])
     }
 }
 
