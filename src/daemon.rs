@@ -49,6 +49,8 @@ struct Task {
     since: u64,
     /// Prompts sent mid-turn that the agent is holding until it picks them up.
     queued: usize,
+    /// Ignore late status hooks from a cancelled turn until a new prompt starts.
+    interrupted: bool,
 }
 
 /// What a running agent is up to, derived from its events.
@@ -627,6 +629,9 @@ impl Daemon {
         if let Err(e) = self.db.execute("INSERT INTO events (task, ts, event) VALUES (?1, ?2, ?3)", params![id, ts, json]) {
             eprintln!("task {id}: {e}");
         }
+        if !accept_after_interrupt(&mut task.interrupted, &event) {
+            return;
+        }
         let (activity, action) = match &event {
             Event::Summary { text } => {
                 let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
@@ -695,6 +700,7 @@ impl Daemon {
     /// The viewer hit Esc or Ctrl-C mid-turn; agents skip their stop hook when interrupted.
     fn interrupt(&mut self, id: u64) {
         if let Some(task) = self.tasks.get_mut(&id) {
+            task.interrupted = true;
             if task.activity != Activity::Done {
                 task.activity = Activity::Done;
                 task.action = "interrupted".into();
@@ -859,6 +865,7 @@ impl Daemon {
             action: String::new(),
             since: now(),
             queued: 0,
+            interrupted: false,
         };
         self.tasks.insert(id, task);
         self.set_state(id, "running");
@@ -1090,6 +1097,15 @@ fn is_interrupt(bytes: &[u8]) -> bool {
     matches!(bytes, b"\x1b" | b"\x1b\x1b" | b"\x03")
 }
 
+/// Keep recording cancelled-turn hooks, but only a new prompt can restart its status.
+/// Summary and usage hooks may still update metadata without changing activity.
+fn accept_after_interrupt(interrupted: &mut bool, event: &Event) -> bool {
+    if matches!(event, Event::Prompt { .. }) {
+        *interrupted = false;
+    }
+    !*interrupted || matches!(event, Event::Summary { .. } | Event::Usage { .. })
+}
+
 fn queued_label(n: usize) -> String {
     if n == 1 { "prompt queued".into() } else { format!("{n} prompts queued") }
 }
@@ -1098,6 +1114,25 @@ fn queued_label(n: usize) -> String {
 mod tests {
     use super::*;
     use proto::ToolKind;
+
+    #[test]
+    fn interrupted_turn_ignores_late_hooks_until_next_prompt() {
+        let mut interrupted = true;
+        for event in [
+            Event::ToolEnd { ok: false },
+            Event::ToolStart { kind: ToolKind::Bash, target: "late tool".into() },
+            Event::TurnDone,
+            Event::Attention { text: "idle".into() },
+        ] {
+            assert!(!accept_after_interrupt(&mut interrupted, &event));
+            assert!(interrupted);
+        }
+        assert!(accept_after_interrupt(&mut interrupted, &Event::Summary { text: "cancelled".into() }));
+        assert!(interrupted);
+        assert!(accept_after_interrupt(&mut interrupted, &Event::Prompt { text: "try again".into() }));
+        assert!(!interrupted);
+        assert!(accept_after_interrupt(&mut interrupted, &Event::ToolEnd { ok: true }));
+    }
 
     #[test]
     fn checks_keep_the_latest_result() {
