@@ -715,13 +715,23 @@ fn keep_linked(m: usize, cfg: Machine, p: EventLoopProxy<Msg>, retry: mpsc::Rece
                 let err = match watch() {
                     Ok((mut w, ms)) => {
                         let _ = p.send_event(Msg::Link(m, Link::Up(ms.max(1))));
-                        (tries, wait) = (0, 2);
-                        while let Ok(Reply::Tasks(tasks)) = proto::read_msg(&mut w) {
-                            if p.send_event(Msg::Tasks(m, tasks)).is_err() {
-                                return;
+                        loop {
+                            match proto::read_msg(&mut w) {
+                                Ok(Reply::Tasks(tasks)) => {
+                                    // Linked for real once a task list arrives; a link that drops
+                                    // before that still spends a retry.
+                                    (tries, wait) = (0, 2);
+                                    if p.send_event(Msg::Tasks(m, tasks)).is_err() {
+                                        return;
+                                    }
+                                }
+                                // A reply that doesn't decode (read errors are I/O kinds; decode errors are `Other`).
+                                Err(e) if e.kind() == io::ErrorKind::Other => {
+                                    break "its daemon is a different arranger build; install the same release on both".to_string();
+                                }
+                                _ => break "connection lost".to_string(),
                             }
                         }
-                        "connection lost".to_string()
                     }
                     Err(e) => e.to_string(),
                 };
