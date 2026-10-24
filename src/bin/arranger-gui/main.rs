@@ -6,6 +6,7 @@ mod overview;
 mod render;
 mod review;
 mod theme;
+mod welcome;
 
 use arranger::adapter;
 use arranger::client::{connect, connect_at, request_at};
@@ -203,6 +204,12 @@ enum Action {
     Overview(bool),
     OvGroup(Option<usize>),
     OvHost(Option<usize>),
+    /// Open this folder as the project, or pick one first (None).
+    OpenProject(Option<PathBuf>),
+    /// Pick a name and place for a new project folder, and open it.
+    NewProject,
+    /// Back to the welcome screen, to switch projects.
+    Welcome,
     /// Start an ended task's agent again (resuming its session), sending it this prompt if any.
     Revive(TaskKey, String),
 }
@@ -237,6 +244,12 @@ struct App {
     last_esc: Option<Instant>,
     /// New-task prompts, oldest first (saved in gui.json), for ↑ in the dialog.
     prompts: Vec<String>,
+    /// No project yet (opened outside one, or asked to switch): the welcome screen shows.
+    welcome: bool,
+    /// Project folders opened here, most recent first (saved in gui.json).
+    recent: Vec<String>,
+    /// Why the last folder couldn't be opened as a project.
+    welcome_error: String,
     /// Why the last Revive of a task failed, shown in its Revive bar.
     revive_error: Option<(TaskKey, String)>,
     /// The Overview table is showing, filtered to one state group (None: all).
@@ -322,6 +335,9 @@ fn run() -> io::Result<()> {
         last_esc: None,
         prompts: Vec::new(),
         revive_error: None,
+        welcome: false,
+        recent: Vec::new(),
+        welcome_error: String::new(),
         overview: false,
         ov_group: None,
         ov_host: None,
@@ -357,6 +373,15 @@ fn run() -> io::Result<()> {
     app.theme = THEMES.iter().position(|t| t.name == settings.theme).unwrap_or(0);
     app.vim = settings.vim;
     app.prompts = settings.prompts;
+    app.recent = settings.recent;
+    // Started inside a project (from a terminal): that's the one. Else (Finder, the Dock) ask.
+    match welcome::project_root(&app.repo) {
+        Some(top) => {
+            app.repo = top.clone();
+            app.remember(&top);
+        }
+        None => app.welcome = true,
+    }
     app.focus = app.rest();
     app.link_host(None);
     for m in machine::load() {
@@ -373,6 +398,8 @@ struct Settings {
     vim: bool,
     /// New-task prompts, oldest first, for ↑ in the dialog.
     prompts: Vec<String>,
+    /// Project folders, most recent first, for the welcome screen.
+    recent: Vec<String>,
 }
 
 impl Settings {
@@ -469,7 +496,9 @@ impl ApplicationHandler<Msg> for App {
             Msg::Tasks(m, tasks) => {
                 self.user_event_tasks(m, tasks);
                 if self.selected.is_none_or(|k| self.task(k).is_none()) {
-                    self.selected = self.order().first().copied();
+                    // Dev aid for screenshots (`ARRANGER_SELECT=<task id>`): start on that local task.
+                    let pick = std::env::var("ARRANGER_SELECT").ok().and_then(|v| v.parse().ok()).map(|id| (0, id)).filter(|&k| self.task(k).is_some());
+                    self.selected = pick.or_else(|| self.order().first().copied());
                 }
                 self.sync_session();
             }
@@ -599,6 +628,11 @@ impl ApplicationHandler<Msg> for App {
                         self.redraw();
                     }
                 }
+            }
+            WindowEvent::DroppedFile(path) if self.welcome => {
+                self.actions.push(Action::OpenProject(Some(path)));
+                self.apply();
+                self.redraw();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 self.caret_on = true;
@@ -1048,7 +1082,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        let s = Settings { theme: THEMES[self.theme].name.into(), vim: self.vim, prompts: self.prompts.clone() };
+        let s = Settings { theme: THEMES[self.theme].name.into(), vim: self.vim, prompts: self.prompts.clone(), recent: self.recent.clone() };
         let _ = std::fs::write(Settings::path(), serde_json::to_vec_pretty(&s).unwrap_or_default());
     }
 
@@ -1346,6 +1380,20 @@ impl App {
 
     fn key(&mut self, ev: &KeyEvent) {
         let m = self.mods;
+        if self.welcome {
+            // Nothing else to drive yet: ⌘O opens a folder, ⌘N starts a new project, Esc goes back.
+            if ev.logical_key == Key::Named(NamedKey::Escape) && welcome::project_root(&self.repo).is_some() {
+                self.welcome = false;
+            }
+            if let (true, Key::Character(c)) = (app_mod(m), &ev.logical_key) {
+                match c.to_lowercase().as_str() {
+                    "o" => self.actions.push(Action::OpenProject(None)),
+                    "n" => self.actions.push(Action::NewProject),
+                    _ => {}
+                }
+            }
+            return;
+        }
         if self.menu && ev.logical_key == Key::Named(NamedKey::Escape) {
             self.menu = false;
             return;
@@ -1664,6 +1712,12 @@ impl App {
                     self.ov_group = g;
                     self.ov_scroll = 0.0;
                 }
+                Action::OpenProject(path) => self.open_project(path, false),
+                Action::NewProject => self.open_project(None, true),
+                Action::Welcome => {
+                    (self.welcome, self.review, self.overview) = (true, None, false);
+                    self.welcome_error.clear();
+                }
                 Action::Revive(key @ (m, id), prompt) => {
                     let sock = self.sock(m);
                     match request_at(sock.as_deref(), &Request::Revive { id, prompt }) {
@@ -1789,7 +1843,9 @@ impl App {
 
         self.probe_changes();
         self.draw_title(r, t, w);
-        if self.review.is_some() {
+        if self.welcome {
+            self.draw_welcome(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H));
+        } else if self.review.is_some() {
             self.draw_review(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H - STATUS_H));
         } else if self.overview {
             self.draw_overview(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H - STATUS_H));
@@ -1797,11 +1853,13 @@ impl App {
             self.draw_sidebar(r, t, h);
             self.draw_main(r, t, Rect::new(self.sidebar_w, TITLE_H, w - self.sidebar_w, h - TITLE_H - STATUS_H));
         }
-        if self.review.is_some() || !self.overview {
+        if !self.welcome && (self.review.is_some() || !self.overview) {
             let (x, top) = if self.review.is_some() { (self.rail_w, TITLE_H + review::STRIP_H) } else { (self.sidebar_w, TITLE_H) };
             r.target(Rect::new(x - 4.0, top, 8.0, h - top - STATUS_H), Cursor::Resize);
         }
-        self.draw_status(r, t, w, h);
+        if !self.welcome {
+            self.draw_status(r, t, w, h);
+        }
         if self.dialog.is_some() {
             self.draw_dialog(r, t, w, h);
         }
@@ -1847,12 +1905,17 @@ impl App {
         let home = std::env::var("HOME").unwrap_or_default();
         let repo = self.repo.display().to_string();
         let repo = repo.strip_prefix(&home).map_or(repo.clone(), |rest| format!("~{rest}"));
-        let rw = r.text(x + 10.0, r.center(bar, MONO, 11.0), &repo, MONO, 11.0, 400, t.text3, 400.0);
+        let rw = if self.welcome { 0.0 } else { r.text(x + 10.0, r.center(bar, MONO, 11.0), &repo, MONO, 11.0, 400, t.text3, 400.0) };
+        // The project path: click it to switch projects.
+        if !self.welcome && self.hit(r, Rect::new(x + 4.0, 7.0, rw + 12.0, 22.0)) {
+            self.actions.push(Action::Welcome);
+        }
 
         // Views: Workspace | Overview | Review.
         let mut nx = x + 26.0 + rw;
         let (review, overview) = (self.review.is_some(), self.overview && self.review.is_none());
-        for (label, on) in [("Workspace", !review && !overview), ("Overview", overview), ("Review", review)] {
+        let tabs = [("Workspace", !review && !overview), ("Overview", overview), ("Review", review)];
+        for (label, on) in tabs.into_iter().filter(|_| !self.welcome) {
             let tw = r.measure(UI, 12.0, 400, label) + 16.0;
             let tab = Rect::new(nx, 7.0, tw, 22.0);
             if on {

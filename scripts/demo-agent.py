@@ -43,19 +43,26 @@ elif "flaky" in prompt:
     tool("Bash", command="cargo test serves_health -- --test-threads=1")
     say("Bash(cargo test serves_health)", "  test serves_health ... ok", "  test result: ok. 1 passed; 0 failed")
     hook({"hook_event_name": "PostToolUse", "tool_response": {}})
-    hook({"hook_event_name": "Stop", "last_assistant_message": "Fixed the flaky `serves_health` test: it now waits for the port instead of sleeping."})
-    say("", "Fixed the flaky `serves_health` test: it now waits for the port instead of sleeping.")
+    hook({"hook_event_name": "Stop", "last_assistant_message": "Fixed the flaky `serves_health` test: it now waits for the port."})
+    say("", "Fixed the flaky `serves_health` test: it now waits for the port.")
 elif "document" in prompt:
     tool("Read", file_path=f"{cwd}/README.md")
     say("Read README.md", "Which section should the config table go under?")
     hook({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "tool_input": {"questions": [
         {"question": "Where should the config reference go?", "options": [{"label": "Under Install"}, {"label": "New Config section"}]}]}})
-else:
-    tool("Read", file_path=f"{cwd}/src/cache.rs")
-    say("Read src/cache.rs (98 lines)", "Swapping the Mutex<HashMap> for a sharded map.")
-    with open("src/cache.rs", "a") as f:
-        f.write("\nconst SHARDS: usize = 16;\n")
-    tool("Edit", file_path=f"{cwd}/src/cache.rs")
+else:  # works on a file the prompt names, so busy screenshots don't repeat one line
+    path, note = next(((p, n) for k, p, n in [
+        ("logging", "src/middleware.rs", "Moving the request log into a tower layer."),
+        ("pagination", "src/orders.rs", "Adding cursor pagination to list_orders."),
+        ("tokio", "Cargo.toml", "Bumping tokio to 1.48; fixing the renamed APIs."),
+        ("ranking", "train.py", "Retraining on last week's clicks; 3 of 12 epochs done."),
+        ("redeploy", "Dockerfile", "Moving the base image to debian:13-slim."),
+    ] if k in prompt), ("src/cache.rs", "Swapping the Mutex<HashMap> for a sharded map."))
+    tool("Read", file_path=f"{cwd}/{path}")
+    say(f"Read {path}", note)
+    with open(path, "a") as f:
+        f.write("\n// wip\n")
+    tool("Edit", file_path=f"{cwd}/{path}")
 
 while True:  # an agent idles at its prompt until told otherwise
     time.sleep(1)

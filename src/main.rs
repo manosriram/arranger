@@ -91,7 +91,14 @@ fn gui() -> io::Result<()> {
     let exe = env::current_exe()?;
     let sibling = exe.with_file_name("arranger-gui");
     let program = if sibling.exists() { sibling } else { "arranger-gui".into() };
-    let program = if cfg!(target_os = "macos") { named_link(&program).unwrap_or(program) } else { program };
+    // Inside arranger.app macOS already has its name and icon; a bare binary needs the link.
+    // Run it by its real path (the command may be a symlink into the app), so macOS sees the bundle.
+    let bundle = fs::canonicalize(&program).ok().filter(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"));
+    let program = match bundle {
+        Some(real) => real,
+        None if cfg!(target_os = "macos") => named_link(&program).unwrap_or(program),
+        None => program,
+    };
     Err(Command::new(program).env("ARRANGER_CLI", exe).exec())
 }
 

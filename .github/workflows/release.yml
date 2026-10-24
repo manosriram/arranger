@@ -29,6 +29,7 @@ jobs:
           name=arranger-${{ matrix.target }} # no version: install.sh fetches releases/latest/download/<name>
           mkdir "$name"
           cp target/${{ matrix.target }}/release/{arranger,arranger-gui} README.md "$name"/
+          if [[ ${{ matrix.target }} == *apple* ]]; then scripts/bundle.sh target/${{ matrix.target }}/release "$name" "$GITHUB_REF_NAME"; fi
           tar czf "$name.tar.gz" "$name"
       - uses: actions/upload-artifact@v4
         with:

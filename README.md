@@ -4,7 +4,10 @@ arranger runs many CLI coding agents (Claude Code, Codex, Gemini, pi) side by si
 
 Linux and macOS. Rust throughout; no webview.
 
-![arranger with four agents: one asking a question, one waiting on approval, one working, one done](assets/screenshot.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshot-dark.png">
+  <img alt="arranger with six agents on three machines: two need you, three are working, and the selected one is done" src="assets/screenshot.png">
+</picture>
 
 ## Install
 
@@ -12,7 +15,9 @@ Linux and macOS. Rust throughout; no webview.
 curl -fsSL https://github.com/manosriram/arranger/releases/latest/download/install.sh | sh
 ```
 
-Or build it: `cargo build --release` (makes `target/release/arranger` and `arranger-gui`).
+On macOS this also puts **arranger.app** in `~/Applications`: open it from Finder, Spotlight or the Dock, then pick a project folder (any folder works; arranger sets up git in it).
+
+Or build it: `cargo build --release` (makes `target/release/arranger` and `arranger-gui`; `just app` wraps them in `target/arranger.app`).
 
 Requires `git`. Install `gh` if you want to open PRs from the app.
 
@@ -80,5 +85,5 @@ The app reaches each machine with your own `ssh` (keys, agent, `~/.ssh/config`) 
 ```sh
 just test        # cargo test
 just bench-mem   # daemon RSS with 20 fake agents
-just screenshot  # re-render assets/screenshot.png with demo agents
+just screenshot  # re-render the README screenshots (light and dark) with demo agents
 ```

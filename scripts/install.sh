@@ -23,8 +23,21 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 curl -fsSL "$url" | tar xz -C "$tmp"
 mkdir -p "$dir"
-install -m 755 "$tmp/arranger-$target/arranger" "$tmp/arranger-$target/arranger-gui" "$dir/"
-echo "arranger installed to $dir"
+pkg="$tmp/arranger-$target"
+if [ -d "$pkg/arranger.app" ]; then
+  # macOS: the app goes in ~/Applications (Finder, Spotlight, the Dock); the command runs the
+  # binaries inside it, so there's one copy.
+  apps="$HOME/Applications"
+  mkdir -p "$apps"
+  rm -rf "$apps/arranger.app"
+  mv "$pkg/arranger.app" "$apps/"
+  ln -sf "$apps/arranger.app/Contents/MacOS/arranger" "$dir/arranger"
+  ln -sf "$apps/arranger.app/Contents/MacOS/arranger-gui" "$dir/arranger-gui"
+  echo "arranger installed to $apps/arranger.app (and the arranger command to $dir)"
+else
+  install -m 755 "$pkg/arranger" "$pkg/arranger-gui" "$dir/"
+  echo "arranger installed to $dir"
+fi
 case ":$PATH:" in
   *":$dir:"*) ;;
   *) echo "add $dir to your PATH" ;;
