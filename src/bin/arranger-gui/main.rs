@@ -325,6 +325,13 @@ struct App {
     focused: bool,
     /// The clock running icons play to.
     epoch: Instant,
+    /// Something but the running icons changed since the last full frame. While false, a frame
+    /// only puts the last one back and redraws `icons` over it.
+    stale: std::cell::Cell<bool>,
+    /// The last full frame left its running icons out, to draw over it each tick: (task, x, cy,
+    /// clip). False while a dialog or menu is open, which they'd show through.
+    icons: std::cell::RefCell<Vec<(TaskInfo, f32, f32, Option<Rect>)>>,
+    layered: bool,
     /// The selected task's diff at its last probe: base branch, files, lines added and removed.
     stats: std::collections::HashMap<TaskKey, (String, usize, u32, u32)>,
 }
@@ -414,6 +421,9 @@ fn run() -> io::Result<()> {
         blink_at: Instant::now(),
         focused: true,
         epoch: Instant::now(),
+        stale: std::cell::Cell::new(true),
+        icons: Default::default(),
+        layered: false,
         stats: Default::default(),
     };
     let settings = Settings::load();
@@ -513,11 +523,19 @@ impl ApplicationHandler<Msg> for App {
             if Instant::now() >= self.blink_at {
                 self.caret_on = !self.caret_on;
                 self.blink_at = Instant::now() + BLINK;
+                if !matches!(self.focus, Focus::Term | Focus::Normal) {
+                    self.stale.set(true);
+                }
             }
             if self.glide != 0.0 {
                 self.glide_step();
+                self.stale.set(true);
             }
-            self.redraw();
+            if self.review.as_ref().is_some_and(|rv| rv.animating()) {
+                self.stale.set(true);
+            }
+            // Running icons alone don't make the frame stale: they redraw over the last one.
+            self.request_frame();
         }
     }
 
@@ -609,6 +627,10 @@ impl ApplicationHandler<Msg> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        // Mouse moves change the frame only through hover_changed, which says so.
+        if !matches!(event, WindowEvent::RedrawRequested | WindowEvent::CursorMoved { .. } | WindowEvent::CursorLeft { .. }) {
+            self.stale.set(true);
+        }
         match event {
             WindowEvent::CloseRequested => {
                 // ponytail: tunnels only die with a clean close; a crash leaves ssh -N running until
@@ -1040,13 +1062,29 @@ impl App {
     /// or done in the last two seconds) and the window has focus; None draws them still.
     fn sweep(&self) -> Option<f32> {
         let now = unix_secs();
-        let moving = |t: &TaskInfo| match group(&t.state) {
-            0 | 1 => true,
-            3 => now - (t.since as f64) < 2.0,
-            _ => false,
-        };
-        let shown = !self.welcome && self.review.is_none() && self.all_tasks().any(moving);
+        let shown = !self.welcome && self.review.is_none() && self.all_tasks().any(|t| moving(t, now));
         (shown && self.focused).then(|| self.epoch.elapsed().as_secs_f32())
+    }
+
+    /// A task's state icon. A moving one is left out of a layered frame and drawn over it at
+    /// each tick (`draw_icons`).
+    fn icon(&self, r: &mut Renderer, t: &Theme, task: &TaskInfo, x: f32, cy: f32) {
+        let sweep = self.sweep();
+        if self.layered && sweep.is_some() && moving(task, unix_secs()) {
+            self.icons.borrow_mut().push((task.clone(), x, cy, r.clip()));
+        } else {
+            state_icon(r, t, &task.state, x, cy, task.since, sweep);
+        }
+    }
+
+    /// Draws the icons the last layered frame left out, at the current point of their animation.
+    fn draw_icons(&self, r: &mut Renderer, t: &Theme) {
+        let sweep = self.sweep();
+        for (task, x, cy, clip) in self.icons.borrow().iter() {
+            r.set_clip(*clip);
+            state_icon(r, t, &task.state, *x, *cy, task.since, sweep);
+        }
+        r.end();
     }
 
     /// The selected task has a diff to review; true until its probe answers.
@@ -1457,7 +1495,14 @@ impl App {
         self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor() as f32) * self.zoom
     }
 
+    /// Asks for a full frame.
     fn redraw(&self) {
+        self.stale.set(true);
+        self.request_frame();
+    }
+
+    /// Asks for a frame; a full one only if something has made it stale.
+    fn request_frame(&self) {
         if let Some(g) = &self.gfx {
             g.window.request_redraw();
         }
@@ -2114,9 +2159,19 @@ impl App {
     fn draw(&mut self) {
         let Some(mut gfx) = self.gfx.take() else { return };
         let size = gfx.window.inner_size();
+        let t = self.theme();
+        // Only the running icons moved: put the last frame back and draw them over it.
+        if !self.stale.get() && self.layered && gfx.r.reuse(size.width, size.height) {
+            self.draw_icons(&mut gfx.r, t);
+            let _ = gfx.surface.swap_buffers(&gfx.context);
+            self.gfx = Some(gfx);
+            return;
+        }
+        self.stale.set(false);
+        self.icons.borrow_mut().clear();
+        self.layered = !(self.dialog.is_some() || self.add_host.is_some() || (self.help && self.vim) || self.menu);
         let dpi = gfx.window.scale_factor() as f32 * self.zoom;
         let (w, h) = (size.width as f32 / dpi, size.height as f32 / dpi);
-        let t = self.theme();
         let r = &mut gfx.r;
         r.begin(size.width, size.height, dpi, t.bg);
 
@@ -2157,6 +2212,7 @@ impl App {
             self.draw_menu(r, t);
         }
         let cursor = r.finish(self.mouse);
+        self.draw_icons(r, t);
         self.hot = r.hot(self.mouse);
         if cursor != self.cursor {
             self.cursor = cursor;
@@ -2434,7 +2490,7 @@ impl App {
         if on {
             r.frame(row, 3.0, bg, t.sel_ring);
         }
-        state_icon(r, t, &task.state, row.x + 8.0, top.y + top.h / 2.0, task.since, self.sweep());
+        self.icon(r, t, task, row.x + 8.0, top.y + top.h / 2.0);
         let text_x = row.x + 28.0;
         let right_w = if let Some(name) = machine {
             let cw = r.measure(MONO, 10.0, 400, name) + 10.0;
@@ -3078,6 +3134,15 @@ fn ship_badge(r: &mut Renderer, t: &Theme, shipped: &str, x: f32, cy: f32) -> f3
 ///
 /// `sweep` is the icons' clock in seconds, None to draw them still; `since` is when the task last
 /// changed state (unix seconds), from which a finished task's dots join into arcs, once.
+/// Whether a task's icon animates: waiting on you, running, or done in the last 2 s.
+fn moving(t: &TaskInfo, now: f64) -> bool {
+    match group(&t.state) {
+        0 | 1 => true,
+        3 => now - (t.since as f64) < 2.0,
+        _ => false,
+    }
+}
+
 fn state_icon(r: &mut Renderer, t: &Theme, state: &str, x: f32, cy: f32, since: u64, sweep: Option<f32>) {
     let c = state_color(t, state);
     let (x, y) = (x - 3.0, cy - 5.3);

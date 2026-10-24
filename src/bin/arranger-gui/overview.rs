@@ -120,7 +120,7 @@ impl App {
             if self.hit(r, row) && clicked(self.click) {
                 acts.push(Action::Select(key));
             }
-            state_icon(r, t, &task.state, col_x[0], row.y + row.h / 2.0, task.since, self.sweep());
+            self.icon(r, t, task, col_x[0], row.y + row.h / 2.0);
             let (x, w) = col("TASK");
             let bw = if task.shipped.is_empty() { 0.0 } else { r.measure(UI, 10.5, 500, &format!("✓ {}", task.shipped)) + 16.0 };
             let tw = r.text(x, r.center(row, UI, 12.5), &title(task), UI, 12.5, 400, if g == 4 { t.text3 } else if on { t.tc_on } else { t.text }, w - bw);

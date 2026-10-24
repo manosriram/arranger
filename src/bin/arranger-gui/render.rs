@@ -136,6 +136,9 @@ pub struct Renderer {
     targets: Vec<(Rect, Option<Rect>, Cursor)>,
     /// This frame's buttons are square (the welcome screen): so is their hover tint.
     pub sharp: bool,
+    /// Offscreen copy of the last full frame (framebuffer, its texture, size), so an animation
+    /// tick can copy it back and draw only what moved. None if the driver can't make one.
+    layer: Option<(glow::Framebuffer, glow::Texture, (u32, u32))>,
 }
 
 /// Added to every requested weight: Geist at its nominal weights reads too thin on screen.
@@ -233,16 +236,22 @@ impl Renderer {
                 vmetrics: RefCell::default(),
                 targets: Vec::new(),
                 sharp: false,
+                layer: None,
             })
         }
     }
 
+    /// Starts a full frame, drawn into the layer until `finish` copies it to the window.
     pub fn begin(&mut self, width: u32, height: u32, dpi: f32, clear: Rgba) {
         self.size = (width.max(1), height.max(1));
         self.dpi = dpi;
         self.targets.clear();
         self.sharp = false;
         unsafe {
+            if self.layer.is_none_or(|l| l.2 != self.size) {
+                self.make_layer();
+            }
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, self.layer.map(|l| l.0));
             self.gl.viewport(0, 0, self.size.0 as i32, self.size.1 as i32);
             let c = clear.map(|v| v as f32 / 255.0);
             self.gl.clear_color(c[0], c[1], c[2], 1.0);
@@ -258,9 +267,68 @@ impl Renderer {
             // Mid grey: lightens dark buttons and darkens light ones, in either theme.
             self.rect(r, if self.sharp { 0.0 } else { 3.0 }, [128, 128, 128, 0x24]);
         }
+        self.set_clip(None);
+        self.present();
+        hot.map_or(Cursor::Arrow, |t| t.2)
+    }
+
+    /// Starts an animation tick: the last full frame goes back on the window as is, for the
+    /// moving parts to draw over. False when there's no layer of this size; draw a full frame.
+    pub fn reuse(&mut self, width: u32, height: u32) -> bool {
+        if self.layer.is_none_or(|l| l.2 != (width, height)) {
+            return false;
+        }
+        unsafe { self.gl.viewport(0, 0, width as i32, height as i32) };
+        self.present();
+        true
+    }
+
+    /// Draws what's queued since `finish` or `reuse` onto the window.
+    pub fn end(&mut self) {
         self.flush();
         self.set_clip(None);
-        hot.map_or(Cursor::Arrow, |t| t.2)
+    }
+
+    /// Flushes into the layer and copies it to the window; drawing goes to the window after.
+    fn present(&mut self) {
+        self.flush();
+        let Some((fb, _, (w, h))) = self.layer else { return };
+        unsafe {
+            self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(fb));
+            self.gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+            let (w, h) = (w as i32, h as i32);
+            self.gl.blit_framebuffer(0, 0, w, h, 0, 0, w, h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+    }
+
+    /// (Re)makes the layer at the current size.
+    fn make_layer(&mut self) {
+        let gl = &self.gl;
+        unsafe {
+            if let Some((fb, tex, _)) = self.layer.take() {
+                gl.delete_framebuffer(fb);
+                gl.delete_texture(tex);
+            }
+            let (Ok(fb), Ok(tex)) = (gl.create_framebuffer(), gl.create_texture()) else { return };
+            let (w, h) = (self.size.0 as i32, self.size.1 as i32);
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, w, h, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fb));
+            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
+            if gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE {
+                self.layer = Some((fb, tex, self.size));
+            } else {
+                gl.delete_framebuffer(fb);
+                gl.delete_texture(tex);
+            }
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+    }
+
+    /// The clip drawing is under now.
+    pub fn clip(&self) -> Option<Rect> {
+        self.clip
     }
 
     /// Registers a click target; the topmost one under the mouse gets the hover tint and its cursor.
