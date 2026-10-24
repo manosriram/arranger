@@ -3,6 +3,7 @@
 //! that triggered it. Redraws happen only on input or daemon pushes, so idle CPU is zero.
 
 mod overview;
+mod sound;
 mod render;
 mod review;
 mod theme;
@@ -247,7 +248,7 @@ struct App {
     pending_g: bool,
     /// `d` was pressed on this task and waits for `y` (delete it) or `n`.
     confirm_delete: Option<TaskKey>,
-    /// When Esc was last pressed in vim mode: a second one soon after goes to the agent.
+    /// When Esc was last pressed in vim mode: a second one forwards both to the agent.
     last_esc: Option<Instant>,
     /// New-task prompts, oldest first (saved in gui.json), for ↑ in the dialog.
     prompts: Vec<String>,
@@ -670,7 +671,7 @@ impl ApplicationHandler<Msg> for App {
                     self.glide += y * ROW_H * 1.5;
                     self.redraw();
                 }
-                MouseScrollDelta::PixelDelta(p) => self.scroll_by(p.y as f32),
+                MouseScrollDelta::PixelDelta(p) => self.scroll_by(p.y as f32 / self.scale()),
             },
             WindowEvent::DroppedFile(path) if self.welcome => {
                 self.actions.push(Action::OpenProject(Some(path)));
@@ -1141,6 +1142,13 @@ impl App {
             t.machine = m;
         }
         if let Some(h) = self.hosts.get_mut(m).filter(|h| !h.removed) {
+            if tasks.iter().any(|task| {
+                h.tasks.iter().find(|old| old.id == task.id).is_some_and(|old| {
+                    sound::should_ding(&old.state, &task.state)
+                })
+            }) {
+                sound::ding();
+            }
             h.tasks = tasks;
         }
     }
@@ -1338,14 +1346,12 @@ impl App {
                 _ => return,
             };
             // Whole lines go to the terminal's scrollback; the rest is a pixel offset.
-            self.wheel += dy / LINE_H;
-            let lines = self.wheel.floor();
-            self.wheel -= lines;
-            screen.scroll(lines as i32);
             let g = screen.grid();
-            if g.display_offset() == 0 && lines < 0.0 || g.display_offset() == g.history_size() {
-                self.wheel = 0.0; // at the bottom, or the oldest line
-            }
+            let position = (g.display_offset() as f32 + self.wheel + dy / LINE_H)
+                .clamp(0.0, g.history_size() as f32);
+            let lines = position.floor() as i32;
+            self.wheel = position - lines as f32;
+            screen.scroll(lines - g.display_offset() as i32);
         }
         self.redraw();
     }
@@ -1643,12 +1649,13 @@ impl App {
             self.actions.push(if m.shift_key() { Action::PickModel(usize::MAX) } else { Action::PickAgent(usize::MAX) });
             return;
         }
-        // Vim: Esc twice quickly is the agent's own Esc (stop Claude), while it's on screen.
+        // Forward both presses: an agent with its own Vim mode may consume the first Esc
+        // to leave insert mode and needs the second to interrupt its turn.
         if self.vim && ev.logical_key == Key::Named(NamedKey::Escape) && !ev.repeat {
             let double = self.last_esc.is_some_and(|at| at.elapsed() < Duration::from_millis(400));
             self.last_esc = (!double).then(Instant::now);
             if double && self.review.is_none() && !self.overview && self.dialog.is_none() && self.add_host.is_none() && self.session.is_some() {
-                self.send_input(b"\x1b".to_vec());
+                self.send_input(b"\x1b\x1b".to_vec());
                 self.focus = Focus::Normal;
                 return;
             }
@@ -2594,16 +2601,8 @@ impl App {
                 let rows = found.or((scrolled && extra > 0).then(|| screen.grid().screen_lines() - extra)).unwrap_or(screen.grid().screen_lines()) as f32;
                 // The last text sits on the pane's bottom, just above our input box, with scrollback
                 // filling the space above it. When everything fits, the first text sits at the top instead.
-                let g = screen.grid();
                 let off = g.display_offset() as i32;
-                let blank = |v: i32| (0..g.columns()).all(|c| g[Line(v - off)][Column(c)].c == ' ');
-                let last = (0..rows as i32).rev().find(|&v| !blank(v));
-                let mut shift = grid.h - last.map_or(grid.h, |l| (l + 1) as f32 * LINE_H);
-                let above = g.history_size() as i32 - off; // view rows of scrollback above row 0
-                if (shift / LINE_H).ceil() as i32 >= above {
-                    let first = (-above..=last.unwrap_or(-1)).find(|&v| !blank(v)).unwrap_or(0);
-                    shift = shift.min(-first as f32 * LINE_H);
-                }
+                let shift = chat_shift(screen, rows as usize, grid.h);
                 let frac = self.wheel * LINE_H; // scrolled partway into the line above
                 r.set_clip(Some(Rect::new(sec.x, sec.y, sec.w, (sec.h - bar_h).min(grid.y + shift + frac - sec.y + rows * LINE_H))));
                 let origin = grid.y + shift + frac;
@@ -3365,6 +3364,21 @@ fn chat_selected_text(screen: &Screen, a: (i32, usize), b: (i32, usize)) -> Stri
     text
 }
 
+/// Anchor layout to live content, independent of which scrollback rows are visible.
+/// Recomputing this from the viewport makes blank lines move the entire chat while scrolling.
+fn chat_shift(screen: &Screen, rows: usize, height: f32) -> f32 {
+    let g = screen.grid();
+    let blank = |v: i32| (0..g.columns()).all(|c| g[Line(v)][Column(c)].c == ' ');
+    let last = (0..rows as i32).rev().find(|&v| !blank(v));
+    let mut shift = height - last.map_or(height, |l| (l + 1) as f32 * LINE_H);
+    let above = g.history_size() as i32;
+    if (shift / LINE_H).ceil() as i32 >= above {
+        let first = (-above..=last.unwrap_or(-1)).find(|&v| !blank(v)).unwrap_or(0);
+        shift = shift.min(-first as f32 * LINE_H);
+    }
+    shift
+}
+
 /// Draws the screen with its first row at `area.y`, and scrollback above that up to `top`.
 fn draw_term(r: &mut Renderer, t: &Theme, screen: &Screen, area: Rect, top: f32, cell_w: f32, focused: bool, selection: Option<((i32, usize), (i32, usize))>) {
     let grid = screen.grid();
@@ -3438,6 +3452,21 @@ mod tests {
         assert_eq!(chat_selected_text(&screen, (0, 0), (1, 3)), "hello world");
         assert_eq!(chat_selected_text(&screen, (1, 0), (2, 6)), "rld\n你好 e\u{301}");
         assert_eq!(chat_selected_text(&screen, (0, 2), (0, 2)), "");
+    }
+
+    #[test]
+    fn chat_anchor_stays_fixed_while_scrolling_across_blank_lines() {
+        let mut screen = Screen::new(40, 8);
+        for i in 0..30 {
+            screen.feed(format!("line {i}\r\n\r\n").as_bytes());
+        }
+        let shift = chat_shift(&screen, 8, 8.0 * LINE_H);
+        for _ in 0..screen.grid().history_size() {
+            screen.scroll(1);
+            assert_eq!(chat_shift(&screen, 8, 8.0 * LINE_H), shift);
+        }
+        screen.scroll(-i32::MAX);
+        assert_eq!(chat_shift(&screen, 8, 8.0 * LINE_H), shift);
     }
 
     #[test]
