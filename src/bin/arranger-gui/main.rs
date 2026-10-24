@@ -365,6 +365,19 @@ impl Settings {
     }
 }
 
+/// A bare binary has no bundle, so macOS shows a generic icon in the Dock; set ours.
+#[cfg(target_os = "macos")]
+fn dock_icon() {
+    use objc2::ClassType;
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::{MainThreadMarker, NSData};
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let data = NSData::with_bytes(include_bytes!("../../../assets/icon.png"));
+    if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
+        unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
+    }
+}
+
 fn init_gfx(el: &ActiveEventLoop) -> Result<Gfx, String> {
     let snapshot = std::env::var_os("ARRANGER_SNAPSHOT").is_some();
     let attrs = WindowAttributes::default()
@@ -377,6 +390,8 @@ fn init_gfx(el: &ActiveEventLoop) -> Result<Gfx, String> {
         .build(el, ConfigTemplateBuilder::new(), |mut configs| configs.next().expect("a GL config"))
         .map_err(|e| e.to_string())?;
     let window = window.ok_or("no window")?;
+    #[cfg(target_os = "macos")]
+    dock_icon();
     let display = config.display();
     let handle = window.window_handle().map_err(|e| e.to_string())?.as_raw();
     let ctx = ContextAttributesBuilder::new()

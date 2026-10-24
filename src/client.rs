@@ -63,8 +63,9 @@ fn connect_or_start() -> io::Result<UnixStream> {
     let data = proto::data_dir();
     fs::create_dir_all(&data)?;
     let log = File::options().create(true).append(true).open(data.join("daemon.log"))?;
-    // The daemon is always `arranger`, even when the GUI (`arranger-gui`) is the caller.
-    let mut cmd = Command::new(env::current_exe()?.with_file_name("arranger"));
+    // The daemon is always `arranger`, even when the GUI is the caller (which `arranger` names).
+    let cli = env::var_os("ARRANGER_CLI").map_or_else(|| env::current_exe().map(|e| e.with_file_name("arranger")), |p| Ok(p.into()))?;
+    let mut cmd = Command::new(cli);
     cmd.arg("serve").stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     unsafe {
         cmd.pre_exec(|| Ok(rustix::process::setsid().map(drop)?));

@@ -2,7 +2,7 @@ use arranger::client::{connect, request};
 use arranger::proto::{self, Reply, Request};
 use arranger::{adapter, daemon, machine};
 use rustix::termios::{self, OptionalActions};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -84,9 +84,27 @@ fn add_machine(name: &str, ssh: &str, repo: &str) -> io::Result<()> {
 
 /// Replaces this process with `arranger-gui`, found next to this binary or on PATH.
 fn gui() -> io::Result<()> {
-    let sibling = env::current_exe()?.with_file_name("arranger-gui");
+    let exe = env::current_exe()?;
+    let sibling = exe.with_file_name("arranger-gui");
     let program = if sibling.exists() { sibling } else { "arranger-gui".into() };
-    Err(Command::new(program).exec())
+    let program = if cfg!(target_os = "macos") { named_link(&program).unwrap_or(program) } else { program };
+    Err(Command::new(program).env("ARRANGER_CLI", exe).exec())
+}
+
+/// macOS names an app without a bundle after its executable file, in the menu bar and the Dock.
+/// So the GUI runs through `<data>/app/arranger`, a hard link to `arranger-gui`, re-made when that
+/// changes. None when it can't be made (another volume, say); the GUI then runs as is.
+fn named_link(gui: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let gui = fs::canonicalize(gui).ok()?;
+    let link = proto::data_dir().join("app/arranger");
+    let (a, b) = (fs::metadata(&gui).ok()?, fs::metadata(&link));
+    if !b.is_ok_and(|b| (b.dev(), b.ino()) == (a.dev(), a.ino())) {
+        fs::create_dir_all(link.parent()?).ok()?;
+        let _ = fs::remove_file(&link);
+        fs::hard_link(&gui, &link).ok()?;
+    }
+    Some(link)
 }
 
 fn parse_id(s: &str) -> io::Result<u64> {
