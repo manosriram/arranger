@@ -268,6 +268,11 @@ impl Renderer {
         self.targets.push((r, self.clip, cursor));
     }
 
+    /// Whether `p` falls inside the current clip, so a row scrolled out of view can't be clicked.
+    pub fn in_clip(&self, p: (f32, f32)) -> bool {
+        self.clip.is_none_or(|c| c.contains(p))
+    }
+
     /// Index of the topmost target under `p` in the last frame.
     pub fn hot(&self, p: (f32, f32)) -> Option<usize> {
         self.targets.iter().rposition(|(r, clip, _)| r.contains(p) && clip.is_none_or(|c| c.contains(p)))

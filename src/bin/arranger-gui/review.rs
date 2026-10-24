@@ -20,6 +20,8 @@ pub struct ReviewView {
     pub file: usize,
     pub split: bool,
     pub scroll: f32,
+    /// The left rail (files, checks, summary) scrolls on its own.
+    pub rail_scroll: f32,
     /// "path\0header" of hunks marked reviewed; they collapse.
     accepted: HashSet<String>,
     pub notes: Vec<Note>,
@@ -137,13 +139,10 @@ pub fn plain(line: &str) -> String {
 }
 
 /// Draws an agent's markdown (headings, bullets, code blocks, bold and `code` runs) wrapped to `w`
-/// from `y`, stopping at `max_y`.
-fn draw_markdown(r: &mut Renderer, t: &Theme, text: &str, x: f32, mut y: f32, w: f32, max_y: f32) {
+/// from `y`; returns the y below it.
+fn draw_markdown(r: &mut Renderer, t: &Theme, text: &str, x: f32, mut y: f32, w: f32) -> f32 {
     let mut fenced = false;
     for line in text.lines() {
-        if y > max_y {
-            return;
-        }
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") {
             fenced = !fenced;
@@ -183,9 +182,6 @@ fn draw_markdown(r: &mut Renderer, t: &Theme, text: &str, x: f32, mut y: f32, w:
                 let ww = r.measure(font, size, weight, word);
                 if cx + ww > right && cx > x + indent {
                     (cx, y) = (x + indent, y + 20.0);
-                    if y > max_y {
-                        return;
-                    }
                 }
                 let dy = if code { 1.0 } else { 0.0 };
                 cx += r.text(cx, y + dy, word, font, size, weight, color, right - cx);
@@ -196,6 +192,7 @@ fn draw_markdown(r: &mut Renderer, t: &Theme, text: &str, x: f32, mut y: f32, w:
         }
         y += if heading { 24.0 } else { 20.0 };
     }
+    y
 }
 
 fn clean(text: &str) -> String {
@@ -217,6 +214,7 @@ impl App {
             file: 0,
             split: false,
             scroll: 0.0,
+            rail_scroll: 0.0,
             accepted: HashSet::new(),
             notes: Vec::new(),
             editing: None,
@@ -521,7 +519,7 @@ impl App {
         r.rect(rail, 0.0, t.panel);
         r.rect(Rect::new(rail.x + self.rail_w - 1.0, rail.y, 1.0, rail.h), 0.0, t.border);
         r.set_clip(Some(rail));
-        let mut y = rail.y + 16.0;
+        let mut y = rail.y + 16.0 - rv.rail_scroll;
         let section = |r: &mut Renderer, y: f32, label: &str| {
             r.text(rail.x + 16.0, y, label, UI, 11.0, 500, t.text3, 200.0);
         };
@@ -581,9 +579,10 @@ impl App {
         if let Some(summary) = rv.data.as_ref().map(|d| d.summary.trim()).filter(|s| !s.is_empty()) {
             y += 18.0;
             section(r, y, "AGENT SUMMARY");
-            draw_markdown(r, t, summary, rail.x + 16.0, y + 24.0, self.rail_w - 32.0, rail.y + rail.h - 20.0);
+            y = draw_markdown(r, t, summary, rail.x + 16.0, y + 24.0, self.rail_w - 32.0);
         }
         r.set_clip(None);
+        let rail_max = y + rv.rail_scroll + 20.0 - (rail.y + rail.h);
 
         // Diff column and commit bar.
         let col = Rect::new(body.x + self.rail_w, body.y, body.w - self.rail_w, body.h - BAR_H);
@@ -657,6 +656,9 @@ impl App {
                 let mw = r.measure(UI, 13.0, 400, msg);
                 r.text(col.x + (col.w - mw) / 2.0, col.y + col.h / 2.0 - 8.0, msg, UI, 13.0, 400, t.text3, col.w);
             }
+        }
+        if let Some(rv) = &mut self.review {
+            rv.rail_scroll = rv.rail_scroll.min(rail_max.max(0.0));
         }
         let ended = task.as_ref().is_some_and(|t| group(&t.state) == 4);
         let menu = self.draw_commit_bar(r, t, Rect::new(col.x, col.y + col.h, col.w, BAR_H), &agent, ended, idle, menu_click, &mut acts);

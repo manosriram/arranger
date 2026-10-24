@@ -1274,8 +1274,9 @@ impl App {
 
     /// Scrolls whatever is under the mouse by `dy` pixels (positive = towards the top).
     fn scroll_by(&mut self, dy: f32) {
-        if let Some(rv) = self.review.as_mut().filter(|_| self.mouse.1 > TITLE_H + 56.0) {
-            rv.scroll = (rv.scroll - dy).max(0.0);
+        if let Some(rv) = self.review.as_mut().filter(|_| self.mouse.1 > TITLE_H + review::STRIP_H) {
+            let s = if self.mouse.0 < self.rail_w { &mut rv.rail_scroll } else { &mut rv.scroll };
+            *s = (*s - dy).max(0.0);
         } else if self.overview {
             self.ov_scroll = (self.ov_scroll - dy).max(0.0);
         } else if self.mouse.0 < self.sidebar_w {
@@ -2035,7 +2036,7 @@ impl App {
 
     fn hit_as(&self, r: &mut Renderer, rect: Rect, cursor: Cursor) -> bool {
         r.target(rect, cursor);
-        self.click.is_some_and(|p| rect.contains(p))
+        self.click.is_some_and(|p| rect.contains(p) && r.in_clip(p))
     }
 
     // ---------- drawing ----------
