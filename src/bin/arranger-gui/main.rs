@@ -1833,7 +1833,10 @@ impl App {
                 Action::Select(id) => {
                     self.selected = Some(id);
                     (self.wheel, self.ticks, self.glide) = (0.0, 0.0, 0.0);
-                    self.focus = self.rest();
+                    // An open dialog keeps its field until it's closed.
+                    if self.dialog.is_none() && self.add_host.is_none() {
+                        self.focus = self.rest();
+                    }
                     self.sync_session();
                 }
                 // An ended agent has no message box to type into.
@@ -2028,6 +2031,8 @@ impl App {
         r.begin(size.width, size.height, dpi, t.bg);
 
         self.probe_changes();
+        // Under an open dialog nothing reacts: the views below draw without the click.
+        let modal_click = (self.dialog.is_some() || self.add_host.is_some()).then(|| self.click.take());
         self.draw_title(r, t, w);
         if self.welcome {
             self.draw_welcome(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H));
@@ -2045,6 +2050,9 @@ impl App {
         }
         if !self.welcome {
             self.draw_status(r, t, w, h);
+        }
+        if let Some(click) = modal_click {
+            self.click = click;
         }
         if self.dialog.is_some() {
             self.draw_dialog(r, t, w, h);
