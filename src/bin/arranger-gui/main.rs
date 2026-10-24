@@ -540,6 +540,9 @@ impl ApplicationHandler<Msg> for App {
                     // Dev aid for screenshots (`ARRANGER_SELECT=<task id>`): start on that local task.
                     let pick = std::env::var("ARRANGER_SELECT").ok().and_then(|v| v.parse().ok()).map(|id| (0, id)).filter(|&k| self.task(k).is_some());
                     self.selected = pick.or_else(|| self.order().first().copied());
+                    if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_REVIEW").is_some() {
+                        self.open_review();
+                    }
                 }
                 self.sync_session();
             }

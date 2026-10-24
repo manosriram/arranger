@@ -49,6 +49,8 @@ A soft ding plays when an agent finishes or needs your help. On Linux, sound req
 
 Each task gets its own worktree on a new branch, `arranger/<id>`, made from the base branch you pick when you start it (the current branch by default). The base branch only changes when you merge into it from Review.
 
+**Run in worktree** in Review opens a terminal in the task’s checkout (over SSH for remote tasks). Run your app or tests there before merging; uncommitted edits are included. From the CLI, `arranger run <id>` opens a shell, or `arranger run <id> <command> [args…]` runs a command with its original exit status.
+
 If merging hits a conflict, `main` is left alone: the conflict lands in the agent's worktree, and Review offers to have the agent resolve it (or take one side) before merging again.
 
 Send a message to an ended agent to resume its last session in the same worktree. Chat history remains available when the window closes or the agent exits. Ctrl+C cancels a running turn; with Vim keys, double Esc also cancels. Provider failures show Error / needs-you; automatic retries show Retrying until the agent resumes.
@@ -66,6 +68,7 @@ arranger new claude "fix the flaky test"   # start an agent on a fresh worktree
 arranger ls                                # agents and what they're doing
 arranger events 3                          # saved conversation and tool activity
 arranger approve 3                         # or: deny 3 [reason]
+arranger run 3 cargo test                  # test directly in its worktree
 arranger diff 3                            # changes since its base or your last commit
 arranger send 3 "also update the docs"     # send a message
 arranger revive 3 "carry on"               # resume an ended agent
