@@ -744,6 +744,11 @@ fn is_live(state: &str) -> bool {
     matches!(state, "running" | "needs-you" | "done")
 }
 
+/// Unix seconds of the task's latest activity, for ordering.
+fn last_event(t: &TaskInfo) -> u64 {
+    t.updated.max(t.since).max(t.created)
+}
+
 fn group(state: &str) -> usize {
     match state {
         "needs-you" => 0,
@@ -1032,13 +1037,13 @@ impl App {
     }
 
     /// Sidebar sections: "Needs you" across every machine, then each machine's other tasks,
-    /// newest first within each state.
+    /// most recently active first within each state.
     fn sections(&self) -> Vec<Section<'_>> {
         let f = self.filter.to_lowercase();
         let shown = |t: &&TaskInfo| {
             f.is_empty() || format!("{} {} {} {}", title(t), t.agent, t.branch, self.hosts[t.machine].name()).to_lowercase().contains(&f)
         };
-        let sort = |v: &mut Vec<&TaskInfo>| v.sort_by_key(|t| (group(&t.state), std::cmp::Reverse(t.created), std::cmp::Reverse(t.id)));
+        let sort = |v: &mut Vec<&TaskInfo>| v.sort_by_key(|t| (group(&t.state), std::cmp::Reverse(last_event(t)), std::cmp::Reverse(t.id)));
         let mut needs: Vec<&TaskInfo> = self.all_tasks().filter(shown).filter(|t| group(&t.state) == 0).collect();
         sort(&mut needs);
         let mut out = vec![Section { key: "needs".into(), host: None, tasks: needs, ended: 0 }];
@@ -1056,7 +1061,7 @@ impl App {
         out
     }
 
-    /// The Overview's rows: by state, newest first, through the filter and the state tabs.
+    /// The Overview's rows: by state, most recently active first, through the filter and the state tabs.
     fn ov_tasks(&self) -> Vec<&TaskInfo> {
         let f = self.filter.to_lowercase();
         let mut v: Vec<&TaskInfo> = self
@@ -1064,7 +1069,7 @@ impl App {
             .filter(|t| self.ov_group.is_none_or(|g| group(&t.state) == g) && self.ov_host.is_none_or(|m| t.machine == m))
             .filter(|t| f.is_empty() || format!("{} {} {} {}", title(t), t.agent, t.branch, self.hosts[t.machine].name()).to_lowercase().contains(&f))
             .collect();
-        v.sort_by_key(|t| (group(&t.state), std::cmp::Reverse(t.created), t.machine, std::cmp::Reverse(t.id)));
+        v.sort_by_key(|t| (group(&t.state), std::cmp::Reverse(last_event(t)), t.machine, std::cmp::Reverse(t.id)));
         v
     }
 

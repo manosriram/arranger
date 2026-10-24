@@ -150,6 +150,7 @@ pub fn run() -> io::Result<()> {
         "reviewed TEXT NOT NULL DEFAULT ''",
         "shipped TEXT NOT NULL DEFAULT ''",
         "model TEXT NOT NULL DEFAULT ''",
+        "updated INTEGER NOT NULL DEFAULT 0",
     ] {
         let _ = db.execute(&format!("ALTER TABLE tasks ADD COLUMN {col}"), []);
     }
@@ -870,7 +871,11 @@ impl Daemon {
 
     fn list(&self, with_files: bool) -> Result<Vec<TaskInfo>, String> {
         let mut stmt =
-            self.db.prepare("SELECT id, agent, branch, worktree, state, title, created, summary, shipped FROM tasks ORDER BY id").map_err(e2s)?;
+            self.db.prepare(
+                "SELECT id, agent, branch, worktree, state, title, created, summary, shipped,
+                 MAX(created, updated, COALESCE((SELECT MAX(ts) FROM events WHERE task = tasks.id) / 1000, 0))
+                 FROM tasks ORDER BY id",
+            ).map_err(e2s)?;
         let rows = stmt.query_map([], |r| {
             Ok(TaskInfo {
                 id: r.get(0)?,
@@ -887,6 +892,7 @@ impl Daemon {
                 since: 0,
                 summary: r.get(7)?,
                 shipped: r.get(8)?,
+                updated: r.get(9)?,
                 machine: 0,
             })
         });
@@ -1022,7 +1028,7 @@ impl Daemon {
                 Ship::Merge => "merged",
                 Ship::Pr => "PR",
             };
-            let _ = self.db.execute("UPDATE tasks SET shipped = ?1 WHERE id = ?2", params![shipped, job.task]);
+            let _ = self.db.execute("UPDATE tasks SET shipped = ?1, updated = ?2 WHERE id = ?3", params![shipped, now(), job.task]);
             self.dirty = true;
         }
         self.send(job.conn, &proto::frame(&Reply::JobDone { ok, output }));
@@ -1045,7 +1051,7 @@ impl Daemon {
 
     fn set_state(&mut self, id: u64, state: &str) {
         self.dirty = true;
-        if let Err(e) = self.db.execute("UPDATE tasks SET state = ?1 WHERE id = ?2", params![state, id]) {
+        if let Err(e) = self.db.execute("UPDATE tasks SET state = ?1, updated = ?2 WHERE id = ?3", params![state, now(), id]) {
             eprintln!("task {id}: {e}");
         }
     }

@@ -105,6 +105,8 @@ pub struct TaskInfo {
     pub summary: String,
     /// How its work last left Review: "committed", "merged" or "PR"; "" if it hasn't.
     pub shipped: String,
+    /// Unix seconds of its last event, state change or ship.
+    pub updated: u64,
     /// Which machine the GUI got this task from (an index into its machine list); not sent.
     #[serde(skip)]
     pub machine: usize,
