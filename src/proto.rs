@@ -9,7 +9,7 @@ use std::path::PathBuf;
 const MAX_FRAME: usize = 64 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -50,6 +50,9 @@ pub enum Request {
     AbortMerge { id: u64 },
     /// Settle every conflict with one side: the task's branch (`ours`) or its base.
     TakeSide { id: u64, ours: bool },
+    /// Atomically subscribe to saved and future conversation events, including ended tasks.
+    Conversation { id: u64 },
+    Cancel { id: u64 },
 }
 
 /// What happens after the commit.
@@ -79,6 +82,7 @@ pub enum Reply {
     Review(Review),
     JobDone { ok: bool, output: String },
     Log(Vec<u8>),
+    ChatEvent(u64, Event),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -187,11 +191,19 @@ pub enum Event {
     Error { message: String },
     /// Session totals so far.
     Usage { tokens: u64, cost: Option<f64> },
+    /// Stable message identity lets streaming chunks update a single native chat message.
+    Message { id: String, text: String, append: bool },
+    /// A queued prompt has started its turn.
+    TurnStarted,
+    ToolOutput { text: String },
+    /// The agent explicitly scheduled an automatic retry after a provider error.
+    Retrying { message: String },
 }
 
 impl Event {
     pub fn describe(&self) -> String {
         match self {
+            Event::Message { text, .. } | Event::ToolOutput { text } => text.clone(),
             Event::Prompt { text } => format!("prompt: {text}"),
             Event::ToolStart { kind, target } => {
                 let verb = match kind {
@@ -210,8 +222,10 @@ impl Event {
             Event::Question { text, .. } => format!("asks: {text}"),
             Event::Attention { text } => format!("notice: {text}"),
             Event::TurnDone => "done".into(),
+            Event::TurnStarted => "working".into(),
             Event::Summary { text } => format!("summary: {text}"),
             Event::Error { message } => format!("error: {message}"),
+            Event::Retrying { message } => format!("retrying: {message}"),
             Event::Usage { tokens, cost: Some(cost) } => format!("{tokens} tokens, ${cost:.4}"),
             Event::Usage { tokens, cost: None } => format!("{tokens} tokens"),
         }

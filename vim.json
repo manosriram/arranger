@@ -2,7 +2,7 @@
   "enable": "Scheme menu (top right) → Vim keys",
   "modes": {
     "normal": "Keys move and act. The status bar shows NORMAL.",
-    "insert": "Keys go to a text field or the agent's terminal. The status bar shows INSERT."
+    "insert": "Keys go to a text field. The status bar shows INSERT."
   },
   "move": {
     "j / ↓": "Next agent (next file in Review)",
@@ -16,7 +16,7 @@
     "/": "Filter agents"
   },
   "act": {
-    "o / ↵": "Attach to the agent's terminal; from Overview, open its chat in insert mode",
+    "o / ↵": "Open the agent's chat; from Overview, focus the message box",
     "a": "Allow the permission request",
     "x": "Deny the permission request",
     "r": "Review the diff",
@@ -26,7 +26,7 @@
   "mode": {
     "i": "Message the selected agent (insert mode), from any view",
     "esc": "Normal mode, from anywhere; closes the open dialog",
-    "esc esc": "Send both Esc presses to the agent to interrupt it",
+    "esc esc": "Interrupt the running turn",
     "?": "Show these keys"
   }
 }

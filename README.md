@@ -2,6 +2,8 @@
 
 arranger runs many CLI coding agents (Claude Code, Codex, Gemini, pi) side by side, each on its own git worktree. A small daemon keeps them alive when the window closes and watches what each one is doing (edits, commands, permission requests, questions). The window shows who needs you, lets you answer in place, and takes you from diff review to a PR.
 
+Chat is Arranger's own UI: messages and tool output stream from background CLI processes, with approval and question controls in the conversation. Claude uses stream-json, Codex uses app-server, Gemini uses ACP, and pi uses RPC. The agents keep their own authentication and permission settings. Use recent CLI versions that support these interfaces.
+
 Linux and macOS. Rust throughout; no webview.
 
 <picture>
@@ -49,7 +51,7 @@ Each task gets its own worktree on a new branch, `arranger/<id>`, made from the 
 
 If merging hits a conflict, `main` is left alone: the conflict lands in the agent's worktree, and Review offers to have the agent resolve it (or take one side) before merging again.
 
-An agent that has ended can be revived: it resumes its last session in the same worktree, with a new prompt if you give one (also how Review hands a conflict to an agent that has already exited).
+Send a message to an ended agent to resume its last session in the same worktree. Chat history remains available when the window closes or the agent exits. Ctrl+C cancels a running turn; with Vim keys, double Esc also cancels. Provider failures show Error / needs-you; automatic retries show Retrying until the agent resumes.
 
 The **Overview** tab lists every agent on every machine in one table, grouped by state, with one action per row: Approve, Answer, Review or Open. Ended agents live there too; click "N ended" under a machine to see that machine's.
 
@@ -62,15 +64,17 @@ Everything also works from the terminal:
 ```sh
 arranger new claude "fix the flaky test"   # start an agent on a fresh worktree
 arranger ls                                # agents and what they're doing
-arranger attach 3                          # its terminal; Ctrl-\ detaches
+arranger events 3                          # saved conversation and tool activity
 arranger approve 3                         # or: deny 3 [reason]
 arranger diff 3                            # changes since its base or your last commit
-arranger send 3 "also update the docs"     # type into it
+arranger send 3 "also update the docs"     # send a message
 arranger revive 3 "carry on"               # resume an ended agent
 arranger commit 3 --merge                  # commit, merge into its base branch
 arranger commit 3 --pr                     # or: commit, push, open a PR
 arranger stop                              # stop the daemon and its agents
 ```
+
+Custom agent commands retain terminal transport for `arranger attach`; their native chat shows events reported through Arranger hooks. Built-in agents use the conversation UI instead of terminal attachment.
 
 ## Other machines
 
@@ -89,3 +93,5 @@ just test        # cargo test
 just bench-mem   # daemon RSS with 20 fake agents
 just screenshot  # re-render the README screenshots (light and dark) with demo agents
 ```
+
+After updating from a build with terminal-backed chat, restart the daemon with `arranger stop` before reopening the app. This stops its running agents; saved tasks can be resumed afterward. Remote daemons must use the same build.

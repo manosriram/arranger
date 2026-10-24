@@ -44,3 +44,15 @@ pub fn resize(master: &OwnedFd, cols: u16, rows: u16) -> io::Result<()> {
     let size = Winsize { ws_col: cols, ws_row: rows, ws_xpixel: 0, ws_ypixel: 0 };
     Ok(tcsetwinsize(master, size)?)
 }
+
+/// Full-duplex stdio without a controlling terminal. stderr goes to a separate diagnostic log.
+pub fn spawn_background(mut cmd: Command, stderr: std::fs::File) -> io::Result<Pty> {
+    let (parent, child_io) = std::os::unix::net::UnixStream::pair()?;
+    cmd.stdin(Stdio::from(OwnedFd::from(child_io.try_clone()?)))
+        .stdout(Stdio::from(OwnedFd::from(child_io)))
+        .stderr(stderr);
+    unsafe { cmd.pre_exec(|| Ok(rustix::process::setsid().map(drop)?)); }
+    let child = cmd.spawn()?;
+    parent.set_nonblocking(true)?;
+    Ok(Pty { master: parent.into(), child })
+}

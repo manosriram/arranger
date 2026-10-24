@@ -2,6 +2,7 @@
 //! Immediate mode: every redraw lays out and draws everything, and resolves the click
 //! that triggered it. Redraws happen only on input or daemon pushes, so idle CPU is zero.
 
+mod chat;
 mod overview;
 mod sound;
 mod render;
@@ -13,12 +14,6 @@ use arranger::adapter;
 use arranger::client::{connect, connect_at, request_at};
 use arranger::machine::{self, Machine};
 use arranger::proto::{self, Event, Reply, Request, Ship, TaskInfo};
-use arranger::screen::Screen;
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::TermMode;
-use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::vte::ansi::{Color, NamedColor};
 use glutin::config::ConfigTemplateBuilder;
 use glutin::context::{ContextApi, ContextAttributesBuilder, GlProfile, NotCurrentGlContext, PossiblyCurrentContext, Version};
 use glutin::display::{GetGlDisplay, GlDisplay};
@@ -56,8 +51,6 @@ const ROW_H: f32 = 28.0;
 /// A row with its second line (what the agent is doing / did).
 const ROW2_H: f32 = 42.0;
 const GROUP_H: f32 = 24.0;
-const TERM_SIZE: f32 = 12.0;
-const LINE_H: f32 = 18.0;
 /// The chat message box shows up to this many lines, this far apart.
 const MSG_LINES: usize = 8;
 const MSG_LINE_H: f32 = 18.0;
@@ -67,10 +60,10 @@ pub type TaskKey = (usize, u64);
 
 pub enum Msg {
     Tasks(usize, Vec<TaskInfo>),
-    Output(u64, Vec<u8>),
+    Conversation(u64, Vec<(u64, Event)>),
+    ChatEvent(u64, Event),
     Exited(u64),
-    /// A finished task's recorded PTY output.
-    History(TaskKey, Vec<u8>),
+
     Link(usize, Link),
     Reply(Tag, Result<Reply, String>),
     /// The add-machine dialog's connection test.
@@ -117,16 +110,12 @@ struct Gfx {
     r: Renderer,
 }
 
-/// The focused task's attach stream and its local copy of the terminal.
+/// The focused task's conversation subscription.
 struct Session {
     seq: u64,
     task: TaskKey,
     writer: UnixStream,
-    screen: Screen,
-    size: (u16, u16),
-    /// Rows of the agent's own input box. The terminal is this much taller than the pane, so the
-    /// box sits just below it, out of sight, and the agent's text fills the pane.
-    extra: u16,
+
 }
 
 impl Drop for Session {
@@ -186,7 +175,7 @@ enum Action {
     NewTask,
     ToggleTheme,
     Answer(bool),
-    Input(Vec<u8>),
+    ReplyQuestion(String),
     PickAgent(usize),
     PickModel(usize),
     Start(bool),
@@ -234,7 +223,8 @@ struct App {
     selected: Option<TaskKey>,
     session: Option<Session>,
     seq: u64,
-    pane: (u16, u16),
+    chat: chat::Chat,
+    chat_error: Option<String>,
     /// Index into THEMES.
     theme: usize,
     /// Vim keys: a normal mode for moving and acting without the mouse.
@@ -282,13 +272,8 @@ struct App {
     review: Option<ReviewView>,
     /// Whether each probed task has anything to review, keyed by the state it was probed in.
     changes: std::collections::HashMap<TaskKey, (String, Option<bool>)>,
-    /// Replay of a finished task's log, shown in place of a live session.
-    history: Option<(TaskKey, Screen)>,
-    /// How far into the top line the chat is scrolled, 0..1 of a line: the chat scrolls by pixel
-    /// though the terminal keeps whole lines.
+    /// Pixels above the bottom of the native conversation (zero follows new output).
     wheel: f32,
-    /// Wheel movement for a full-screen agent not yet worth a wheel tick.
-    ticks: f32,
     /// Mouse-wheel scrolling still to apply: notches glide over a few frames instead of jumping;
     /// and when the last frame of it ran.
     glide: f32,
@@ -358,7 +343,8 @@ fn run() -> io::Result<()> {
         selected: None,
         session: None,
         seq: 0,
-        pane: (80, 24),
+        chat: chat::Chat::default(),
+        chat_error: None,
         theme: 0,
         vim: false,
         menu: false,
@@ -387,9 +373,7 @@ fn run() -> io::Result<()> {
         remove_armed: None,
         review: None,
         changes: Default::default(),
-        history: None,
         wheel: 0.0,
-        ticks: 0.0,
         glide: 0.0,
         glide_at: Instant::now(),
         mods: ModifiersState::empty(),
@@ -575,29 +559,17 @@ impl ApplicationHandler<Msg> for App {
                     a.test = Some(res);
                 }
             }
-            Msg::Output(seq, bytes) => {
-                if let Some(s) = self.session.as_mut().filter(|s| s.seq == seq) {
-                    let replies = s.screen.feed(&bytes);
-                    if !replies.is_empty() {
-                        let _ = s.writer.write_all(&proto::frame(&Request::Input(replies)));
-                    }
+            Msg::Conversation(seq, events) => {
+                if self.session.as_ref().is_some_and(|s| s.seq == seq) {
+                    self.chat = chat::Chat::default();
+                    for (_, event) in events { self.chat.event(event); }
                 }
+            }
+            Msg::ChatEvent(seq, event) => {
+                if self.session.as_ref().is_some_and(|s| s.seq == seq) { self.chat.event(event); }
             }
             Msg::Exited(seq) => {
-                if self.session.as_ref().is_some_and(|s| s.seq == seq) {
-                    self.session = None;
-                }
-            }
-            Msg::History(id, bytes) => {
-                if self.selected == Some(id) {
-                    // Full-screen agents (Claude Code) leave the alternate screen on exit, wiping the
-                    // chat; stop at that point to keep their last frame.
-                    let end = bytes.windows(8).rposition(|w| w == b"\x1b[?1049l").unwrap_or(bytes.len());
-                    let (cols, rows) = last_size(&bytes[..end]).unwrap_or(self.pane);
-                    let mut screen = Screen::new(cols, rows);
-                    screen.feed(&bytes[..end]);
-                    self.history = Some((id, screen));
-                }
+                if self.session.as_ref().is_some_and(|s| s.seq == seq) { self.session = None; }
             }
             Msg::Reply(tag, reply) => self.on_reply(tag, reply),
         }
@@ -774,10 +746,6 @@ fn keep_linked(m: usize, cfg: Machine, p: EventLoopProxy<Msg>, retry: mpsc::Rece
     }
 }
 
-fn is_live(state: &str) -> bool {
-    matches!(state, "running" | "needs-you" | "done")
-}
-
 /// Unix seconds of the task's latest activity, for ordering.
 fn last_event(t: &TaskInfo) -> u64 {
     t.updated.max(t.since).max(t.created)
@@ -786,7 +754,7 @@ fn last_event(t: &TaskInfo) -> u64 {
 fn group(state: &str) -> usize {
     match state {
         "needs-you" => 0,
-        "running" => 1,
+        "running" | "retrying" => 1,
         "queued" => 2,
         "done" => 3,
         _ => 4, // the agent process is gone: exited, dead, failed
@@ -864,6 +832,7 @@ fn reason(task: &TaskInfo) -> String {
         (Some(Event::Question { .. }), _) => "Asked a question".into(),
         (Some(Event::Error { .. }), _) => "Error".into(),
         (_, "needs-you") => "Needs you".into(),
+        (_, "retrying") => "Retrying".into(),
         (_, "running") if !task.action.is_empty() => {
             let mut c = task.action.chars();
             c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
@@ -927,77 +896,6 @@ fn recall(list: &[String], hist: &mut Option<usize>, text: &mut String, up: bool
     *hist = next;
     *text = next.map_or_else(String::new, |i| list[i].clone());
     true
-}
-
-/// Bytes a terminal sends for a key press.
-fn key_bytes(ev: &KeyEvent, mods: ModifiersState, app_cursor: bool) -> Option<Vec<u8>> {
-    let arrow = |c: char| if app_cursor { format!("\x1bO{c}") } else { format!("\x1b[{c}") };
-    let s = match &ev.logical_key {
-        Key::Named(n) => match n {
-            NamedKey::Enter => "\r".into(),
-            NamedKey::Backspace => "\x7f".into(),
-            NamedKey::Tab if mods.shift_key() => "\x1b[Z".into(),
-            NamedKey::Tab => "\t".into(),
-            NamedKey::Escape => "\x1b".into(),
-            NamedKey::Space if mods.control_key() => "\0".into(),
-            NamedKey::Space => " ".into(),
-            NamedKey::ArrowUp => arrow('A'),
-            NamedKey::ArrowDown => arrow('B'),
-            NamedKey::ArrowRight => arrow('C'),
-            NamedKey::ArrowLeft => arrow('D'),
-            NamedKey::Home => "\x1b[H".into(),
-            NamedKey::End => "\x1b[F".into(),
-            NamedKey::PageUp => "\x1b[5~".into(),
-            NamedKey::PageDown => "\x1b[6~".into(),
-            NamedKey::Delete => "\x1b[3~".into(),
-            NamedKey::Insert => "\x1b[2~".into(),
-            NamedKey::F1 => "\x1bOP".into(),
-            NamedKey::F2 => "\x1bOQ".into(),
-            NamedKey::F3 => "\x1bOR".into(),
-            NamedKey::F4 => "\x1bOS".into(),
-            _ => return None,
-        },
-        Key::Character(c) if mods.control_key() => {
-            let ch = c.chars().next()?.to_ascii_lowercase();
-            let b = match ch {
-                'a'..='z' => ch as u8 - b'a' + 1,
-                '[' | '3' => 0x1b,
-                '\\' | '4' => 0x1c,
-                ']' | '5' => 0x1d,
-                '^' | '6' => 0x1e,
-                '_' | '-' | '7' => 0x1f,
-                '@' | ' ' | '2' => 0,
-                _ => return ev.text.as_ref().map(|t| t.as_bytes().to_vec()),
-            };
-            return Some(vec![b]);
-        }
-        Key::Character(c) => ev.text.as_deref().unwrap_or(c).to_string(),
-        _ => return None,
-    };
-    let mut bytes = s.into_bytes();
-    if mods.alt_key() && !cfg!(target_os = "macos") {
-        bytes.insert(0, 0x1b); // Alt as Meta; macOS Option composes characters instead
-    }
-    Some(bytes)
-}
-
-fn term_color(t: &Theme, c: Color, fg: bool) -> Option<Rgba> {
-    match c {
-        Color::Spec(rgb) => Some([rgb.r, rgb.g, rgb.b, 255]),
-        Color::Indexed(i) => Some(t.indexed(i)),
-        Color::Named(n) => {
-            let (i, dim) = (n as usize, NamedColor::DimBlack as usize);
-            match n {
-                NamedColor::Background => None,
-                NamedColor::DimForeground => Some(t.text3),
-                NamedColor::BrightForeground => Some(t.tc_on),
-                _ if i < 16 => Some(t.ansi(i as u8)),
-                _ if (dim..dim + 8).contains(&i) => Some(alpha(t.ansi((i - dim) as u8), 170)),
-                _ if fg => Some(t.tc),
-                _ => None,
-            }
-        }
-    }
 }
 
 /// Splits `text` into lines no wider than `max_w`.
@@ -1196,7 +1094,7 @@ impl App {
         }
     }
 
-    /// Where focus rests when no field has it: the agent's terminal, or vim's normal mode.
+    /// Where focus rests when no field has it: the conversation, or Vim normal mode.
     fn rest(&self) -> Focus {
         if self.vim { Focus::Normal } else { Focus::Term }
     }
@@ -1228,10 +1126,10 @@ impl App {
     }
 
     /// Opens the selected task's chat from the Overview, typing into its message box (insert
-    /// mode) unless the agent has ended.
+    /// mode).
     fn open_from_overview(&mut self) {
         self.actions.push(Action::Overview(false));
-        self.actions.push(Action::Focus(Focus::Message)); // ignored for an ended agent
+        self.actions.push(Action::Focus(Focus::Message));
     }
 
     /// Steps Workspace → Overview → Review → Workspace (or back). Review needs a selected task,
@@ -1328,30 +1226,7 @@ impl App {
         } else if self.mouse.0 < self.sidebar_w {
             self.scroll = (self.scroll - dy).max(0.0);
         } else if self.review.is_none() && !self.welcome {
-            let id = self.selected;
-            if let Some(s) = self.session.as_ref().filter(|s| Some(s.task) == id && s.screen.mode().contains(TermMode::ALT_SCREEN)) {
-                // A full-screen agent scrolls itself, a few lines per tick: one tick per three lines
-                // moved, as a wheel notch would, or it races.
-                self.ticks += dy / (3.0 * LINE_H);
-                let n = self.ticks.trunc();
-                self.ticks -= n;
-                if let Some(bytes) = self.wheel_bytes(&s.screen, n as i32).filter(|_| n != 0.0) {
-                    self.send_input(bytes);
-                }
-                return;
-            }
-            let screen = match (&mut self.session, &mut self.history) {
-                (Some(s), _) if Some(s.task) == id => &mut s.screen,
-                (_, Some((h, screen))) if Some(*h) == id => screen,
-                _ => return,
-            };
-            // Whole lines go to the terminal's scrollback; the rest is a pixel offset.
-            let g = screen.grid();
-            let position = (g.display_offset() as f32 + self.wheel + dy / LINE_H)
-                .clamp(0.0, g.history_size() as f32);
-            let lines = position.floor() as i32;
-            self.wheel = position - lines as f32;
-            screen.scroll(lines - g.display_offset() as i32);
+            self.wheel = (self.wheel + dy).max(0.0);
         }
         self.redraw();
     }
@@ -1365,37 +1240,6 @@ impl App {
         let step = if self.glide.abs() < 1.0 { self.glide } else { self.glide * share };
         self.glide -= step;
         self.scroll_by(step);
-    }
-
-    /// A full-screen agent (alternate screen, no scrollback here) scrolls its own chat: the
-    /// wheel goes to it as mouse-wheel reports, or as arrow keys when it doesn't take the mouse.
-    fn wheel_bytes(&self, screen: &Screen, lines: i32) -> Option<Vec<u8>> {
-        let mode = screen.mode();
-        if !mode.contains(TermMode::ALT_SCREEN) {
-            return None;
-        }
-        let up = lines > 0;
-        let n = lines.unsigned_abs() as usize;
-        if mode.intersects(TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) {
-            let cell_w = self.gfx.as_ref()?.r.advance(MONO, TERM_SIZE, 400, '0');
-            let col = ((self.mouse.0 - self.sidebar_w - 16.0) / cell_w).max(0.0) as u32 + 1;
-            let row = ((self.mouse.1 - TITLE_H - HEADER_H - 12.0) / LINE_H).max(0.0) as u32 + 1;
-            let button = if up { 64 } else { 65 };
-            let one = if mode.contains(TermMode::SGR_MOUSE) {
-                format!("\x1b[<{button};{col};{row}M").into_bytes()
-            } else {
-                vec![0x1b, b'[', b'M', 32 + button as u8, (32 + col.min(223)) as u8, (32 + row.min(223)) as u8]
-            };
-            return Some(one.repeat(n));
-        }
-        let app = mode.contains(TermMode::APP_CURSOR);
-        let key: &[u8] = match (up, app) {
-            (true, true) => b"\x1bOA",
-            (true, false) => b"\x1b[A",
-            (false, true) => b"\x1bOB",
-            (false, false) => b"\x1b[B",
-        };
-        Some(key.repeat(n))
     }
 
     /// Redraws only when the mouse crosses into another target, so moving it costs nothing otherwise.
@@ -1417,57 +1261,38 @@ impl App {
     }
 
     fn sync_session(&mut self) {
-        let want = self.current().filter(|t| is_live(&t.state)).map(|t| (t.machine, t.id));
-        self.load_history();
-        if self.session.as_ref().map(|s| s.task) == want {
-            return;
-        }
+        let want = self.current().map(|t| (t.machine, t.id));
+        if self.session.as_ref().map(|s| s.task) == want { return; }
         self.session = None;
+        self.chat = chat::Chat::default();
+        self.chat_error = None;
+        self.chat_selection = None;
+        self.chat_copy.clear();
+        self.wheel = 0.0;
         let Some(key @ (m, id)) = want else { return };
-        let (cols, rows) = self.pane;
         let Ok(mut sock) = connect_at(self.sock(m).as_deref()) else { return };
-        if sock.write_all(&proto::frame(&Request::Attach { id, cols, rows, native: false })).is_err() {
-            return;
-        }
+        if sock.write_all(&proto::frame(&Request::Conversation { id })).is_err() { return; }
         let Ok(mut reader) = sock.try_clone() else { return };
         self.seq += 1;
         let (seq, p) = (self.seq, self.proxy.clone());
         thread::spawn(move || {
-            while let Ok(Reply::Output(bytes)) = proto::read_msg(&mut reader) {
-                if p.send_event(Msg::Output(seq, bytes)).is_err() {
-                    return;
-                }
+            while let Ok(reply) = proto::read_msg(&mut reader) {
+                let msg = match reply {
+                    Reply::Events(events) => Msg::Conversation(seq, events),
+                    Reply::ChatEvent(_, event) => Msg::ChatEvent(seq, event),
+                    _ => break,
+                };
+                if p.send_event(msg).is_err() { return; }
             }
             let _ = p.send_event(Msg::Exited(seq));
         });
-        self.session = Some(Session { seq, task: key, writer: sock, screen: Screen::new(cols, rows), size: (cols, rows), extra: 0 });
+        self.session = Some(Session { seq, task: key, writer: sock });
     }
 
-    /// For a task that is no longer running, replays its PTY log so its chat stays readable.
-    fn load_history(&mut self) {
-        let Some(task) = self.current().filter(|t| !is_live(&t.state) && t.state != "queued") else {
-            self.history = None;
-            return;
-        };
-        let key = (task.machine, task.id);
-        if self.history.as_ref().is_some_and(|h| h.0 == key) {
-            return;
-        }
-        let (sock, p) = (self.sock(key.0), self.proxy.clone());
-        self.history = None;
-        thread::spawn(move || {
-            if let Ok(Reply::Log(zst)) = request_at(sock.as_deref(), &Request::Log { id: key.1 }) {
-                if let Ok(bytes) = zstd::decode_all(&zst[..]) {
-                    let _ = p.send_event(Msg::History(key, bytes));
-                }
-            }
-        });
-    }
-
+    /// Kept as the action used by Esc/Ctrl-C and question buttons.
     fn send_input(&mut self, bytes: Vec<u8>) {
-        self.wheel = 0.0; // typing jumps the chat back to the bottom
-        if let Some(s) = &mut self.session {
-            let _ = s.writer.write_all(&proto::frame(&Request::Input(bytes)));
+        if matches!(bytes.as_slice(), b"\x1b" | b"\x1b\x1b" | b"\x03") {
+            if let Some((m,id)) = self.selected { self.spawn_request(m, Tag::Message, Request::Cancel { id }); }
         }
     }
 
@@ -1649,8 +1474,7 @@ impl App {
             self.actions.push(if m.shift_key() { Action::PickModel(usize::MAX) } else { Action::PickAgent(usize::MAX) });
             return;
         }
-        // Forward both presses: an agent with its own Vim mode may consume the first Esc
-        // to leave insert mode and needs the second to interrupt its turn.
+        // Double Esc cancels the running turn without leaving Vim normal mode.
         if self.vim && ev.logical_key == Key::Named(NamedKey::Escape) && !ev.repeat {
             let double = self.last_esc.is_some_and(|at| at.elapsed() < Duration::from_millis(400));
             self.last_esc = (!double).then(Instant::now);
@@ -1660,8 +1484,7 @@ impl App {
                 return;
             }
         }
-        // Vim: Esc anywhere is normal mode, closing whatever was being typed into (the agent's
-        // terminal doesn't get it).
+        // Vim: Esc anywhere is normal mode, closing whatever was being typed into.
         if self.vim && self.focus != Focus::Normal && ev.logical_key == Key::Named(NamedKey::Escape) {
             if self.add_host.take().is_none() && self.dialog.is_some() {
                 self.actions.push(Action::CloseDialog);
@@ -1693,17 +1516,14 @@ impl App {
             }
             return; // the agent's terminal isn't on screen
         }
-        let typed = ev.text.as_ref().filter(|t| t.chars().any(|c| !c.is_control()) && !m.control_key() && !m.alt_key());
-        let kind = self.current().map(|t| adapter::kind(&t.agent).to_string()).unwrap_or_default();
-        if self.focus == Focus::Term && typed.is_some() && self.session.as_ref().and_then(|s| agent_box(&s.screen, &kind)).is_some() {
-            // The agent's own input box is hidden behind ours: typing goes to ours.
-            self.focus = Focus::Message;
+        if m.control_key() && ev.logical_key == Key::Character("c".into()) && self.focus == Focus::Message {
+            self.send_input(b"\x03".to_vec());
+            return;
         }
+        let typed = ev.text.as_ref().filter(|t| t.chars().any(|c| !c.is_control()) && !m.control_key() && !m.alt_key());
+        if self.focus == Focus::Term && typed.is_some() { self.focus = Focus::Message; }
         if self.focus == Focus::Term {
-            let app_cursor = self.session.as_ref().is_some_and(|s| s.screen.mode().contains(TermMode::APP_CURSOR));
-            if let Some(bytes) = key_bytes(ev, m, app_cursor) {
-                self.send_input(bytes);
-            }
+            if ev.logical_key == Key::Named(NamedKey::Escape) || (m.control_key() && ev.logical_key == Key::Character("c".into())) { self.send_input(b"\x03".to_vec()); }
             return;
         }
         let focus = self.focus;
@@ -1763,7 +1583,6 @@ impl App {
                     self.focus = self.rest();
                 }
             }
-            Key::Named(NamedKey::Tab) if focus == Focus::Message && m.shift_key() => self.send_input(b"\x1b[Z".to_vec()), // cycles the agent's mode
             Key::Named(NamedKey::Enter) if matches!(focus, Focus::Prompt | Focus::Note | Focus::Message) && shift => self.insert("\n"),
             Key::Named(NamedKey::Enter) => match focus {
                 Focus::Message => {
@@ -1778,6 +1597,8 @@ impl App {
                             self.save_settings();
                         }
                         self.sent_hist = None;
+                        self.wheel = 0.0;
+                        self.chat_error = None;
                         self.spawn_request(m, Tag::Message, Request::Prompt { id, text });
                     }
                 }
@@ -1837,13 +1658,8 @@ impl App {
 
     fn paste(&mut self) {
         let text = clipboard();
-        if self.focus == Focus::Term {
-            let bracketed = self.session.as_ref().is_some_and(|s| s.screen.mode().contains(TermMode::BRACKETED_PASTE));
-            let bytes = if bracketed { format!("\x1b[200~{text}\x1b[201~") } else { text.replace('\n', "\r") };
-            self.send_input(bytes.into_bytes());
-        } else {
-            self.insert(&text);
-        }
+        if self.focus == Focus::Term { self.focus = Focus::Message; }
+        self.insert(&text);
     }
 
     /// The selected byte range in the focused field, if any.
@@ -1892,15 +1708,15 @@ impl App {
             match action {
                 Action::Select(id) => {
                     self.selected = Some(id);
-                    (self.wheel, self.ticks, self.glide) = (0.0, 0.0, 0.0);
+                    (self.wheel, self.glide) = (0.0, 0.0);
                     // An open dialog keeps its field until it's closed.
                     if self.dialog.is_none() && self.add_host.is_none() {
                         self.focus = self.rest();
                     }
                     self.sync_session();
                 }
-                // An ended agent has no message box to type into.
-                Action::Focus(Focus::Message) if self.current().is_none_or(|t| group(&t.state) == 4) => {}
+                // There must be a selected task to message.
+                Action::Focus(Focus::Message) if self.current().is_none() => {}
                 Action::Focus(f) => {
                     self.confirm_delete = None;
                     if self.focus != f {
@@ -1973,7 +1789,9 @@ impl App {
                         let _ = request_at(self.sock(m).as_deref(), &Request::Answer { id, allow, message: String::new() });
                     }
                 }
-                Action::Input(bytes) => self.send_input(bytes),
+                Action::ReplyQuestion(text) => {
+                    if let Some((m,id)) = self.selected { self.spawn_request(m, Tag::Message, Request::Prompt { id, text }); }
+                }
                 Action::PickAgent(i) => {
                     if let Some(d) = &mut self.dialog {
                         let agent = if i == usize::MAX { (d.agent + 1) % AGENTS.len() } else { i };
@@ -2524,32 +2342,8 @@ impl App {
             dx += w + 32.0;
         }
 
-        // Message box at the bottom; once the agent has ended, a bar to bring it back instead.
-        let ended = group(&task.state) == 4;
         let input_area = Rect::new(area.x, area.y + area.h - 49.0, area.w, 49.0);
-        if ended {
-            r.rect(Rect::new(area.x, input_area.y, area.w, 1.0), 0.0, t.border);
-            let label = format!("Revive {}", adapter::kind(&task.agent));
-            let bw = r.measure(UI, 12.5, 500, &label) + 28.0;
-            let b = Rect::new(area.x + area.w - 10.0 - bw, input_area.y + 9.0, bw, 32.0);
-            let key = (task.machine, task.id);
-            let note = match self.revive_error.as_ref().filter(|e| e.0 == key) {
-                Some((_, e)) => (format!("Couldn't revive: {e}"), t.del),
-                None => (format!("{} has ended · revive it to pick up where it left off", adapter::kind(&task.agent)), t.text3),
-            };
-            r.text(area.x + 16.0, r.center(b, UI, 12.5), &note.0, UI, 12.5, 400, note.1, b.x - area.x - 32.0);
-            r.rect(b, 4.0, t.primary_bg);
-            r.text(b.x + 14.0, r.center(b, UI, 12.5), &label, UI, 12.5, 500, t.primary_fg, bw);
-            if self.hit(r, b) {
-                self.actions.push(Action::Revive(key, String::new()));
-            }
-        }
-        // The message box grows upwards over the chat as lines are added (the agent's pane keeps
-        // its size: resizing would make it redraw), up to MSG_LINES, then shows the caret's part.
-        let mode = self.session.as_ref().filter(|s| s.task == (task.machine, task.id)).and_then(|s| agent_box(&s.screen, kind)).map(|(_, mode)| mode);
-        let chip_label = mode.map(|m| if m.is_empty() { "default mode".to_string() } else { m });
-        let chip_w = chip_label.as_ref().map(|l| r.measure(MONO, 10.5, 400, l) + r.measure(UI, 10.0, 400, "⇧Tab") + 26.0);
-        let text_w = area.w - 80.0 - chip_w.map_or(0.0, |w| w + 8.0);
+        let text_w = area.w - 80.0;
         let message = self.message.clone();
         let lines = wrap(r, &message, UI, 12.5, text_w);
         let caret = self.caret_for(Focus::Message, &message).map(|at| caret_line(&message, &lines, at));
@@ -2558,120 +2352,25 @@ impl App {
         let grow = (shown - 1) as f32 * MSG_LINE_H;
         let ib = Rect::new(area.x + 10.0, input_area.y + 9.0 - grow, area.w - 20.0, 32.0 + grow);
 
-        // Terminal section.
         let sec = Rect::new(area.x, area.y + HEADER_H, area.w, input_area.y - area.y - HEADER_H);
         r.rect(sec, 0.0, t.term);
-        if self.hit_as(r, sec, Cursor::Text) && !self.click.is_some_and(|p| !ended && ib.contains(p)) {
-            self.actions.push(Action::Focus(Focus::Term));
-        }
-        let bar_h = if task.need.is_some() { 48.0 } else { 0.0 };
-        let grid = Rect::new(sec.x + 16.0, sec.y + 12.0, sec.w - 32.0, sec.h - 20.0 - bar_h);
-        let cell_w = r.advance(MONO, TERM_SIZE, 400, '0');
-        let size = (((grid.w / cell_w) as u16).max(2), ((grid.h / LINE_H) as u16).max(1));
-        self.pane = size;
-        let term_focus = self.focus == Focus::Term && self.dialog.is_none();
-        let mut box_rows = None;
-        let extra = self.session.as_ref().filter(|s| s.task == (task.machine, task.id)).map_or(0, |s| s.extra as usize);
-        let screen = match (&mut self.session, &mut self.history) {
-            (Some(s), _) if s.task == (task.machine, task.id) => {
-                let size = (size.0, size.1 + s.extra);
-                if s.size != size {
-                    s.size = size;
-                    s.screen.resize(size.0, size.1);
-                    let _ = s.writer.write_all(&proto::frame(&Request::Resize { cols: size.0, rows: size.1 }));
-                }
-                Some(&s.screen)
-            }
-            (_, Some((key, screen))) if *key == (task.machine, task.id) => Some(&*screen), // kept at the size it was drawn for
-            _ => None,
-        };
-        match screen {
-            Some(screen) => {
-                // Stop above the agent's own input box: ours below replaces it.
-                let found = agent_box(screen, kind).map(|(row, _)| row);
-                // Down to its last text, not the screen bottom: codex draws inline, so the blank rows
-                // below its box grow with the pty, and counting them grew the pty again each frame
-                // (45→49→53→57→53 rows), until codex panicked on the shrink.
-                let g = screen.grid();
-                let text = |v: usize| (0..g.columns()).any(|c| g[Line(v as i32)][Column(c)].c != ' ');
-                box_rows = found.map(|row| ((row..g.screen_lines()).rfind(|&v| text(v)).unwrap_or(row) + 1 - row) as u16);
-                // Scrolled back, the box can't be found, but it's still the bottom `extra` rows:
-                // keep them out, or the chat jumps by the box's height as scrolling starts.
-                let scrolled = screen.grid().display_offset() > 0;
-                let rows = found.or((scrolled && extra > 0).then(|| screen.grid().screen_lines() - extra)).unwrap_or(screen.grid().screen_lines()) as f32;
-                // The last text sits on the pane's bottom, just above our input box, with scrollback
-                // filling the space above it. When everything fits, the first text sits at the top instead.
-                let off = g.display_offset() as i32;
-                let shift = chat_shift(screen, rows as usize, grid.h);
-                let frac = self.wheel * LINE_H; // scrolled partway into the line above
-                r.set_clip(Some(Rect::new(sec.x, sec.y, sec.w, (sec.h - bar_h).min(grid.y + shift + frac - sec.y + rows * LINE_H))));
-                let origin = grid.y + shift + frac;
-                let key = (task.machine, task.id);
-                if self.chat_selection.is_some_and(|s| s.0 != key) {
-                    self.chat_selection = None;
-                    self.chat_copy.clear();
-                }
-                let visible_bottom = (sec.y + sec.h - bar_h).min(origin + rows * LINE_H).min(if ended { input_area.y } else { ib.y - 9.0 });
-                let selectable = Rect::new(sec.x, sec.y, sec.w, (visible_bottom - sec.y).max(0.0));
-                let pressed = self.click.is_some_and(|p| selectable.contains(p)) && self.dialog.is_none() && self.add_host.is_none() && !self.menu;
-                if pressed || self.chat_drag {
-                    let row = (((self.mouse.1.clamp(sec.y, visible_bottom.max(sec.y)) - origin) / LINE_H).floor() as i32 - off)
-                        .clamp(-(g.history_size() as i32), g.screen_lines() as i32 - 1);
-                    let col = (((self.mouse.0 - grid.x) / cell_w).round().max(0.0) as usize).min(g.columns());
-                    let point = (row, col);
-                    if pressed {
-                        self.chat_selection = Some((key, point, point));
-                        self.chat_drag = true;
-                    } else if let Some(selection) = &mut self.chat_selection {
-                        selection.2 = point;
-                    }
-                }
-                let selection = self.chat_selection.filter(|s| s.0 == key).map(|s| if s.1 <= s.2 { (s.1, s.2) } else { (s.2, s.1) });
-                self.chat_copy = selection.map_or_else(String::new, |(a, b)| chat_selected_text(screen, a, b));
-                draw_term(r, t, screen, Rect { y: origin, ..grid }, sec.y, cell_w, term_focus, selection);
-                r.set_clip(None);
-            }
-            None => {
-                let note = match task.state.as_str() {
-                    "queued" => "Queued · starts when a slot frees up".to_string(),
-                    "exited" => "Agent exited".into(),
-                    "dead" => "Agent died with the daemon (no output recorded)".into(),
-                    "failed" => "Agent failed to start".into(),
-                    _ => "Connecting…".into(),
-                };
-                r.text(grid.x, grid.y, &note, MONO, TERM_SIZE, 400, t.text3, grid.w);
-            }
-        }
-        // Learn the agent's box height from the live screen; the next frame resizes to hide it.
-        // Exactly the box: more and a full-screen agent's top rows (your message) fall off the
-        // pane. Not the blank rows above it either, which come and go as text streams; resizing
-        // each time made the agent redraw (stutter).
-        if let (Some(b), Some(s)) = (box_rows.filter(|&b| b <= 16), self.session.as_mut().filter(|s| s.task == (task.machine, task.id))) {
-            s.extra = b;
-        }
+        if self.hit_as(r, sec, Cursor::Text) && !self.click.is_some_and(|p| ib.contains(p)) { self.actions.push(Action::Focus(Focus::Term)); }
+        let bar_h = if task.need.is_some() || self.chat_error.is_some() { 48.0 } else { 0.0 };
+        let grid = Rect::new(sec.x + 16.0, sec.y + 12.0, (sec.w - 32.0).max(24.0), (sec.h - 24.0 - grow - bar_h).max(0.0));
+        self.draw_chat(r, t, grid, &task);
+        if let Some(error) = &self.chat_error { r.text(grid.x, sec.y + sec.h - grow - 35.0, error, UI, 12.0, 400, t.del, grid.w); }
         if let Some(need) = &task.need {
-            let bar = Rect::new(sec.x + 16.0, sec.y + sec.h - 16.0 - 38.0 - if ended { 0.0 } else { grow }, sec.w - 32.0, 38.0);
+            let bar = Rect::new(sec.x + 16.0, sec.y + sec.h - 16.0 - 38.0 - grow, sec.w - 32.0, 38.0);
             self.draw_need(r, t, bar, &task, need, color, tint);
         }
-        if !ended {
+        {
             r.rect(Rect::new(area.x, ib.y - 9.0, area.w, input_area.y + input_area.h - ib.y + 9.0), 0.0, t.bg);
             r.rect(Rect::new(area.x, ib.y - 9.0, area.w, 1.0), 0.0, t.border);
             let focused = self.focus == Focus::Message;
             r.frame(ib, 4.0, t.panel, if focused { t.work } else { t.border2 });
-            let ib_hit = self.hit_as(r, ib, Cursor::Text); // before the chip, so the chip is on top
+            let ib_hit = self.hit_as(r, ib, Cursor::Text);
             let row = |i: usize| Rect::new(ib.x, ib.y + i as f32 * MSG_LINE_H, ib.w, 32.0);
             r.text(ib.x + 10.0, r.center(row(0), MONO, 12.5), "›", MONO, 12.5, 400, t.text3, 20.0);
-            // The agent's mode (read from its hidden footer); click or ⇧Tab cycles it.
-            if let (Some(label), Some(cw)) = (&chip_label, chip_w) {
-                let last = row(shown - 1);
-                let chip = Rect::new(ib.x + ib.w - 34.0 - cw, last.y + 6.0, cw, 20.0);
-                r.rect(chip, 3.0, t.raised);
-                let lw = r.text(chip.x + 8.0, r.center(chip, MONO, 10.5), label, MONO, 10.5, 400, t.text2, cw);
-                r.text(chip.x + 16.0 + lw, r.center(chip, UI, 10.0), "⇧Tab", UI, 10.0, 400, t.text3, 40.0);
-                if self.hit(r, chip) {
-                    self.actions.push(Action::Input(b"\x1b[Z".to_vec()));
-                }
-            }
             if self.message.is_empty() && !focused {
                 let host = &self.hosts[task.machine];
                 let on = host.cfg.as_ref().map(|_| format!(" on {}", host.name())).unwrap_or_default();
@@ -2721,7 +2420,7 @@ impl App {
                     .iter()
                     .enumerate()
                     .take(4)
-                    .map(|(i, o)| (o.clone(), (i + 1).to_string(), Action::Input((i + 1).to_string().into_bytes())))
+                    .map(|(i, o)| (o.clone(), (i + 1).to_string(), Action::ReplyQuestion(o.clone())))
                     .collect();
                 ("ASKS", text.clone(), buttons)
             }
@@ -2748,7 +2447,7 @@ impl App {
             bx -= 6.0;
         }
         if !task.asking && matches!(need, Event::PermissionRequest { .. }) {
-            let note = "answer in the agent's terminal";
+            let note = "permission request is no longer pending";
             let nw = r.measure(UI, 11.0, 400, note);
             bx -= nw;
             r.text(bx, r.center(bar, UI, 11.0), note, UI, 11.0, 400, t.text3, nw + 2.0);
@@ -3264,62 +2963,6 @@ fn unix_secs() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }
 
-/// The last terminal size recorded in a task log (the daemon writes `ESC [8;rows;cols t` on resize).
-fn last_size(log: &[u8]) -> Option<(u16, u16)> {
-    let at = log.windows(4).rposition(|w| w == b"\x1b[8;")?;
-    let rest = &log[at + 4..];
-    let end = rest.iter().take(12).position(|&b| b == b't')?;
-    let (rows, cols) = std::str::from_utf8(&rest[..end]).ok()?.split_once(';')?;
-    Some((cols.parse().ok()?, rows.parse().ok()?))
-}
-
-/// The agent's own input box at the bottom of its screen, which ours replaces. Returns the box's
-/// first row and the mode its footer shows ("" if none). None when the screen is scrolled back or
-/// shows something else there (a menu, a dialog), so those stay on screen.
-fn agent_box(screen: &Screen, kind: &str) -> Option<(usize, String)> {
-    let grid = screen.grid();
-    if grid.display_offset() != 0 {
-        return None;
-    }
-    let rows: Vec<String> = (0..grid.screen_lines())
-        .map(|row| (0..grid.columns()).map(|c| grid[Line(row as i32)][Column(c)].c).collect::<String>().trim_end().to_string())
-        .collect();
-    if kind == "codex" {
-        // `› draft`, a blank row, then `model effort · cwd … Plan mode` and a hints row. Menus use `› 1. …`.
-        let top = rows.iter().rposition(|r| r.starts_with("› "))?;
-        let numbered = rows[top][4..].split_once('.').is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
-        let below: Vec<&String> = rows[top + 1..].iter().filter(|r| !r.is_empty()).collect();
-        if numbered || below.len() > 8 || !below.iter().any(|r| r.contains(" · ")) {
-            return None;
-        }
-        let plan = below.iter().any(|r| r.ends_with("Plan mode"));
-        return Some((top, if plan { "plan mode".into() } else { String::new() }));
-    }
-    let rule = |s: &String| s.trim().chars().count() >= 20 && s.trim().chars().all(|c| c == '─');
-    let lower = rows.iter().rposition(rule)?;
-    let upper = rows[..lower].iter().rposition(rule)?;
-    if lower - upper > 12 || rows[lower + 1..].iter().filter(|r| !r.is_empty()).count() > 4 {
-        return None;
-    }
-    if kind == "pi" {
-        // Input between two rules; the footer's last row ends with the model and thinking level.
-        let last = rows[lower + 1..].iter().rfind(|r| !r.is_empty());
-        let mode = last.and_then(|r| r.trim().rsplit("  ").next()).filter(|m| *m != "unknown").unwrap_or("");
-        return Some((upper, mode.trim().to_string()));
-    }
-    // Claude Code: `❯ draft` between two rules; footer "-- INSERT --  ⏵⏵ auto mode on (shift+tab to cycle) · …"
-    if !rows[upper + 1].trim_start().starts_with(['❯', '>']) {
-        return None;
-    }
-    let mode = rows[lower + 1..]
-        .iter()
-        .find_map(|r| r.find("(shift+tab to cycle)").map(|i| r[..i].rsplit("--").next().unwrap_or("").trim_matches(|c: char| !c.is_alphanumeric()).to_string()))
-        .unwrap_or_default();
-    Some((upper, mode))
-}
-
-/// The arranger mark ("Ensemble"): arcs of players around an amber conductor, from the logo's SVG.
-/// `size` is the mark's box; below 24 px it uses the solid two-arc variant, above it the dotted one.
 fn logo(r: &mut Renderer, x: f32, y: f32, size: f32, ink: Rgba, amber: Rgba) {
     if size < 24.0 {
         r.path(1, "M5 45A27 27 0 0 1 59 45M19 45A13 13 0 0 1 45 45", Some(7.0), x, y, size, ink);
@@ -3339,135 +2982,10 @@ fn logo(r: &mut Renderer, x: f32, y: f32, size: f32, ink: Rgba, amber: Rgba) {
     r.path(4, "M27.5 45a4.5 4.5 0 1 0 9 0a4.5 4.5 0 1 0 -9 0", None, x, y, size, amber);
 }
 
-/// Extract a half-open range, preserving terminal wraps and Unicode combining characters.
-fn chat_selected_text(screen: &Screen, a: (i32, usize), b: (i32, usize)) -> String {
-    let g = screen.grid();
-    let mut text = String::new();
-    let first = a.0.max(-(g.history_size() as i32));
-    let last = b.0.min(g.screen_lines() as i32 - 1);
-    for row in first..=last {
-        let line = &g[Line(row)];
-        let start = if row == a.0 { a.1 } else { 0 };
-        let end = if row == b.0 { b.1 } else { g.columns() }.min(g.columns());
-        let mut part = String::new();
-        for col in start..end {
-            let cell = &line[Column(col)];
-            if !cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::HIDDEN) {
-                part.push(cell.c);
-                part.extend(cell.zerowidth().into_iter().flatten());
-            }
-        }
-        let wrapped = end == g.columns() && line[Column(g.columns() - 1)].flags.contains(Flags::WRAPLINE);
-        text.push_str(if wrapped { &part } else { part.trim_end() });
-        if row < last && !wrapped { text.push('\n'); }
-    }
-    text
-}
-
-/// Anchor layout to live content, independent of which scrollback rows are visible.
-/// Recomputing this from the viewport makes blank lines move the entire chat while scrolling.
-fn chat_shift(screen: &Screen, rows: usize, height: f32) -> f32 {
-    let g = screen.grid();
-    let blank = |v: i32| (0..g.columns()).all(|c| g[Line(v)][Column(c)].c == ' ');
-    let last = (0..rows as i32).rev().find(|&v| !blank(v));
-    let mut shift = height - last.map_or(height, |l| (l + 1) as f32 * LINE_H);
-    let above = g.history_size() as i32;
-    if (shift / LINE_H).ceil() as i32 >= above {
-        let first = (-above..=last.unwrap_or(-1)).find(|&v| !blank(v)).unwrap_or(0);
-        shift = shift.min(-first as f32 * LINE_H);
-    }
-    shift
-}
-
-/// Draws the screen with its first row at `area.y`, and scrollback above that up to `top`.
-fn draw_term(r: &mut Renderer, t: &Theme, screen: &Screen, area: Rect, top: f32, cell_w: f32, focused: bool, selection: Option<((i32, usize), (i32, usize))>) {
-    let grid = screen.grid();
-    let mode = screen.mode();
-    let (asc, desc) = r.vmetrics(MONO, TERM_SIZE);
-    let base = (LINE_H - (asc + desc)) / 2.0 + asc;
-    let offset = grid.display_offset() as i32;
-    let above = (((area.y - top) / LINE_H).ceil().max(0.0) as i32).min(grid.history_size() as i32 - offset);
-    for row in -above..grid.screen_lines() as i32 {
-        let line = &grid[Line(row - offset)];
-        let y = area.y + row as f32 * LINE_H;
-        for col in 0..grid.columns() {
-            let cell = &line[Column(col)];
-            if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
-                continue;
-            }
-            let mut fg = term_color(t, cell.fg, true).unwrap_or(t.tc);
-            let mut bg = term_color(t, cell.bg, false);
-            if cell.flags.contains(Flags::INVERSE) {
-                (fg, bg) = (bg.unwrap_or(t.term), Some(fg));
-            }
-            fg = readable(fg, bg.unwrap_or(t.term));
-            if cell.flags.contains(Flags::DIM) {
-                fg = alpha(fg, 150);
-            }
-            let x = area.x + col as f32 * cell_w;
-            let width = if cell.flags.contains(Flags::WIDE_CHAR) { cell_w * 2.0 } else { cell_w };
-            if let Some(bg) = bg {
-                r.rect(Rect::new(x, y, width, LINE_H), 0.0, bg);
-            }
-            if selection.is_some_and(|(a, b)| a <= (row - offset, col) && (row - offset, col) < b) {
-                r.rect(Rect::new(x, y, width, LINE_H), 0.0, alpha(t.work, 90));
-            }
-            if cell.c != ' ' && !cell.flags.contains(Flags::HIDDEN) {
-                let weight = if cell.flags.contains(Flags::BOLD) { 600 } else { 400 };
-                r.glyph_char(MONO, cell.c, x, y + base, TERM_SIZE, weight, fg);
-            }
-            if cell.flags.intersects(Flags::ALL_UNDERLINES) {
-                r.rect(Rect::new(x, y + base + 2.0, width, 1.0), 0.0, fg);
-            }
-        }
-    }
-    if mode.contains(TermMode::SHOW_CURSOR) && offset == 0 {
-        let p = grid.cursor.point;
-        let cur = Rect::new(area.x + p.column.0 as f32 * cell_w, area.y + p.line.0 as f32 * LINE_H, cell_w, LINE_H);
-        if focused {
-            r.rect(cur, 0.0, alpha(t.text, 120));
-        } else {
-            let c = alpha(t.text, 120);
-            for side in [
-                Rect::new(cur.x, cur.y, cur.w, 1.0),
-                Rect::new(cur.x, cur.y + cur.h - 1.0, cur.w, 1.0),
-                Rect::new(cur.x, cur.y, 1.0, cur.h),
-                Rect::new(cur.x + cur.w - 1.0, cur.y, 1.0, cur.h),
-            ] {
-                r.rect(side, 0.0, c);
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn chat_selection_copies_ranges_and_wraps() {
-        let mut screen = Screen::new(8, 4);
-        screen.feed("hello world\r\n你好 e\u{301}".as_bytes());
-        assert_eq!(chat_selected_text(&screen, (0, 1), (0, 4)), "ell");
-        assert_eq!(chat_selected_text(&screen, (0, 0), (1, 3)), "hello world");
-        assert_eq!(chat_selected_text(&screen, (1, 0), (2, 6)), "rld\n你好 e\u{301}");
-        assert_eq!(chat_selected_text(&screen, (0, 2), (0, 2)), "");
-    }
-
-    #[test]
-    fn chat_anchor_stays_fixed_while_scrolling_across_blank_lines() {
-        let mut screen = Screen::new(40, 8);
-        for i in 0..30 {
-            screen.feed(format!("line {i}\r\n\r\n").as_bytes());
-        }
-        let shift = chat_shift(&screen, 8, 8.0 * LINE_H);
-        for _ in 0..screen.grid().history_size() {
-            screen.scroll(1);
-            assert_eq!(chat_shift(&screen, 8, 8.0 * LINE_H), shift);
-        }
-        screen.scroll(-i32::MAX);
-        assert_eq!(chat_shift(&screen, 8, 8.0 * LINE_H), shift);
-    }
 
     #[test]
     fn caret_moves_and_maps_to_wrapped_lines() {
@@ -3509,30 +3027,6 @@ mod tests {
     fn markdown_runs() {
         assert_eq!(review::plain("## Fixed **the** `bug` in [docs](http://x) _now_"), "Fixed the bug in docs now");
         assert_eq!(review::plain("- snake_case stays"), "snake_case stays");
-    }
-
-    #[test]
-    fn finds_claude_input_box_and_mode() {
-        let rule = "─".repeat(40);
-        let mut s = Screen::new(60, 8);
-        s.feed(format!("chat\r\n\r\n{rule}\r\n❯ draft\r\n{rule}\r\n-- INSERT --  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents").as_bytes());
-        assert_eq!(agent_box(&s, "claude"), Some((2, "auto mode on".to_string())));
-
-        let mut menu = Screen::new(60, 8);
-        menu.feed(format!("{rule}\r\nAccessing workspace:\r\n❯ 1. Yes\r\n{rule}\r\n").as_bytes());
-        assert_eq!(agent_box(&menu, "claude"), None);
-
-        let mut codex = Screen::new(80, 8);
-        codex.feed("  >_ OpenAI Codex\r\n\r\n› fix it\r\n\r\n  GPT medium · ~/repo     Plan mode\r\n  ? for shortcuts".as_bytes());
-        assert_eq!(agent_box(&codex, "codex"), Some((2, "plan mode".to_string())));
-        let mut trust = Screen::new(80, 8);
-        trust.feed("  Trust this folder?\r\n\r\n› 1. Trust and continue\r\n  2. Quit\r\n\r\n  enter continue · esc quit".as_bytes());
-        assert_eq!(agent_box(&trust, "codex"), None);
-
-        let mut pi = Screen::new(60, 8);
-        pi.feed(format!("chat\r\n{rule}\r\ndraft\r\n{rule}\r\n~/repo\r\n0.0%/0 (auto)        sonnet • high").as_bytes());
-        assert_eq!(agent_box(&pi, "pi"), Some((1, "sonnet • high".to_string())));
-        assert_eq!(last_size(b"x\x1b[8;24;80tyy\x1b[8;62;236tzz"), Some((236, 62)));
     }
 
     #[test]
