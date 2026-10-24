@@ -90,6 +90,8 @@ pub enum Tag {
     Note,
     Discard,
     Message,
+    /// Deleting a task from vim's `d`.
+    Delete,
 }
 
 fn key(path: &str, header: &str) -> String {
@@ -259,7 +261,7 @@ impl App {
             return;
         }
         let Some(rv) = &mut self.review else {
-            if let (Tag::Message, Err(e)) = (tag, reply) {
+            if let (Tag::Message | Tag::Delete, Err(e)) = (tag, reply) {
                 eprintln!("arranger: {e}");
             }
             return;
