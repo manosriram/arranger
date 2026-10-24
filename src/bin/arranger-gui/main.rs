@@ -1373,9 +1373,12 @@ impl App {
         } else if self.review.is_none() && !self.welcome {
             let id = self.selected;
             if let Some(s) = self.session.as_ref().filter(|s| Some(s.task) == id && s.screen.mode().contains(TermMode::ALT_SCREEN)) {
-                // A full-screen agent scrolls itself, a few lines per tick: one tick per three lines
-                // moved, as a wheel notch would, or it races.
-                self.ticks += dy / (3.0 * LINE_H);
+                // Mouse-aware agents move several lines per wheel report; arrow-key fallback
+                // moves only one line, so it must receive one key per line of movement.
+                let lines_per_tick = if s.screen.mode().intersects(
+                    TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
+                ) { 3.0 } else { 1.0 };
+                self.ticks += dy / (lines_per_tick * LINE_H);
                 let n = self.ticks.trunc();
                 self.ticks -= n;
                 if let Some(bytes) = self.wheel_bytes(&s.screen, n as i32).filter(|_| n != 0.0) {
