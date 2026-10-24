@@ -57,6 +57,10 @@ fn task_lifecycle() {
     let repo = home.0.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
+    // The daemon commits in a worktree without the helper's `git -c` flags.
+    // Keep its identity in the repo so this also works on clean CI runners.
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "user.email", "t@t"]);
     std::fs::write(repo.join("README"), "hi\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-q", "-m", "init"]);
