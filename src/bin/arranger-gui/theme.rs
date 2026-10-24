@@ -319,6 +319,20 @@ pub const THEMES: [&Theme; 8] = [&GRAPHITE, &MIDNIGHT, &MOSS, &EMBER, &PAPER, &L
 
 pub const AGENTS: [&str; 4] = ["claude", "codex", "pi", "gemini"];
 
+/// Models the new-task dialog offers per agent: (label, `--model` value); "default" passes none.
+pub fn models(agent: &str) -> &'static [(&'static str, &'static str)] {
+    match agent {
+        "claude" => &[
+            ("default", ""),
+            ("opus 5.5", "claude-opus-5-5"),
+            ("sonnet 5.5", "claude-sonnet-5-5"),
+            ("haiku 5.5", "claude-haiku-5-5"),
+            ("fable 5.1", "claude-fable-5-1"),
+        ],
+        _ => &[("default", "")], // ponytail: list other agents' models once someone wants them
+    }
+}
+
 pub fn accent(agent: &str) -> Rgba {
     match agent {
         "claude" => hex(0xF0875A),

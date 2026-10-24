@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use review::{ReviewAction, ReviewView, Tag};
-use theme::{AGENTS, Rgba, THEMES, Theme, accent, accent_deep, alpha, blend, readable};
+use theme::{AGENTS, Rgba, THEMES, Theme, accent, accent_deep, alpha, blend, models, readable};
 #[cfg(test)]
 use theme::{GRAPHITE, PAPER};
 use winit::application::ApplicationHandler;
@@ -150,6 +150,8 @@ enum Focus {
 struct Dialog {
     prompt: String,
     agent: usize,
+    /// Index into the agent's `models`; 0 is its default.
+    model: usize,
     host: usize,
     /// Repo on the chosen machine.
     repo: String,
@@ -179,6 +181,7 @@ enum Action {
     Answer(bool),
     Input(Vec<u8>),
     PickAgent(usize),
+    PickModel(usize),
     Start(bool),
     CloseDialog,
     OpenReview,
@@ -1211,7 +1214,7 @@ impl App {
     fn open_dialog(&mut self) {
         // Starts on the selected task's machine.
         let host = self.current().map_or(0, |t| t.machine);
-        self.dialog = Some(Dialog { prompt: String::new(), agent: 0, host: 0, repo: String::new(), base: String::new(), branches: Vec::new(), list: None, error: String::new() });
+        self.dialog = Some(Dialog { prompt: String::new(), agent: 0, model: 0, host: 0, repo: String::new(), base: String::new(), branches: Vec::new(), list: None, error: String::new() });
         self.pick_host(host);
         self.focus = Focus::Prompt;
         self.select_all = false;
@@ -1261,6 +1264,7 @@ impl App {
             repo: d.repo.trim().into(),
             base: Some(d.base.trim().to_string()).filter(|b| !b.is_empty()),
             prompt: Some(d.prompt.trim().to_string()).filter(|p| !p.is_empty()),
+            model: Some(models(AGENTS[d.agent])[d.model].1.to_string()).filter(|m| !m.is_empty()),
         };
         match request_at(sock.as_deref(), &req) {
             Ok(Reply::Created { id, .. }) => {
@@ -1341,7 +1345,7 @@ impl App {
             return;
         }
         if self.dialog.is_some() && ev.logical_key == Key::Named(NamedKey::Tab) {
-            self.actions.push(Action::PickAgent(usize::MAX));
+            self.actions.push(if m.shift_key() { Action::PickModel(usize::MAX) } else { Action::PickAgent(usize::MAX) });
             return;
         }
         // Vim: Esc twice quickly is the agent's own Esc (stop Claude), while it's on screen.
@@ -1593,7 +1597,15 @@ impl App {
                 Action::Input(bytes) => self.send_input(bytes),
                 Action::PickAgent(i) => {
                     if let Some(d) = &mut self.dialog {
-                        d.agent = if i == usize::MAX { (d.agent + 1) % AGENTS.len() } else { i };
+                        let agent = if i == usize::MAX { (d.agent + 1) % AGENTS.len() } else { i };
+                        if agent != d.agent {
+                            (d.agent, d.model) = (agent, 0); // models are per agent
+                        }
+                    }
+                }
+                Action::PickModel(i) => {
+                    if let Some(d) = &mut self.dialog {
+                        d.model = if i == usize::MAX { (d.model + 1) % models(AGENTS[d.agent]).len() } else { i };
                     }
                 }
                 Action::Start(attach) => self.start(attach),
@@ -2354,7 +2366,7 @@ impl App {
 
     fn draw_dialog(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
         let Some(d) = &self.dialog else { return };
-        let (prompt, agent_i, base, error) = (d.prompt.clone(), d.agent, d.base.clone(), d.error.clone());
+        let (prompt, agent_i, model_i, base, error) = (d.prompt.clone(), d.agent, d.model, d.base.clone(), d.error.clone());
         let (branches, list) = (d.branches.clone(), d.list);
         // A click on the open branch list is the list's alone, whatever lies under it.
         let list_click = self.click.filter(|p| list.is_some_and(|l| l.contains(*p)));
@@ -2374,7 +2386,7 @@ impl App {
         let dx = (w - dw) / 2.0;
         let prompt_lines = wrap(r, &prompt, UI, 18.0, dw - 36.0);
         let text_h = (prompt_lines.len().max(3) as f32) * 27.0;
-        let dh = 2.0 + 34.0 + 12.0 + text_h + 16.0 + 78.0 + host_row + 58.0;
+        let dh = 2.0 + 34.0 + 12.0 + text_h + 16.0 + 78.0 + 78.0 + host_row + 58.0;
         let dlg = Rect::new(dx, 88.0, dw, dh);
         r.rect(Rect::new(dlg.x - 1.0, dlg.y - 1.0, dlg.w + 2.0, dlg.h + 2.0), 9.0, alpha(a, 0x33));
         r.frame(dlg, 8.0, t.dialog, t.border2);
@@ -2393,11 +2405,12 @@ impl App {
         if self.hit(r, esc) {
             self.actions.push(Action::CloseDialog);
         }
-        let pw = r.measure(MONO, 11.0, 400, agent) + 21.0;
+        let pill_label = if model_i == 0 { agent.to_string() } else { format!("{agent} · {}", models(agent)[model_i].0) };
+        let pw = r.measure(MONO, 11.0, 400, &pill_label) + 21.0;
         let pill = Rect::new(esc.x - 8.0 - pw, head.y, pw, 20.0);
         r.rect(pill, 3.0, alpha(a, 0x1A));
         r.rect(Rect::new(pill.x + 7.0, pill.y + 7.0, 6.0, 6.0), 1.0, a);
-        r.text(pill.x + 17.0, r.center(pill, MONO, 11.0), agent, MONO, 11.0, 400, a, pw);
+        r.text(pill.x + 17.0, r.center(pill, MONO, 11.0), &pill_label, MONO, 11.0, 400, a, pw);
 
         // Prompt.
         let ty = hy + 20.0 + 14.0;
@@ -2472,9 +2485,30 @@ impl App {
         r.frame(chip, 3.0, t.dialog, t.border2);
         r.text(chip.x + 5.0, r.center(chip, UI, 10.0), "auto", UI, 10.0, 400, t.text3, 30.0);
 
+        // Model, from the chosen agent's list.
+        let oy = gy + 78.0;
+        r.rect(Rect::new(dlg.x + 1.0, oy, dlg.w - 2.0, 1.0), 0.0, t.border);
+        let lw = r.text(dlg.x + 18.0, oy + 14.0, "Model", UI, 11.0, 400, t.text3, 100.0);
+        r.text(dlg.x + 22.0 + lw, oy + 14.0, &format!("· {agent}"), UI, 11.0, 400, t.faint, 100.0);
+        let mut mx = dlg.x + 18.0;
+        for (i, (label, _)) in models(agent).iter().enumerate() {
+            let on = i == model_i;
+            let bw = r.measure(MONO, 12.0, 400, label) + 20.0;
+            let b = Rect::new(mx, oy + 36.0, bw, 28.0);
+            r.frame(b, 4.0, t.dialog, if on { a } else { t.border2 });
+            if on {
+                r.rect(b.inset(1.0), 3.0, alpha(a, 0x1F));
+            }
+            r.text(b.x + 10.0, r.center(b, MONO, 12.0), label, MONO, 12.0, 400, if on { a } else { t.tc }, bw);
+            if self.hit(r, b) {
+                self.actions.push(Action::PickModel(i));
+            }
+            mx += bw + 4.0;
+        }
+
         // Machine | Repo.
         if host_row > 0.0 {
-            let my = gy + 78.0;
+            let my = gy + 156.0;
             r.rect(Rect::new(dlg.x + 1.0, my, dlg.w - 2.0, 1.0), 0.0, t.border);
             r.rect(Rect::new(dlg.x + dlg.w / 2.0, my, 1.0, 78.0), 0.0, t.border);
             r.text(dlg.x + 18.0, my + 14.0, "Machine", UI, 11.0, 400, t.text3, 100.0);
@@ -2506,7 +2540,7 @@ impl App {
         }
 
         // Footer.
-        let fy = gy + 78.0 + host_row;
+        let fy = gy + 156.0 + host_row;
         let foot = Rect::new(dlg.x + 1.0, fy, dlg.w - 2.0, dlg.y + dlg.h - fy - 1.0);
         r.rect(Rect::new(dlg.x + 1.0, fy, dlg.w - 2.0, 1.0), 0.0, t.border);
         r.rect(Rect::new(foot.x, foot.y + 1.0, foot.w, foot.h - 1.0), 7.0, t.panel);
