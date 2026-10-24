@@ -2570,7 +2570,12 @@ impl App {
             Some(screen) => {
                 // Stop above the agent's own input box: ours below replaces it.
                 let found = agent_box(screen, kind).map(|(row, _)| row);
-                box_rows = found.map(|row| (screen.grid().screen_lines() - row) as u16);
+                // Down to its last text, not the screen bottom: codex draws inline, so the blank rows
+                // below its box grow with the pty, and counting them grew the pty again each frame
+                // (45→49→53→57→53 rows), until codex panicked on the shrink.
+                let g = screen.grid();
+                let text = |v: usize| (0..g.columns()).any(|c| g[Line(v as i32)][Column(c)].c != ' ');
+                box_rows = found.map(|row| ((row..g.screen_lines()).rfind(|&v| text(v)).unwrap_or(row) + 1 - row) as u16);
                 // Scrolled back, the box can't be found, but it's still the bottom `extra` rows:
                 // keep them out, or the chat jumps by the box's height as scrolling starts.
                 let scrolled = screen.grid().display_offset() > 0;
