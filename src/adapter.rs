@@ -56,6 +56,9 @@ pub fn launch(agent: &str, prompt: &str, model: &str, resume: Option<&str>, exe:
                 "Stop": h(30), "StopFailure": h(10),
             }});
             argv.extend(["--settings".into(), settings.to_string()]);
+            // Its fullscreen mode draws on the alternate screen, which keeps no scrollback, so the
+            // PTY log replays as just the last frame once the task stops. Inline keeps the chat.
+            env.push(("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN".into(), "1".into()));
         }
         "codex" => {
             argv.push("--dangerously-bypass-hook-trust".into());
@@ -390,8 +393,9 @@ mod tests {
         let (exe, data) = (Path::new("/bin/arranger"), Path::new("/tmp"));
         let (argv, _) = launch("claude", "hi", "claude-sonnet-5-5", None, exe, data).unwrap();
         assert_eq!(argv[argv.len() - 4..], ["--model", "claude-sonnet-5-5", "--", "hi"]);
-        let (argv, _) = launch("claude", "", "", None, exe, data).unwrap();
+        let (argv, env) = launch("claude", "", "", None, exe, data).unwrap();
         assert!(!argv.contains(&"--model".to_string()));
+        assert!(env.iter().any(|(k, v)| k == "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN" && v == "1")); // replayable history
     }
 
     #[test]
