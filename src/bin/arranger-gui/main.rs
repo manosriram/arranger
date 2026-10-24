@@ -154,6 +154,8 @@ struct Dialog {
     /// Repo on the chosen machine.
     repo: String,
     base: String,
+    /// Which of `App::prompts` ↑/↓ put in the prompt box.
+    hist: Option<usize>,
     /// Local branches, most recent first; empty on other machines, where the base is typed.
     branches: Vec<String>,
     /// The branch list is open, and where it was drawn last frame.
@@ -228,6 +230,8 @@ struct App {
     pending_g: bool,
     /// When Esc was last pressed in vim mode: a second one soon after goes to the agent.
     last_esc: Option<Instant>,
+    /// New-task prompts, oldest first (saved in gui.json), for ↑ in the dialog.
+    prompts: Vec<String>,
     /// The Overview table is showing, filtered to one state group (None: all).
     overview: bool,
     ov_group: Option<usize>,
@@ -307,6 +311,7 @@ fn run() -> io::Result<()> {
         help: false,
         pending_g: false,
         last_esc: None,
+        prompts: Vec::new(),
         overview: false,
         ov_group: None,
         ov_host: None,
@@ -340,6 +345,7 @@ fn run() -> io::Result<()> {
     let settings = Settings::load();
     app.theme = THEMES.iter().position(|t| t.name == settings.theme).unwrap_or(0);
     app.vim = settings.vim;
+    app.prompts = settings.prompts;
     app.focus = app.rest();
     app.link_host(None);
     for m in machine::load() {
@@ -350,9 +356,12 @@ fn run() -> io::Result<()> {
 
 /// Window preferences, kept in <data>/gui.json.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 struct Settings {
     theme: String,
     vim: bool,
+    /// New-task prompts, oldest first, for ↑ in the dialog.
+    prompts: Vec<String>,
 }
 
 impl Settings {
@@ -1006,7 +1015,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        let s = Settings { theme: THEMES[self.theme].name.into(), vim: self.vim };
+        let s = Settings { theme: THEMES[self.theme].name.into(), vim: self.vim, prompts: self.prompts.clone() };
         let _ = std::fs::write(Settings::path(), serde_json::to_vec_pretty(&s).unwrap_or_default());
     }
 
@@ -1226,7 +1235,7 @@ impl App {
     fn open_dialog(&mut self) {
         // Starts on the selected task's machine.
         let host = self.current().map_or(0, |t| t.machine);
-        self.dialog = Some(Dialog { prompt: String::new(), agent: 0, host: 0, repo: String::new(), base: String::new(), branches: Vec::new(), list: None, error: String::new() });
+        self.dialog = Some(Dialog { prompt: String::new(), agent: 0, host: 0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new() });
         self.pick_host(host);
         self.focus = Focus::Prompt;
         self.select_all = false;
@@ -1279,8 +1288,15 @@ impl App {
         };
         match request_at(sock.as_deref(), &req) {
             Ok(Reply::Created { id, .. }) => {
+                let prompt = d.prompt.trim().to_string();
+                if !prompt.is_empty() && self.prompts.last() != Some(&prompt) {
+                    self.prompts.push(prompt);
+                    let over = self.prompts.len().saturating_sub(50);
+                    self.prompts.drain(..over);
+                    self.save_settings();
+                }
                 self.dialog = None;
-                self.focus = if attach { Focus::Term } else { Focus::Message };
+                self.focus = if attach { Focus::Term } else if self.vim { Focus::Normal } else { Focus::Message };
                 // Fetch the list now: the watch push may not have the new task yet, and selection
                 // would fall back to the first row.
                 if let Ok(Reply::Tasks(tasks)) = request_at(sock.as_deref(), &Request::List { files: false }) {
@@ -1420,6 +1436,24 @@ impl App {
         if linux_ctrl && ev.logical_key == Key::Character("a".into()) {
             self.select_all = true;
             return;
+        }
+        // ↑/↓ in an empty prompt box (or one showing a recalled prompt) step through earlier ones.
+        if let (Focus::Prompt, Key::Named(k @ (NamedKey::ArrowUp | NamedKey::ArrowDown)), Some(d)) = (focus, &ev.logical_key, &mut self.dialog) {
+            let browsing = d.hist.filter(|&i| self.prompts.get(i) == Some(&d.prompt));
+            if d.prompt.is_empty() || browsing.is_some() {
+                let n = self.prompts.len();
+                let next = match (browsing, *k == NamedKey::ArrowUp) {
+                    (None, true) => n.checked_sub(1),
+                    (Some(i), true) => Some(i.saturating_sub(1)),
+                    (Some(i), false) => Some(i + 1).filter(|&j| j < n),
+                    (None, false) => None,
+                };
+                d.hist = next;
+                d.prompt = next.map_or_else(String::new, |i| self.prompts[i].clone());
+                self.caret = Some((focus, d.prompt.len()));
+                self.select_all = false;
+                return;
+            }
         }
         let replace = std::mem::take(&mut self.select_all);
         let word = m.alt_key() || linux_ctrl;
@@ -2120,12 +2154,7 @@ impl App {
             Some(screen) => {
                 // Stop above the agent's own input box: ours below replaces it.
                 let found = agent_box(screen, kind).map(|(row, _)| row);
-                box_rows = found.map(|row| {
-                    // With the blank rows the agent leaves above its box (a couple at most).
-                    let g = screen.grid();
-                    let gap = (1..=2.min(row)).take_while(|k| (0..g.columns()).all(|c| g[Line((row - k) as i32)][Column(c)].c == ' ')).count();
-                    (g.screen_lines() - row + gap) as u16
-                });
+                box_rows = found.map(|row| (screen.grid().screen_lines() - row) as u16);
                 let rows = found.unwrap_or(screen.grid().screen_lines()) as f32;
                 // The last text sits on the pane's bottom, just above our input box, with scrollback
                 // filling the space above it. When everything fits, the first text sits at the top instead.
@@ -2154,11 +2183,12 @@ impl App {
                 r.text(grid.x, grid.y, &note, MONO, TERM_SIZE, 400, t.text3, grid.w);
             }
         }
-        // Learn the agent's box height from the live screen; the next frame resizes to hide it. Only
-        // ever grows: the blank rows above the box come and go as text streams, and resizing each
-        // time made the agent redraw (stutter). The last text stays in view either way.
+        // Learn the agent's box height from the live screen; the next frame resizes to hide it.
+        // Exactly the box: more and a full-screen agent's top rows (your message) fall off the
+        // pane. Not the blank rows above it either, which come and go as text streams; resizing
+        // each time made the agent redraw (stutter).
         if let (Some(b), Some(s)) = (box_rows.filter(|&b| b <= 16), self.session.as_mut().filter(|s| s.task == (task.machine, task.id))) {
-            s.extra = s.extra.max(b);
+            s.extra = b;
         }
         if let Some(need) = &task.need {
             let bar = Rect::new(sec.x + 16.0, sec.y + sec.h - 16.0 - 38.0, sec.w - 32.0, 38.0);
