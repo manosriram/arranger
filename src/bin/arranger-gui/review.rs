@@ -247,6 +247,15 @@ impl App {
             if let Some(c) = self.changes.get_mut(&key) {
                 c.1 = Some(has);
             }
+            match &reply {
+                Ok(Reply::Review(d)) => {
+                    let (added, removed) = d.files.iter().fold((0, 0), |(a, r), f| (a + f.added, r + f.removed));
+                    self.stats.insert(key, (d.base.clone(), d.files.len(), added, removed));
+                }
+                _ => {
+                    self.stats.remove(&key);
+                }
+            }
             return;
         }
         let Some(rv) = &mut self.review else {

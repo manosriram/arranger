@@ -50,7 +50,7 @@ use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 const TITLE_H: f32 = 36.0;
 const STATUS_H: f32 = 22.0;
 const SIDEBAR_W: f32 = 272.0;
-const HEADER_H: f32 = 40.0;
+const HEADER_H: f32 = 80.0;
 const ROW_H: f32 = 28.0;
 /// A row with its second line (what the agent is doing / did).
 const ROW2_H: f32 = 42.0;
@@ -299,6 +299,12 @@ struct App {
     dragging: Option<Divider>,
     caret_on: bool,
     blink_at: Instant,
+    /// Whether the window has focus: running icons only play while it does.
+    focused: bool,
+    /// The clock running icons play to.
+    epoch: Instant,
+    /// The selected task's diff at its last probe: base branch, files, lines added and removed.
+    stats: std::collections::HashMap<TaskKey, (String, usize, u32, u32)>,
 }
 
 fn main() {
@@ -375,6 +381,9 @@ fn run() -> io::Result<()> {
         dragging: None,
         caret_on: true,
         blink_at: Instant::now(),
+        focused: true,
+        epoch: Instant::now(),
+        stats: Default::default(),
     };
     let settings = Settings::load();
     app.theme = THEMES.iter().position(|t| t.name == settings.theme).unwrap_or(0);
@@ -477,12 +486,13 @@ impl ApplicationHandler<Msg> for App {
         }
     }
 
-    /// Wakes only to blink the caret while a text field has focus, to animate the Review button, or to
-    /// glide a wheel notch.
+    /// Wakes only to blink the caret while a text field has focus, to animate the Review button, to
+    /// glide a wheel notch, or to play running icons.
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let blink = (!matches!(self.focus, Focus::Term | Focus::Normal)).then_some(self.blink_at);
         let moving = self.glide != 0.0 || self.review.as_ref().is_some_and(|rv| rv.animating());
-        let frame = moving.then(|| Instant::now() + Duration::from_millis(if self.glide != 0.0 { 16 } else { 33 }));
+        let ms = if self.glide != 0.0 { 16 } else if moving { 33 } else { 80 };
+        let frame = (moving || self.sweep().is_some()).then(|| Instant::now() + Duration::from_millis(ms));
         match blink.into_iter().chain(frame).min() {
             Some(at) => el.set_control_flow(ControlFlow::WaitUntil(at)),
             None => el.set_control_flow(ControlFlow::Wait),
@@ -581,6 +591,10 @@ impl ApplicationHandler<Msg> for App {
                 self.redraw();
             }
             WindowEvent::ScaleFactorChanged { .. } => self.redraw(),
+            WindowEvent::Focused(on) => {
+                self.focused = on;
+                self.redraw();
+            }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 let dpi = self.scale() as f64;
@@ -909,6 +923,13 @@ impl App {
 
     fn current(&self) -> Option<&TaskInfo> {
         self.selected.and_then(|k| self.task(k))
+    }
+
+    /// Seconds on the running icons' clock, while one is on screen and the window has focus; None
+    /// draws them still.
+    fn sweep(&self) -> Option<f32> {
+        let shown = !self.welcome && self.review.is_none() && self.all_tasks().any(|t| group(&t.state) == 1);
+        (shown && self.focused).then(|| self.epoch.elapsed().as_secs_f32())
     }
 
     /// The selected task has a diff to review; true until its probe answers.
@@ -1937,7 +1958,11 @@ impl App {
         let home = std::env::var("HOME").unwrap_or_default();
         let repo = self.repo.display().to_string();
         let repo = repo.strip_prefix(&home).map_or(repo.clone(), |rest| format!("~{rest}"));
-        let rw = if self.welcome { 0.0 } else { r.text(x + 10.0, r.center(bar, MONO, 11.0), &repo, MONO, 11.0, 400, t.text3, 400.0) };
+        if !self.welcome {
+            r.text(x + 8.0, r.center(bar, UI, 13.0), "/", UI, 13.0, 400, t.faint, 20.0);
+        }
+        let x = x + 14.0;
+        let rw = if self.welcome { 0.0 } else { r.text(x + 10.0, r.center(bar, MONO, 11.0), &repo, MONO, 11.0, 400, t.text2, 400.0) };
         // The project path: click it to switch projects.
         if !self.welcome && self.hit(r, Rect::new(x + 4.0, 7.0, rw + 12.0, 22.0)) {
             self.actions.push(Action::Welcome);
@@ -1948,13 +1973,13 @@ impl App {
         let (review, overview) = (self.review.is_some(), self.overview && self.review.is_none());
         let tabs = [("Workspace", !review && !overview), ("Overview", overview), ("Review", review)];
         for (label, on) in tabs.into_iter().filter(|_| !self.welcome) {
-            let tw = r.measure(UI, 12.0, 400, label) + 16.0;
-            let tab = Rect::new(nx, 7.0, tw, 22.0);
+            let tw = r.measure(UI, 12.0, if on { 500 } else { 400 }, label) + 20.0;
+            let tab = Rect::new(nx, 0.0, tw, TITLE_H);
             if on {
-                r.rect(tab, 3.0, t.raised);
+                r.rect(Rect::new(tab.x + 10.0, TITLE_H - 2.0, tw - 20.0, 2.0), 0.0, t.text);
             }
             let off = label == "Review" && !on && !self.reviewable();
-            r.text(tab.x + 8.0, r.center(tab, UI, 12.0), label, UI, 12.0, 400, if on { t.text } else if off { alpha(t.text3, 90) } else { t.text3 }, tw);
+            r.text(tab.x + 10.0, r.center(tab, UI, 12.0), label, UI, 12.0, if on { 500 } else { 400 }, if on { t.text } else if off { alpha(t.text3, 90) } else { t.text2 }, tw);
             if self.hit(r, tab) && !on && !off {
                 self.actions.push(match label {
                     "Review" => Action::OpenReview,
@@ -1963,7 +1988,7 @@ impl App {
                     _ => Action::Overview(false),
                 });
             }
-            nx += tw + 1.0;
+            nx += tw;
         }
 
         // Scheme menu button: [swatch] Graphite ˅
@@ -2034,9 +2059,8 @@ impl App {
                 None if sec.tasks.is_empty() => continue,
                 None => {
                     let head = Rect::new(6.0, y + 4.0, self.sidebar_w - 13.0, GROUP_H - 4.0);
-                    r.rect(Rect::new(12.0, head.y + head.h / 2.0 - 2.5, 5.0, 5.0), 1.0, t.needs);
-                    let lw = r.text(23.0, r.center(head, UI, 10.5), "NEEDS YOU", UI, 10.5, 500, t.text3, 150.0);
-                    r.text(29.0 + lw, r.center(head, MONO, 10.5), &sec.tasks.len().to_string(), MONO, 10.5, 400, t.text3, 40.0);
+                    let lw = r.text(14.0, r.center(head, UI, 10.5), "NEEDS YOU", UI, 10.5, 500, t.needs, 150.0);
+                    r.text(20.0 + lw, r.center(head, MONO, 10.5), &sec.tasks.len().to_string(), MONO, 10.5, 400, t.needs, 40.0);
                     if multi {
                         let note = "all machines";
                         let nw = r.measure(UI, 10.5, 400, note);
@@ -2163,7 +2187,7 @@ impl App {
         if on {
             r.frame(row, 3.0, bg, t.sel_ring);
         }
-        state_icon(r, t, &task.state, row.x + 8.0, top.y + top.h / 2.0, bg);
+        state_icon(r, t, &task.state, row.x + 8.0, top.y + top.h / 2.0, bg, self.sweep());
         let text_x = row.x + 28.0;
         let right_w = if let Some(name) = machine {
             let cw = r.measure(MONO, 10.0, 400, name) + 10.0;
@@ -2172,12 +2196,10 @@ impl App {
             r.text(chip.x + 5.0, r.center(chip, MONO, 10.0), name, MONO, 10.0, 400, t.text2, cw);
             cw
         } else {
-            // How long it's been idle once done, else how long it has existed.
-            let time = if g == 3 && task.since != 0 { ago(task.since) } else { age(task) };
-            let tw = r.measure(MONO, 10.5, 400, &time);
-            r.rect(Rect::new(row.x + row.w - 8.0 - tw - 11.0, top.y + top.h / 2.0 - 2.5, 5.0, 5.0), 1.0, accent(adapter::kind(&task.agent)));
-            r.text(row.x + row.w - 8.0 - tw, r.center(top, MONO, 10.5), &time, MONO, 10.5, 400, t.text3, tw + 2.0);
-            tw + 11.0
+            let kind = adapter::kind(&task.agent);
+            let kw = r.measure(MONO, 10.5, 400, kind);
+            r.text(row.x + row.w - 8.0 - kw, r.center(top, MONO, 10.5), kind, MONO, 10.5, 400, t.text3, kw + 2.0);
+            kw
         };
         let tc = if g == 4 { t.text3 } else if on { t.tc_on } else { t.tc };
         let room = row.w - 28.0 - right_w - 14.0;
@@ -2214,38 +2236,70 @@ impl App {
         let color = state_color(t, &task.state);
         let tint = alpha(color, if t.dark { 0x14 } else { 0x12 });
 
-        // Header.
+        // Header: why it's here, the title and Review; under them, the task's details.
         let head = Rect::new(area.x, area.y, area.w, HEADER_H);
         r.rect(Rect::new(area.x, area.y + HEADER_H - 1.0, area.w, 1.0), 0.0, t.border);
+        let top = Rect::new(area.x, area.y + 10.0, area.w, 28.0);
         let why = reason(&task);
         let pw = r.measure(UI, 11.0, 500, &why).min(260.0) + 23.0;
-        let pill = Rect::new(area.x + 16.0, area.y + 10.0, pw, 20.0);
+        let pill = Rect::new(area.x + 20.0, top.y + 4.0, pw, 20.0);
         r.rect(pill, 3.0, tint);
         r.rect(Rect::new(pill.x + 6.0, pill.y + 7.5, 5.0, 5.0), 1.0, color);
         r.text(pill.x + 16.0, r.center(pill, UI, 11.0), &why, UI, 11.0, 500, color, pw - 20.0);
         let kind = adapter::kind(&task.agent);
-        // Remote tasks name their machine and repo first.
         let host = &self.hosts[task.machine];
-        let place = host.cfg.as_ref().map(|_| format!("{} · ", host.name())).unwrap_or_default();
-        let meta = format!("· {}{} · {}", place, task.branch, age(&task));
-        let meta_w = r.measure(MONO, 11.0, 400, kind) + r.measure(MONO, 11.0, 400, &meta) + 4.0;
-        let review_label = "Review";
+        let review_label = "Review changes";
         let review_key = mod_label("R");
-        let bw = r.measure(UI, 12.0, 500, review_label) + r.measure(MONO, 10.5, 400, &review_key) + 28.0;
-        let review = Rect::new(head.x + head.w - 12.0 - bw, head.y + 7.0, bw, 26.0);
+        let bw = r.measure(UI, 12.0, 500, review_label) + r.measure(MONO, 10.5, 400, &review_key) + 30.0;
+        let review = Rect::new(head.x + head.w - 16.0 - bw, top.y, bw, 28.0);
         let can = self.reviewable();
         let (bg, fg) = if can { (t.primary_bg, t.primary_fg) } else { (t.raised, alpha(t.text3, 120)) };
-        r.rect(review, 3.0, bg);
-        let rlw = r.text(review.x + 10.0, r.center(review, UI, 12.0), review_label, UI, 12.0, 500, fg, bw);
+        r.rect(review, 4.0, bg);
+        let rlw = r.text(review.x + 12.0, r.center(review, UI, 12.0), review_label, UI, 12.0, 500, fg, bw);
         r.text(review.x + 18.0 + rlw, r.center(review, MONO, 10.5), &review_key, MONO, 10.5, 400, alpha(fg, 160), 60.0);
         if can && self.hit(r, review) {
             self.actions.push(Action::OpenReview);
         }
-        let tx = pill.x + pw + 6.0 + ship_badge(r, t, &task.shipped, pill.x + pw + 6.0, pill.y + pill.h / 2.0) + 4.0;
-        let title_w = r.text(tx, r.center(head, UI, 13.5), &title(&task), UI, 13.5, 500, t.text, (head.w - (tx - head.x) - meta_w - 26.0 - bw).max(40.0));
-        let mx = tx + title_w + 10.0;
-        let kw = r.text(mx, r.center(head, MONO, 11.0), kind, MONO, 11.0, 400, accent(kind), 100.0);
-        r.text(mx + kw + 4.0, r.center(head, MONO, 11.0), &meta, MONO, 11.0, 400, t.text3, meta_w);
+        let tx = pill.x + pw + 8.0 + ship_badge(r, t, &task.shipped, pill.x + pw + 8.0, pill.y + pill.h / 2.0) + 4.0;
+        r.text(tx, r.center(top, UI, 15.0), &title(&task), UI, 15.0, 600, t.text, (review.x - tx - 16.0).max(40.0));
+
+        // Details: label over value, as many as fit.
+        let stats = self.stats.get(&(task.machine, task.id)).filter(|_| self.changes.get(&(task.machine, task.id)).is_some_and(|c| c.1.is_some()));
+        let from = stats.map(|s| s.0.as_str()).filter(|b| !b.is_empty() && *b != "HEAD" && *b != task.branch);
+        let branch = match from {
+            Some(base) => format!("{} from {base}", task.branch),
+            None => task.branch.clone(),
+        };
+        let changes: Vec<(String, Rgba)> = match stats {
+            Some(&(_, 0, ..)) => vec![("none yet".into(), t.text3)],
+            Some(&(_, files, added, removed)) => vec![
+                (format!("+{added}"), t.add),
+                (format!(" −{removed}"), t.del),
+                (format!(" · {files} file{}", if files == 1 { "" } else { "s" }), t.text),
+            ],
+            None => vec![("—".into(), t.text3)],
+        };
+        let details: [(&str, Vec<(String, Rgba)>); 5] = [
+            ("Agent", vec![(kind.to_string(), accent(kind))]),
+            ("Branch", vec![(branch, t.text)]),
+            ("Machine", vec![(host.name().to_string(), t.text)]),
+            ("Changes", changes),
+            ("Elapsed", vec![(age(&task), t.text)]),
+        ];
+        let (ly, vy) = (area.y + 46.0, area.y + 60.0);
+        let mut dx = area.x + 20.0;
+        for (label, parts) in details {
+            let w = parts.iter().map(|(s, _)| r.measure(MONO, 11.5, 400, s)).sum::<f32>().max(r.measure(UI, 10.5, 400, label));
+            if dx + w > head.x + head.w - 16.0 {
+                break;
+            }
+            r.text(dx, ly, label, UI, 10.5, 400, t.text3, w + 2.0);
+            let mut px = dx;
+            for (s, c) in &parts {
+                px += r.text(px, vy, s, MONO, 11.5, 400, *c, w + 2.0);
+            }
+            dx += w + 32.0;
+        }
 
         // Message box at the bottom; once the agent has ended, a bar to bring it back instead.
         let ended = group(&task.state) == 4;
@@ -2860,12 +2914,14 @@ fn ship_badge(r: &mut Renderer, t: &Theme, shipped: &str, x: f32, cy: f32) -> f3
     w
 }
 
-fn state_icon(r: &mut Renderer, t: &Theme, state: &str, x: f32, cy: f32, bg: Rgba) {
+/// `sweep` is the running icon's clock in seconds (see `ensemble`); None draws it still.
+fn state_icon(r: &mut Renderer, t: &Theme, state: &str, x: f32, cy: f32, bg: Rgba, sweep: Option<f32>) {
     let c = state_color(t, state);
     match group(state) {
         0 => r.rect(Rect::new(x + 2.0, cy - 4.0, 8.0, 8.0), 1.0, c),
-        1 | 2 => {
-            let (rad, stroke) = if group(state) == 1 { (4.5, 1.6) } else { (4.0, 1.1) };
+        1 => ensemble(r, x - 3.0, cy - 5.3, c, sweep),
+        2 => {
+            let (rad, stroke) = (4.0, 1.1);
             r.rect(Rect::new(x + 6.0 - rad, cy - rad, rad * 2.0, rad * 2.0), rad, c);
             let inner = rad - stroke;
             r.rect(Rect::new(x + 6.0 - inner, cy - inner, inner * 2.0, inner * 2.0), inner, bg);
@@ -2876,6 +2932,24 @@ fn state_icon(r: &mut Renderer, t: &Theme, state: &str, x: f32, cy: f32, bg: Rgb
             r.glyph_char(UI, '✓', x, cy - 6.0 + a * 0.85, 12.0, 600, color);
         }
     }
+}
+
+/// The running icon: the logo's players as eight dots on two arcs around a lit centre, 18 px wide
+/// with its top at `y`. With a clock (`sweep`, seconds) the players light up left to right on a 1.6 s
+/// loop; without one they're all lit.
+fn ensemble(r: &mut Renderer, x: f32, y: f32, color: Rgba, sweep: Option<f32>) {
+    const PLAYERS: [(f32, f32); 8] = [(5.6, 32.0), (13.4, 13.4), (17.9, 32.0), (31.8, 5.6), (31.8, 17.9), (46.1, 32.0), (50.6, 13.4), (58.4, 32.0)];
+    let dot = |cx: f32, cy: f32, rad: f32| format!("M{} {cy}a{rad} {rad} 0 1 0 {} 0a{rad} {rad} 0 1 0 -{} 0", cx - rad, rad * 2.0, rad * 2.0);
+    for (i, &(cx, cy)) in PLAYERS.iter().enumerate() {
+        // Each dot's pulse starts 0.15 s after the one before: up over 0.48 s, down over 0.48 s, then rests.
+        let lit = sweep.map_or(1.0, |s| {
+            let k = (s - i as f32 * 0.15).rem_euclid(1.6) / 1.6;
+            let ease = |v: f32| v * v * (3.0 - 2.0 * v);
+            if k < 0.3 { ease(k / 0.3) } else if k < 0.6 { 1.0 - ease((k - 0.3) / 0.3) } else { 0.0 }
+        });
+        r.path(20 + i as u16, &dot(cx, cy, 4.7), None, x, y, 18.0, alpha(color, (64.0 + 191.0 * lit) as u8));
+    }
+    r.path(28, &dot(31.8, 32.0, 5.2), None, x, y, 18.0, color);
 }
 
 /// The last terminal size recorded in a task log (the daemon writes `ESC [8;rows;cols t` on resize).
