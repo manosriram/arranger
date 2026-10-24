@@ -1193,7 +1193,8 @@ impl App {
                 self.overview = false;
                 self.actions.push(Action::Focus(Focus::Term));
             }
-            "a" => self.actions.push(Action::Answer(true)),
+            "y" | "a" => self.actions.push(Action::Answer(true)),
+            "n" if !self.overview && self.review.is_none() && self.current().is_some_and(|t| t.asking && matches!(t.need, Some(Event::PermissionRequest { .. }))) => self.actions.push(Action::Answer(false)),
             "x" => self.actions.push(Action::Answer(false)),
             "d" if self.review.is_none() && !self.overview => self.confirm_delete = self.current().map(|t| (t.machine, t.id)),
             "r" => self.actions.push(Action::OpenReview),
@@ -2410,8 +2411,8 @@ impl App {
                 };
                 let buttons = if task.asking {
                     vec![
-                        ("Allow".into(), mod_label("1"), Action::Answer(true)),
-                        ("Deny".into(), mod_label("2"), Action::Answer(false)),
+                        ("Allow".into(), if self.vim { "y".into() } else { mod_label("1") }, Action::Answer(true)),
+                        ("Deny".into(), if self.vim { "n".into() } else { mod_label("2") }, Action::Answer(false)),
                     ]
                 } else {
                     Vec::new()

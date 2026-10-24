@@ -17,10 +17,10 @@
   },
   "act": {
     "o / ↵": "Open the agent's chat; from Overview, focus the message box",
-    "a": "Allow the permission request",
-    "x": "Deny the permission request",
+    "y / a": "Allow the permission request",
+    "n / x": "Deny the permission request (chat)",
     "r": "Review the diff",
-    "n": "New task",
+    "n": "New task (when no chat approval is pending)",
     "m": "Add machine (Workspace)"
   },
   "mode": {
