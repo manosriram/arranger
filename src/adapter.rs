@@ -85,11 +85,13 @@ pub fn launch(agent: &str, prompt: &str, model: &str, resume: bool, exe: &Path, 
     if !model.is_empty() {
         argv.extend(["--model".into(), model.into()]);
     }
+    // A prompt starting with `-` must not be read as a flag.
     if !prompt.is_empty() {
-        if kind(agent) == "gemini" {
-            argv.push("-i".into()); // gemini's positional prompt runs non-interactively
+        match kind(agent) {
+            "gemini" => argv.push(format!("--prompt-interactive={prompt}")), // its positional prompt runs non-interactively
+            "pi" => argv.push(prompt.into()), // ponytail: whether pi takes `--` is untested
+            _ => argv.extend(["--".into(), prompt.into()]),
         }
-        argv.push(prompt.into());
     }
     Ok((argv, env))
 }
@@ -378,9 +380,18 @@ mod tests {
     fn launch_model() {
         let (exe, data) = (Path::new("/bin/arranger"), Path::new("/tmp"));
         let (argv, _) = launch("claude", "hi", "claude-sonnet-5-5", false, exe, data).unwrap();
-        assert_eq!(argv[argv.len() - 3..], ["--model", "claude-sonnet-5-5", "hi"]);
+        assert_eq!(argv[argv.len() - 4..], ["--model", "claude-sonnet-5-5", "--", "hi"]);
         let (argv, _) = launch("claude", "", "", false, exe, data).unwrap();
         assert!(!argv.contains(&"--model".to_string()));
+    }
+
+    #[test]
+    fn dash_prompt_is_not_a_flag() {
+        let (exe, data) = (Path::new("/bin/arranger"), Path::new("/tmp"));
+        let (argv, _) = launch("codex", "- fix it", "", false, exe, data).unwrap();
+        assert_eq!(argv[argv.len() - 2..], ["--", "- fix it"]);
+        let (argv, _) = launch("claude", "-x", "", true, exe, data).unwrap();
+        assert_eq!(argv[argv.len() - 2..], ["--", "-x"]);
     }
 
     #[test]
