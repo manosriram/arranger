@@ -47,6 +47,8 @@ struct Task {
     action: String,
     /// Unix seconds when `activity`/`action` last changed.
     since: u64,
+    /// Prompts sent mid-turn that the agent is holding until it picks them up.
+    queued: usize,
 }
 
 /// What a running agent is up to, derived from its events.
@@ -412,7 +414,7 @@ impl Daemon {
                     Err(e) => Reply::Error(e),
                 }
             }
-            Request::Prompt { id, text } => match self.tasks.get(&id) {
+            Request::Prompt { id, text } => match self.tasks.get_mut(&id) {
                 Some(task) => {
                     let mut bytes = if task.screen.mode().contains(TermMode::BRACKETED_PASTE) {
                         format!("\x1b[200~{text}\x1b[201~").into_bytes()
@@ -421,6 +423,13 @@ impl Daemon {
                     };
                     bytes.push(b'\r');
                     write_pty(&task.pty.master, &bytes);
+                    // Busy agents hold the prompt until their turn ends.
+                    if task.activity == Activity::Running {
+                        task.queued += 1;
+                        task.action = queued_label(task.queued);
+                        task.since = now();
+                        self.dirty = true;
+                    }
                     self.resume(id);
                     Reply::Ok
                 }
@@ -630,6 +639,13 @@ impl Daemon {
             Event::ToolStart { .. } => (Activity::Running, event.describe()),
             Event::Prompt { .. } | Event::ToolEnd { .. } => (Activity::Running, "working".into()),
         };
+        match &event {
+            Event::Prompt { .. } => task.queued = task.queued.saturating_sub(1),
+            // Some agents fold queued prompts into the running turn without a prompt event.
+            Event::TurnDone => task.queued = 0,
+            _ => {}
+        }
+        let action = if activity == Activity::Running && task.queued > 0 { queued_label(task.queued) } else { action };
         task.need = (activity == Activity::NeedsYou).then(|| event.clone());
         if (task.activity, &task.action) != (activity, &action) {
             task.since = now();
@@ -822,6 +838,7 @@ impl Daemon {
             need: None,
             action: String::new(),
             since: now(),
+            queued: 0,
         };
         self.tasks.insert(id, task);
         self.set_state(id, "running");
@@ -1041,6 +1058,10 @@ impl Daemon {
         let _ = fs::remove_file(sock);
         let _ = fs::remove_file(self.data.join("daemon.pid"));
     }
+}
+
+fn queued_label(n: usize) -> String {
+    if n == 1 { "prompt queued".into() } else { format!("{n} prompts queued") }
 }
 
 #[cfg(test)]
