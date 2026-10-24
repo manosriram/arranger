@@ -3,6 +3,7 @@
 //! that triggered it. Redraws happen only on input or daemon pushes, so idle CPU is zero.
 
 mod overview;
+mod sound;
 mod render;
 mod review;
 mod theme;
@@ -1130,6 +1131,13 @@ impl App {
             t.machine = m;
         }
         if let Some(h) = self.hosts.get_mut(m).filter(|h| !h.removed) {
+            if tasks.iter().any(|task| {
+                h.tasks.iter().find(|old| old.id == task.id).is_some_and(|old| {
+                    sound::should_ding(&old.state, &task.state)
+                })
+            }) {
+                sound::ding();
+            }
             h.tasks = tasks;
         }
     }

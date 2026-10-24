@@ -43,6 +43,8 @@ That's it: it starts the daemon if needed and opens the window. Closing the wind
 
 On Linux use Ctrl+Shift in place of ⌘.
 
+A soft ding plays when an agent finishes or needs your help. On Linux, sound requires `paplay` (PulseAudio/PipeWire) or `aplay` (ALSA).
+
 Each task gets its own worktree on a new branch, `arranger/<id>`, made from the base branch you pick when you start it (the current branch by default). The base branch only changes when you merge into it from Review.
 
 If merging hits a conflict, `main` is left alone: the conflict lands in the agent's worktree, and Review offers to have the agent resolve it (or take one side) before merging again.
