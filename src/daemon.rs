@@ -1085,9 +1085,9 @@ impl Daemon {
     }
 }
 
-/// A lone Esc keypress (not the start of an escape sequence) or Ctrl-C.
+/// Esc, Vim's double Esc, or Ctrl-C (not the start of a terminal escape sequence).
 fn is_interrupt(bytes: &[u8]) -> bool {
-    bytes == b"\x1b" || bytes == b"\x03"
+    matches!(bytes, b"\x1b" | b"\x1b\x1b" | b"\x03")
 }
 
 fn queued_label(n: usize) -> String {
@@ -1111,8 +1111,10 @@ mod tests {
     #[test]
     fn interrupt_keys() {
         assert!(is_interrupt(b"\x1b"));
+        assert!(is_interrupt(b"\x1b\x1b"));
         assert!(is_interrupt(b"\x03"));
         assert!(!is_interrupt(b"\x1b[A"));
+        assert!(!is_interrupt(b"\x1b\x1b[A"));
         assert!(!is_interrupt(b"a"));
     }
 }

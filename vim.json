@@ -26,7 +26,7 @@
   "mode": {
     "i": "Message the selected agent (insert mode), from any view",
     "esc": "Normal mode, from anywhere; closes the open dialog",
-    "esc esc": "Send Esc to the agent (stops Claude)",
+    "esc esc": "Send both Esc presses to the agent to interrupt it",
     "?": "Show these keys"
   }
 }

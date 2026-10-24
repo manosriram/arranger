@@ -247,7 +247,7 @@ struct App {
     pending_g: bool,
     /// `d` was pressed on this task and waits for `y` (delete it) or `n`.
     confirm_delete: Option<TaskKey>,
-    /// When Esc was last pressed in vim mode: a second one soon after goes to the agent.
+    /// When Esc was last pressed in vim mode: a second one forwards both to the agent.
     last_esc: Option<Instant>,
     /// New-task prompts, oldest first (saved in gui.json), for ↑ in the dialog.
     prompts: Vec<String>,
@@ -1631,12 +1631,13 @@ impl App {
             self.actions.push(if m.shift_key() { Action::PickModel(usize::MAX) } else { Action::PickAgent(usize::MAX) });
             return;
         }
-        // Vim: Esc twice quickly is the agent's own Esc (stop Claude), while it's on screen.
+        // Forward both presses: an agent with its own Vim mode may consume the first Esc
+        // to leave insert mode and needs the second to interrupt its turn.
         if self.vim && ev.logical_key == Key::Named(NamedKey::Escape) && !ev.repeat {
             let double = self.last_esc.is_some_and(|at| at.elapsed() < Duration::from_millis(400));
             self.last_esc = (!double).then(Instant::now);
             if double && self.review.is_none() && !self.overview && self.dialog.is_none() && self.add_host.is_none() && self.session.is_some() {
-                self.send_input(b"\x1b".to_vec());
+                self.send_input(b"\x1b\x1b".to_vec());
                 self.focus = Focus::Normal;
                 return;
             }
