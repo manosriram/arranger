@@ -7,3 +7,6 @@ test:
 bench-mem:
     cargo build --release
     scripts/bench-mem.sh
+
+screenshot:
+    scripts/demo.sh

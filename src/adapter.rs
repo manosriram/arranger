@@ -382,4 +382,56 @@ mod tests {
         let (argv, _) = launch("claude", "", "", false, exe, data).unwrap();
         assert!(!argv.contains(&"--model".to_string()));
     }
+
+    #[test]
+    fn questions_stops_and_failures() {
+        let mut t = Totals::default();
+        let q = json!({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "tool_input": {"questions": [
+            {"question": "Which db?", "options": [{"label": "sqlite"}, {"label": "postgres"}]}]}});
+        assert_eq!(parse("claude", &q, &mut t).0, [Event::Question { text: "Which db?".into(), options: vec!["sqlite".into(), "postgres".into()] }]);
+        let n = json!({"hook_event_name": "Notification", "notification_type": "agent_needs_input", "message": "waiting"});
+        assert_eq!(parse("claude", &n, &mut t).0, [Event::Question { text: "waiting".into(), options: vec![] }]);
+        let n = json!({"hook_event_name": "Notification", "notification_type": "idle"});
+        assert!(parse("claude", &n, &mut t).0.is_empty());
+        let stop = json!({"hook_event_name": "Stop", "last_assistant_message": "Done."});
+        assert_eq!(parse("codex", &stop, &mut t), (vec![Event::Summary { text: "Done.".into() }, Event::TurnDone], false));
+        let fail = json!({"hook_event_name": "StopFailure", "error_type": "rate_limit"});
+        assert_eq!(parse("claude", &fail, &mut t).0, [Event::Error { message: "rate_limit".into() }]);
+        let end = json!({"hook_event_name": "PostToolUse", "tool_response": {"success": false}});
+        assert_eq!(parse("claude", &end, &mut t).0, [Event::ToolEnd { ok: false }]);
+    }
+
+    #[test]
+    fn gemini_and_pi_names() {
+        let mut t = Totals::default();
+        let v = json!({"hook_event_name": "BeforeTool", "cwd": "/w", "tool_name": "run_shell_command", "tool_input": {"command": "ls"}});
+        assert_eq!(parse("gemini", &v, &mut t).0, [Event::ToolStart { kind: ToolKind::Bash, target: "ls".into() }]);
+        let v = json!({"hook_event_name": "AfterAgent", "prompt_response": "ok"});
+        assert_eq!(parse("gemini", &v, &mut t).0, [Event::Summary { text: "ok".into() }, Event::TurnDone]);
+        // codex sends argv-style commands
+        let v = json!({"hook_event_name": "PreToolUse", "tool_name": "shell", "tool_input": {"command": ["git", "status"]}});
+        assert_eq!(parse("codex", &v, &mut t).0, [Event::ToolStart { kind: ToolKind::Bash, target: "git status".into() }]);
+        let usage = json!({"type": "usage", "usage": {"totalTokens": 100, "cost": {"total": 0.5}}});
+        parse("pi", &usage, &mut t);
+        assert_eq!(parse("pi", &usage, &mut t).0, [Event::Usage { tokens: 200, cost: Some(1.0) }]); // pi's usage adds up
+        assert_eq!(parse("pi", &json!({"type": "done"}), &mut t).0, [Event::TurnDone]);
+    }
+
+    #[test]
+    fn transcript_tokens() {
+        let path = std::env::temp_dir().join(format!("arranger-transcript-{}.jsonl", std::process::id()));
+        let msg = |id: &str| json!({"type": "assistant", "message": {"id": id, "usage": {"input_tokens": 10, "output_tokens": 5}}}).to_string();
+        // the same message repeats once per content block and counts once
+        fs::write(&path, [msg("a"), msg("a"), msg("b"), "not json".into()].join("\n")).unwrap();
+        assert_eq!(transcript_usage(path.to_str().unwrap()), Some(Event::Usage { tokens: 30, cost: None }));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn decisions() {
+        let v: Value = serde_json::from_str(&decision(false, "no")).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["decision"], json!({"behavior": "deny", "message": "no"}));
+        let v: Value = serde_json::from_str(&decision(true, "")).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["decision"]["behavior"], "allow");
+    }
 }

@@ -255,6 +255,8 @@ struct App {
     /// A machine whose Remove was clicked once; the next click removes it.
     remove_armed: Option<usize>,
     review: Option<ReviewView>,
+    /// Whether each probed task has anything to review, keyed by the state it was probed in.
+    changes: std::collections::HashMap<TaskKey, (String, Option<bool>)>,
     /// Replay of a finished task's log, shown in place of a live session.
     history: Option<(TaskKey, Screen)>,
     /// Wheel movement over the terminal not yet worth a whole line.
@@ -332,6 +334,7 @@ fn run() -> io::Result<()> {
         add_host: None,
         remove_armed: None,
         review: None,
+        changes: Default::default(),
         history: None,
         wheel: 0.0,
         mods: ModifiersState::empty(),
@@ -890,6 +893,23 @@ impl App {
         self.selected.and_then(|k| self.task(k))
     }
 
+    /// The selected task has a diff to review; true until its probe answers.
+    fn reviewable(&self) -> bool {
+        self.current().is_some_and(|t| self.changes.get(&(t.machine, t.id)).is_none_or(|c| c.1 != Some(false)))
+    }
+
+    /// Asks for the selected task's diff whenever its state has moved since the last ask.
+    fn probe_changes(&mut self) {
+        let Some(t) = self.current() else { return };
+        let (key, stamp) = ((t.machine, t.id), format!("{} {} {} {}", t.state, t.since, t.shipped, t.action));
+        if self.changes.get(&key).is_some_and(|c| c.0 == stamp) {
+            return;
+        }
+        let prev = self.changes.get(&key).and_then(|c| c.1);
+        self.changes.insert(key, (stamp, prev));
+        self.spawn_request(key.0, Tag::Changes(key), Request::Review { id: key.1 });
+    }
+
     fn all_tasks(&self) -> impl Iterator<Item = &TaskInfo> {
         self.hosts.iter().filter(|h| !h.removed).flat_map(|h| &h.tasks)
     }
@@ -1058,7 +1078,7 @@ impl App {
     fn cycle_view(&mut self, forward: bool) {
         let cur = if self.review.is_some() { 2 } else if self.overview { 1 } else { 0 };
         let mut next = if forward { (cur + 1) % 3 } else { (cur + 2) % 3 };
-        if next == 2 && self.current().is_none() {
+        if next == 2 && !self.reviewable() {
             next = if forward { 0 } else { 1 };
         }
         self.actions.push(match next {
@@ -1680,7 +1700,7 @@ impl App {
                 }
                 Action::Start(attach) => self.start(attach),
                 Action::OpenReview => {
-                    if self.dialog.is_none() {
+                    if self.dialog.is_none() && (self.review.is_some() || self.reviewable()) {
                         self.open_review();
                     }
                 }
@@ -1765,6 +1785,7 @@ impl App {
         let r = &mut gfx.r;
         r.begin(size.width, size.height, dpi, t.bg);
 
+        self.probe_changes();
         self.draw_title(r, t, w);
         if self.review.is_some() {
             self.draw_review(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H - STATUS_H));
@@ -1835,8 +1856,9 @@ impl App {
             if on {
                 r.rect(tab, 3.0, t.raised);
             }
-            r.text(tab.x + 8.0, r.center(tab, UI, 12.0), label, UI, 12.0, 400, if on { t.text } else { t.text3 }, tw);
-            if self.hit(r, tab) && !on {
+            let off = label == "Review" && !on && !self.reviewable();
+            r.text(tab.x + 8.0, r.center(tab, UI, 12.0), label, UI, 12.0, 400, if on { t.text } else if off { alpha(t.text3, 90) } else { t.text3 }, tw);
+            if self.hit(r, tab) && !on && !off {
                 self.actions.push(match label {
                     "Review" => Action::OpenReview,
                     "Overview" => Action::Overview(true),
@@ -2105,10 +2127,12 @@ impl App {
         let review_key = mod_label("R");
         let bw = r.measure(UI, 12.0, 500, review_label) + r.measure(MONO, 10.5, 400, &review_key) + 28.0;
         let review = Rect::new(head.x + head.w - 12.0 - bw, head.y + 7.0, bw, 26.0);
-        r.rect(review, 3.0, t.primary_bg);
-        let rlw = r.text(review.x + 10.0, r.center(review, UI, 12.0), review_label, UI, 12.0, 500, t.primary_fg, bw);
-        r.text(review.x + 18.0 + rlw, r.center(review, MONO, 10.5), &review_key, MONO, 10.5, 400, alpha(t.primary_fg, 160), 60.0);
-        if self.hit(r, review) {
+        let can = self.reviewable();
+        let (bg, fg) = if can { (t.primary_bg, t.primary_fg) } else { (t.raised, alpha(t.text3, 120)) };
+        r.rect(review, 3.0, bg);
+        let rlw = r.text(review.x + 10.0, r.center(review, UI, 12.0), review_label, UI, 12.0, 500, fg, bw);
+        r.text(review.x + 18.0 + rlw, r.center(review, MONO, 10.5), &review_key, MONO, 10.5, 400, alpha(fg, 160), 60.0);
+        if can && self.hit(r, review) {
             self.actions.push(Action::OpenReview);
         }
         let tx = pill.x + pw + 6.0 + ship_badge(r, t, &task.shipped, pill.x + pw + 6.0, pill.y + pill.h / 2.0) + 4.0;

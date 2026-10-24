@@ -293,4 +293,69 @@ mod tests {
         assert!(!dir.join("new.txt").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A fresh repo under the temp dir with `f.txt` committed on `main`; returns (dir, git).
+    fn repo(name: &str) -> (std::path::PathBuf, impl Fn(&[&str]) -> String) {
+        let dir = std::env::temp_dir().join(format!("arranger-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.clone();
+        let git = move |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&d).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("f.txt"), "one\ntwo\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "i"]);
+        (dir, git)
+    }
+
+    #[test]
+    fn diff_sees_commits_edits_and_deletes() {
+        let (dir, git) = repo("diff");
+        let base = resolve(&dir, "HEAD").unwrap();
+        std::fs::write(dir.join("c.txt"), "committed\n").unwrap();
+        git(&["add", "c.txt"]);
+        git(&["commit", "-q", "-m", "agent"]);
+        std::fs::remove_file(dir.join("f.txt")).unwrap();
+        std::fs::write(dir.join("bin.dat"), b"\0\x01").unwrap();
+        let files = diff(&dir, &base, None).unwrap();
+        let got: Vec<_> = files.iter().map(|f| (f.path.as_str(), f.status, f.binary, f.added, f.removed)).collect();
+        assert_eq!(got, [("bin.dat", 'A', true, 0, 0), ("c.txt", 'A', false, 1, 0), ("f.txt", 'D', false, 0, 2)]);
+        assert_eq!(diff(&dir, &base, Some("c.txt")).unwrap().len(), 1);
+        // Nothing to review against the tip once it's all committed and the worktree matches.
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "rest"]);
+        assert!(diff(&dir, "HEAD", None).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_conflicts_and_base() {
+        let (dir, git) = repo("conflict");
+        let fork = resolve(&dir, "HEAD").unwrap();
+        git(&["checkout", "-q", "-b", "agent"]);
+        std::fs::write(dir.join("f.txt"), "one\nagent\n").unwrap();
+        git(&["commit", "-q", "-am", "agent"]);
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(dir.join("f.txt"), "one\nmain\n").unwrap();
+        git(&["commit", "-q", "-am", "main"]);
+        let main = resolve(&dir, "main").unwrap();
+        git(&["checkout", "-q", "agent"]);
+        assert_eq!(conflicts(&dir).unwrap(), (vec![], false));
+        assert_eq!(diff_base(&dir, &fork, "main"), fork); // main moved, but isn't merged in yet
+
+        assert!(!Command::new("git").arg("-C").arg(&dir).args(["merge", "-q", "main"]).output().unwrap().status.success());
+        assert_eq!(conflicts(&dir).unwrap(), (vec!["f.txt".to_string()], true));
+        assert_eq!(diff_base(&dir, &fork, "main"), main); // mid-merge, review against what's coming in
+        std::fs::write(dir.join("f.txt"), "one\nboth\n").unwrap();
+        git(&["add", "f.txt"]);
+        assert_eq!(conflicts(&dir).unwrap(), (vec![], true)); // resolved, not yet committed
+        git(&["commit", "-q", "--no-edit"]);
+        assert_eq!(diff_base(&dir, &fork, "main"), main); // merged: main's own changes drop out of the diff
+        assert_eq!(diff(&dir, &main, None).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

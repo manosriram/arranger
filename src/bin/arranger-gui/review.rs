@@ -82,6 +82,8 @@ pub enum ReviewAction {
 
 pub enum Tag {
     Review(u64),
+    /// A background diff for the Review tab's enabled state.
+    Changes(crate::TaskKey),
     Revert,
     Resolve,
     Commit,
@@ -239,6 +241,14 @@ impl App {
     }
 
     pub fn on_reply(&mut self, tag: Tag, reply: Result<Reply, String>) {
+        if let Tag::Changes(key) = tag {
+            // An error (no worktree, say) means there's nothing to look at either.
+            let has = matches!(&reply, Ok(Reply::Review(d)) if !d.files.is_empty() || d.merging || !d.conflicts.is_empty());
+            if let Some(c) = self.changes.get_mut(&key) {
+                c.1 = Some(has);
+            }
+            return;
+        }
         let Some(rv) = &mut self.review else {
             if let (Tag::Message, Err(e)) = (tag, reply) {
                 eprintln!("arranger: {e}");

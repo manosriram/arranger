@@ -1042,3 +1042,18 @@ impl Daemon {
         let _ = fs::remove_file(self.data.join("daemon.pid"));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proto::ToolKind;
+
+    #[test]
+    fn checks_keep_the_latest_result() {
+        let bash = |cmd: &str| (0, Event::ToolStart { kind: ToolKind::Bash, target: cmd.into() });
+        let end = |ok| (0, Event::ToolEnd { ok });
+        let events = [bash("cargo test"), end(false), bash("ls"), end(true), bash("cargo build"), end(true), bash("cargo test"), end(true), bash("npm run lint")];
+        let want: Vec<(String, Option<bool>)> = vec![("cargo build".into(), Some(true)), ("cargo test".into(), Some(true)), ("npm run lint".into(), None)];
+        assert_eq!(checks(&events), want);
+    }
+}

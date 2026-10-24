@@ -4,6 +4,8 @@ arranger runs many CLI coding agents (Claude Code, Codex, Gemini, pi) side by si
 
 Linux and macOS. Rust throughout; no webview.
 
+![arranger with four agents: one asking a question, one waiting on approval, one working, one done](assets/screenshot.png)
+
 ## Install
 
 ```sh
@@ -14,17 +16,24 @@ Or build it: `cargo build --release` (makes `target/release/arranger` and `arran
 
 Requires `git`. Install `gh` if you want to open PRs from the app.
 
-## Use
+## Run
 
-Run `arranger` inside a git repo. It starts the daemon if needed and opens the window.
+```sh
+cd your/repo
+arranger
+```
+
+That's it: it starts the daemon if needed and opens the window. Closing the window leaves the agents running; run `arranger` again to get back to them.
+
+## Use
 
 | Key | Action |
 |-----|--------|
-| ⌘N | New task: pick an agent, write the prompt |
+| ⌘N | New task: pick an agent and its model, write the prompt |
 | ⌘J / ⌘K | Next / previous agent |
 | ⌘I | Message the selected agent |
 | ⌘1 / ⌘2 | Allow / deny a permission request |
-| ⌘R | Review the diff: revert hunks, comment, then merge (or commit, or open a PR) |
+| ⌘R | Review the diff: revert hunks, comment, then merge (or commit, or open a PR). Greyed out while there's nothing to review |
 | ⌘T | Switch between dark and light |
 
 On Linux use Ctrl+Shift in place of ⌘.
@@ -32,6 +41,8 @@ On Linux use Ctrl+Shift in place of ⌘.
 Each task gets its own worktree on a new branch, `arranger/<id>`, made from the base branch you pick when you start it (the current branch by default). The base branch only changes when you merge into it from Review.
 
 If merging hits a conflict, `main` is left alone: the conflict lands in the agent's worktree, and Review offers to have the agent resolve it (or take one side) before merging again.
+
+An agent that has ended can be revived: it resumes its last session in the same worktree, with a new prompt if you give one (also how Review hands a conflict to an agent that has already exited).
 
 The **Overview** tab lists every agent on every machine in one table, grouped by state, with one action per row: Approve, Answer, Review or Open. Ended agents live there too; click "N ended" under a machine to see that machine's.
 
@@ -47,6 +58,8 @@ arranger ls                                # agents and what they're doing
 arranger attach 3                          # its terminal; Ctrl-\ detaches
 arranger approve 3                         # or: deny 3 [reason]
 arranger diff 3                            # changes since its base or your last commit
+arranger send 3 "also update the docs"     # type into it
+arranger revive 3 "carry on"               # resume an ended agent
 arranger commit 3 --merge                  # commit, merge into its base branch
 arranger commit 3 --pr                     # or: commit, push, open a PR
 arranger stop                              # stop the daemon and its agents
@@ -67,4 +80,5 @@ The app reaches each machine with your own `ssh` (keys, agent, `~/.ssh/config`) 
 ```sh
 just test        # cargo test
 just bench-mem   # daemon RSS with 20 fake agents
+just screenshot  # re-render assets/screenshot.png with demo agents
 ```
