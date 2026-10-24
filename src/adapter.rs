@@ -28,8 +28,9 @@ pub const PARENT_SESSION_ENV: &[&str] = &[
     "CLAUDE_CODE_MESSAGING_TOKEN",
 ];
 
-/// Program, args and extra env that start `agent` with arranger's hooks installed.
-pub fn launch(agent: &str, prompt: &str, exe: &Path, data: &Path) -> io::Result<(Vec<String>, Vec<(String, String)>)> {
+/// Program, args and extra env that start `agent` with arranger's hooks installed, on `model`
+/// ("" leaves the agent's default; claude, codex, gemini and pi all take `--model`).
+pub fn launch(agent: &str, prompt: &str, model: &str, exe: &Path, data: &Path) -> io::Result<(Vec<String>, Vec<(String, String)>)> {
     let hook = |name: &str| format!("'{}' hook {name}", exe.display());
     let mut argv = vec![agent.to_string()];
     let mut env = vec![("ARRANGER_BIN".to_string(), exe.display().to_string())];
@@ -69,6 +70,9 @@ pub fn launch(agent: &str, prompt: &str, exe: &Path, data: &Path) -> io::Result<
             argv.extend(["-e".into(), path.display().to_string()]);
         }
         _ => {}
+    }
+    if !model.is_empty() {
+        argv.extend(["--model".into(), model.into()]);
     }
     if !prompt.is_empty() {
         if kind(agent) == "gemini" {
@@ -347,5 +351,14 @@ mod tests {
         let patch = "*** Begin Patch\n*** Update File: /w/a.rs\n@@\n*** Add File: b.rs\n*** End Patch";
         let v = json!({"hook_event_name": "PreToolUse", "cwd": "/w", "tool_name": "apply_patch", "tool_input": {"command": patch}});
         assert_eq!(parse("codex", &v, &mut t).0.len(), 2);
+    }
+
+    #[test]
+    fn launch_model() {
+        let (exe, data) = (Path::new("/bin/arranger"), Path::new("/tmp"));
+        let (argv, _) = launch("claude", "hi", "claude-sonnet-5-5", exe, data).unwrap();
+        assert_eq!(argv[argv.len() - 3..], ["--model", "claude-sonnet-5-5", "hi"]);
+        let (argv, _) = launch("claude", "", "", exe, data).unwrap();
+        assert!(!argv.contains(&"--model".to_string()));
     }
 }

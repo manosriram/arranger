@@ -147,6 +147,7 @@ pub fn run() -> io::Result<()> {
         "summary TEXT NOT NULL DEFAULT ''",
         "reviewed TEXT NOT NULL DEFAULT ''",
         "shipped TEXT NOT NULL DEFAULT ''",
+        "model TEXT NOT NULL DEFAULT ''",
     ] {
         let _ = db.execute(&format!("ALTER TABLE tasks ADD COLUMN {col}"), []);
     }
@@ -369,7 +370,7 @@ impl Daemon {
                 Ok(tasks) => Reply::Tasks(tasks),
                 Err(e) => Reply::Error(e),
             },
-            Request::New { agent, repo, base, prompt } => match self.create(&agent, &repo, base.as_deref(), prompt.as_deref().unwrap_or("")) {
+            Request::New { agent, repo, base, prompt, model } => match self.create(&agent, &repo, base.as_deref(), prompt.as_deref().unwrap_or(""), model.as_deref().unwrap_or("")) {
                 Ok(id) => Reply::Created { id, state: self.state(id) },
                 Err(e) => Reply::Error(e),
             },
@@ -705,7 +706,7 @@ impl Daemon {
         self.set_state(id, state);
     }
 
-    fn create(&mut self, agent: &str, dir: &Path, base: Option<&str>, prompt: &str) -> Result<u64, String> {
+    fn create(&mut self, agent: &str, dir: &Path, base: Option<&str>, prompt: &str, model: &str) -> Result<u64, String> {
         // A repo typed on another machine (`~/src/api`): the daemon's own home.
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
         let dir = dir.strip_prefix("~").map_or(dir.to_path_buf(), |rest| home.join(rest));
@@ -716,9 +717,9 @@ impl Daemon {
         let repo_name = top.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         self.db
             .execute(
-                "INSERT INTO tasks (agent, repo, branch, worktree, state, created, title, prompt)
-                 VALUES (?1, ?2, '', '', 'new', ?3, ?4, ?4)",
-                params![agent, top.to_string_lossy(), now_secs(), prompt],
+                "INSERT INTO tasks (agent, repo, branch, worktree, state, created, title, prompt, model)
+                 VALUES (?1, ?2, '', '', 'new', ?3, ?4, ?4, ?5)",
+                params![agent, top.to_string_lossy(), now_secs(), prompt, model],
             )
             .map_err(e2s)?;
         let id = self.db.last_insert_rowid() as u64;
@@ -755,13 +756,13 @@ impl Daemon {
     }
 
     fn start(&mut self, id: u64) -> Result<(), String> {
-        let (agent, repo, wt, prompt): (String, String, String, String) = self
+        let (agent, repo, wt, prompt, model): (String, String, String, String, String) = self
             .db
-            .query_row("SELECT agent, repo, worktree, prompt FROM tasks WHERE id = ?1", [id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            .query_row("SELECT agent, repo, worktree, prompt, model FROM tasks WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })
             .map_err(e2s)?;
-        let (argv, env) = adapter::launch(&agent, &prompt, &self.exe, &self.data).map_err(e2s)?;
+        let (argv, env) = adapter::launch(&agent, &prompt, &model, &self.exe, &self.data).map_err(e2s)?;
         let mut cmd = if Path::new(&wt).join(".arranger/setup").exists() {
             let mut sh = Command::new("sh");
             sh.args(["-c", "./.arranger/setup && exec \"$0\" \"$@\""]).args(&argv);

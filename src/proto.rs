@@ -9,13 +9,13 @@ use std::path::PathBuf;
 const MAX_FRAME: usize = 64 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
     Ping,
-    /// `prompt` is passed to the agent as its first message.
-    New { agent: String, repo: PathBuf, base: Option<String>, prompt: Option<String> },
+    /// `prompt` is passed to the agent as its first message; `model` as `--model` (None: the agent's default).
+    New { agent: String, repo: PathBuf, base: Option<String>, prompt: Option<String>, model: Option<String> },
     List { files: bool },
     Kill { id: u64 },
     Events { id: u64 },

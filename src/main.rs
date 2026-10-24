@@ -213,7 +213,7 @@ fn hook(adapter: &str) -> io::Result<()> {
 
 fn new(agent: &str, base: Option<&str>, prompt: &[&str]) -> io::Result<()> {
     let prompt = Some(prompt.join(" ")).filter(|p| !p.is_empty());
-    let req = Request::New { agent: agent.into(), repo: env::current_dir()?, base: base.map(Into::into), prompt };
+    let req = Request::New { agent: agent.into(), repo: env::current_dir()?, base: base.map(Into::into), prompt, model: None };
     match request(&req)? {
         Reply::Created { id, state } => Ok(println!("{id} {state}")),
         reply => Err(unexpected(reply)),
