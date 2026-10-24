@@ -918,6 +918,8 @@ impl App {
             }
             out.push(Section { key: format!("host:{i}"), host: Some(i), tasks, ended });
         }
+        // Unreachable machines sink to the bottom; the sort is stable, so order is otherwise kept.
+        out.sort_by_key(|s| s.host.is_some_and(|m| matches!(self.hosts[m].link, Link::Down(_))));
         out
     }
 
