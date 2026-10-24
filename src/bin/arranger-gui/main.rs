@@ -2472,7 +2472,7 @@ impl App {
         let dx = (w - dw) / 2.0;
         let prompt_lines = wrap(r, &prompt, UI, 18.0, dw - 36.0);
         let text_h = (prompt_lines.len().max(3) as f32) * 27.0;
-        let dh = 2.0 + 34.0 + 12.0 + text_h + 16.0 + 78.0 + 78.0 + host_row + 58.0;
+        let dh = 2.0 + 34.0 + 12.0 + text_h + 16.0 + 78.0 + host_row + 58.0;
         let dlg = Rect::new(dx, 88.0, dw, dh);
         r.rect(Rect::new(dlg.x - 1.0, dlg.y - 1.0, dlg.w + 2.0, dlg.h + 2.0), 9.0, alpha(a, 0x33));
         r.frame(dlg, 8.0, t.dialog, t.border2);
@@ -2491,12 +2491,11 @@ impl App {
         if self.hit(r, esc) {
             self.actions.push(Action::CloseDialog);
         }
-        let pill_label = if model_i == 0 { agent.to_string() } else { format!("{agent} · {}", models(agent)[model_i].0) };
-        let pw = r.measure(MONO, 11.0, 400, &pill_label) + 21.0;
+        let pw = r.measure(MONO, 11.0, 400, agent) + 21.0;
         let pill = Rect::new(esc.x - 8.0 - pw, head.y, pw, 20.0);
         r.rect(pill, 3.0, alpha(a, 0x1A));
         r.rect(Rect::new(pill.x + 7.0, pill.y + 7.0, 6.0, 6.0), 1.0, a);
-        r.text(pill.x + 17.0, r.center(pill, MONO, 11.0), &pill_label, MONO, 11.0, 400, a, pw);
+        r.text(pill.x + 17.0, r.center(pill, MONO, 11.0), agent, MONO, 11.0, 400, a, pw);
 
         // Prompt.
         let ty = hy + 20.0 + 14.0;
@@ -2571,30 +2570,9 @@ impl App {
         r.frame(chip, 3.0, t.dialog, t.border2);
         r.text(chip.x + 5.0, r.center(chip, UI, 10.0), "auto", UI, 10.0, 400, t.text3, 30.0);
 
-        // Model, from the chosen agent's list.
-        let oy = gy + 78.0;
-        r.rect(Rect::new(dlg.x + 1.0, oy, dlg.w - 2.0, 1.0), 0.0, t.border);
-        let lw = r.text(dlg.x + 18.0, oy + 14.0, "Model", UI, 11.0, 400, t.text3, 100.0);
-        r.text(dlg.x + 22.0 + lw, oy + 14.0, &format!("· {agent}"), UI, 11.0, 400, t.faint, 100.0);
-        let mut mx = dlg.x + 18.0;
-        for (i, (label, _)) in models(agent).iter().enumerate() {
-            let on = i == model_i;
-            let bw = r.measure(MONO, 12.0, 400, label) + 20.0;
-            let b = Rect::new(mx, oy + 36.0, bw, 28.0);
-            r.frame(b, 4.0, t.dialog, if on { a } else { t.border2 });
-            if on {
-                r.rect(b.inset(1.0), 3.0, alpha(a, 0x1F));
-            }
-            r.text(b.x + 10.0, r.center(b, MONO, 12.0), label, MONO, 12.0, 400, if on { a } else { t.tc }, bw);
-            if self.hit(r, b) {
-                self.actions.push(Action::PickModel(i));
-            }
-            mx += bw + 4.0;
-        }
-
         // Machine | Repo.
         if host_row > 0.0 {
-            let my = gy + 156.0;
+            let my = gy + 78.0;
             r.rect(Rect::new(dlg.x + 1.0, my, dlg.w - 2.0, 1.0), 0.0, t.border);
             r.rect(Rect::new(dlg.x + dlg.w / 2.0, my, 1.0, 78.0), 0.0, t.border);
             r.text(dlg.x + 18.0, my + 14.0, "Machine", UI, 11.0, 400, t.text3, 100.0);
@@ -2626,16 +2604,26 @@ impl App {
         }
 
         // Footer.
-        let fy = gy + 156.0 + host_row;
+        let fy = gy + 78.0 + host_row;
         let foot = Rect::new(dlg.x + 1.0, fy, dlg.w - 2.0, dlg.y + dlg.h - fy - 1.0);
         r.rect(Rect::new(dlg.x + 1.0, fy, dlg.w - 2.0, 1.0), 0.0, t.border);
         r.rect(Rect::new(foot.x, foot.y + 1.0, foot.w, foot.h - 1.0), 7.0, t.panel);
-        let start_label = format!("Start {agent}");
+        // Start <agent> · <model> ↵ | ⌄ — the chevron (or Shift+Tab) cycles the agent's models.
+        let model = models(agent)[model_i].0;
+        let start_label = if model_i == 0 { format!("Start {agent}") } else { format!("Start {agent} · {model}") };
         let sw = r.measure(UI, 13.0, 500, &start_label) + 40.0;
-        let start = Rect::new(foot.x + foot.w - 14.0 - sw, foot.y + 12.0, sw, 34.0);
-        r.rect(start, 4.0, if t.dark { a } else { accent_deep(agent) });
+        let cw = 28.0;
+        let chev = Rect::new(foot.x + foot.w - 14.0 - cw, foot.y + 12.0, cw, 34.0);
+        let start = Rect::new(chev.x - sw, chev.y, sw, 34.0);
+        let fill = if t.dark { a } else { accent_deep(agent) };
+        r.rect(Rect::new(start.x, start.y, sw + cw, 34.0), 4.0, fill);
+        r.rect(Rect::new(chev.x, chev.y + 7.0, 1.0, 20.0), 0.0, alpha(t.on_accent, 90));
         let slw = r.text(start.x + 14.0, r.center(start, UI, 13.0), &start_label, UI, 13.0, 500, t.on_accent, sw);
         r.text(start.x + 20.0 + slw, r.center(start, MONO, 10.0), "↵", MONO, 10.0, 400, alpha(t.on_accent, 150), 20.0);
+        r.path(9, "M18 26L32 40L46 26", Some(6.0), chev.x + 8.0, chev.y + 11.0, 12.0, t.on_accent);
+        if self.hit(r, chev) {
+            self.actions.push(Action::PickModel(usize::MAX)); // ponytail: cycles; a menu like the branch list if the lists grow
+        }
         let attach_key = mod_label("↵");
         let aw = r.measure(UI, 13.0, 400, "Start & attach") + r.measure(MONO, 10.0, 400, &attach_key) + 32.0;
         let attach = Rect::new(start.x - 8.0 - aw, start.y, aw, 34.0);
