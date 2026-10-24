@@ -24,9 +24,18 @@ Run `arranger` inside a git repo. It starts the daemon if needed and opens the w
 | ⌘J / ⌘K | Next / previous agent |
 | ⌘I | Message the selected agent |
 | ⌘1 / ⌘2 | Allow / deny a permission request |
-| ⌘R | Review the diff: revert hunks, comment, commit, open a PR |
+| ⌘R | Review the diff: revert hunks, comment, then merge (or commit, or open a PR) |
+| ⌘T | Switch between dark and light |
 
 On Linux use Ctrl+Shift in place of ⌘.
+
+Each task gets its own worktree on a new branch, `arranger/<id>`, made from the base branch you pick when you start it (the current branch by default). The base branch only changes when you merge into it from Review.
+
+If merging hits a conflict, `main` is left alone: the conflict lands in the agent's worktree, and Review offers to have the agent resolve it (or take one side) before merging again.
+
+The **Overview** tab lists every agent on every machine in one table, grouped by state, with one action per row: Approve, Answer, Review or Open. Ended agents live there too; click "N ended" under a machine to see that machine's.
+
+Eight colour schemes (four dark, four light) are in the menu at the top right.
 
 Prefer vim keys? Turn on **Vim keys** in the scheme menu (top right). The bindings are in [vim.json](vim.json), and `?` shows them in the app.
 
@@ -37,8 +46,9 @@ arranger new claude "fix the flaky test"   # start an agent on a fresh worktree
 arranger ls                                # agents and what they're doing
 arranger attach 3                          # its terminal; Ctrl-\ detaches
 arranger approve 3                         # or: deny 3 [reason]
-arranger diff 3                            # changes against its base
-arranger commit 3 --pr                     # commit, push, open a PR
+arranger diff 3                            # changes since its base or your last commit
+arranger commit 3 --merge                  # commit, merge into its base branch
+arranger commit 3 --pr                     # or: commit, push, open a PR
 arranger stop                              # stop the daemon and its agents
 ```
 

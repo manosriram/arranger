@@ -4,6 +4,7 @@
 use crate::proto::{DiffLine, FileDiff, Hunk};
 use imara_diff::{Algorithm, Diff, InternedInput};
 use std::collections::BTreeSet;
+use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -186,13 +187,62 @@ pub fn revert(worktree: &Path, base: &str, path: &str, header: &str) -> Result<(
     Ok(())
 }
 
-/// Shell script for Commit (and PR): `$1` message, `$2` "pr" or "", `$3` PR body, `$4` base branch.
+/// The commit a review diffs against: `stored` (where the task started, or your last commit), until
+/// the base branch is merged into this one (under way, or done). Then its tip, so only this branch's
+/// work and any conflict resolution show, not everything the base branch gained meanwhile.
+pub fn diff_base(worktree: &Path, stored: &str, base_branch: &str) -> String {
+    let Ok(repo) = gix::open(worktree) else { return stored.into() };
+    if let Ok(tip) = fs::read_to_string(repo.git_dir().join("MERGE_HEAD")) {
+        return tip.lines().next().unwrap_or(stored).to_string();
+    }
+    let id = |rev: &str| repo.rev_parse_single(rev).ok().map(|i| i.detach());
+    let (Some(tip), Some(head), Some(old)) = (id(base_branch).filter(|_| !base_branch.is_empty()), id("HEAD"), id(stored)) else {
+        return stored.into();
+    };
+    let below = |a, b| repo.merge_base(a, b).ok().flatten().is_some_and(|m| m.detach() == a); // a is an ancestor of b
+    if tip != old && below(tip, head) && below(old, tip) { tip.to_string() } else { stored.into() }
+}
+
+/// Files the merge under way left conflicted, and whether one is under way at all.
+pub fn conflicts(worktree: &Path) -> Result<(Vec<String>, bool), String> {
+    let repo = gix::open(worktree).map_err(e2s)?;
+    let index = repo.index_or_empty().map_err(e2s)?;
+    let mut files: Vec<String> = index
+        .entries()
+        .iter()
+        .filter(|e| e.stage() != gix::index::entry::Stage::Unconflicted)
+        .map(|e| e.path(&index).to_string())
+        .collect();
+    files.dedup(); // one entry per side, adjacent
+    Ok((files, repo.git_dir().join("MERGE_HEAD").exists()))
+}
+
+/// Shell script for Commit: `$1` message, `$2` "merge", "pr" or "", `$3` PR body, `$4` base branch.
+/// A merge goes into wherever the base is checked out; a conflict is backed out, never left half done.
 pub const COMMIT_SCRIPT: &str = r#"set -e
+if [ -n "$(git diff --name-only --diff-filter=U)" ]; then echo "resolve the conflicts first"; exit 1; fi
 git add -A
 if ! git diff --cached --quiet; then git commit -q -m "$1"; fi
 if [ "$2" = pr ]; then
   git push -q -u origin HEAD
   gh pr create --title "$1" --body "$3" --base "$4"
+elif [ "$2" = merge ]; then
+  [ -n "$4" ] || { echo "no base branch to merge into"; exit 1; }
+  branch=$(git rev-parse --abbrev-ref HEAD)
+  where=$(git worktree list --porcelain | awk -v b="branch refs/heads/$4" '/^worktree /{w=substr($0,10)} $0==b{print w}')
+  into_base() {
+    if [ -z "$where" ]; then git fetch -q . "$branch:$4" 2>/dev/null
+    else git -C "$where" merge -q --ff-only "$branch" 2>/dev/null; fi
+  }
+  if ! into_base; then
+    # $4 moved on: bring it into this branch here, so a conflict lands in this worktree, never in $4.
+    if ! git merge -q --no-edit "$4" >/dev/null 2>&1; then
+      echo "conflicts with $4 in $(git diff --name-only --diff-filter=U | tr '\n' ' ')"
+      exit 1
+    fi
+    into_base || { echo "couldn't update $4 (local changes there?); nothing was changed"; exit 1; }
+  fi
+  echo "merged $branch into $4"
 else
   git log -1 --format='committed %h %s'
 fi"#;

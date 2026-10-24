@@ -1,5 +1,5 @@
 use arranger::client::{connect, request};
-use arranger::proto::{self, Reply, Request};
+use arranger::proto::{self, Reply, Request, Ship};
 use arranger::{adapter, daemon, machine};
 use rustix::termios::{self, OptionalActions};
 use std::fs::{self, File};
@@ -15,7 +15,7 @@ use std::{env, thread};
 const USAGE: &str = "usage: arranger            open the workspace window
        arranger [ls [--files] | new <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
                  | approve <id> | deny <id> [reason] | events <id> | diff <id> | revert <id> <path> <hunk#>
-                 | send <id> <text> | commit <id> [--pr] [message] | ping | stop | serve | hook <adapter>
+                 | send <id> <text> | commit <id> [--merge|--pr] [message] | ping | stop | serve | hook <adapter>
                  | machine [ls | add <name> <user@host> [repo] | rm <name>] | endpoint]";
 /// Ctrl-\, raw and in kitty keyboard encoding.
 const DETACH: &[&[u8]] = &[b"\x1c", b"\x1b[92;5u"];
@@ -56,8 +56,9 @@ fn main() {
         ["send", id, ref text @ ..] => {
             parse_id(id).and_then(|id| request(&Request::Prompt { id, text: text.join(" ") }).map(drop))
         }
-        ["commit", id, "--pr", ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, true)),
-        ["commit", id, ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, false)),
+        ["commit", id, "--merge", ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, Ship::Merge)),
+        ["commit", id, "--pr", ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, Ship::Pr)),
+        ["commit", id, ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, Ship::Commit)),
         ["new", agent, "--branch", base, ref prompt @ ..] => new(agent, Some(base), prompt),
         ["new", agent, ref prompt @ ..] => new(agent, None, prompt),
         ["attach", id] => parse_id(id).and_then(attach),
@@ -163,8 +164,8 @@ fn revert(id: u64, path: &str, hunk: &str) -> io::Result<()> {
     request(&Request::Revert { id, path: path.into(), header }).map(drop)
 }
 
-fn commit(id: u64, message: &[&str], pr: bool) -> io::Result<()> {
-    match request(&Request::Commit { id, message: message.join(" "), pr })? {
+fn commit(id: u64, message: &[&str], ship: Ship) -> io::Result<()> {
+    match request(&Request::Commit { id, message: message.join(" "), ship })? {
         Reply::JobDone { ok, output } => {
             println!("{output}");
             if ok { Ok(()) } else { Err(io::Error::other("commit failed")) }

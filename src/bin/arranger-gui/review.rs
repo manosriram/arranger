@@ -2,7 +2,7 @@
 //! revert/accept, line notes sent back to the agent, and commit / PR / discard.
 
 use super::*;
-use arranger::proto::{FileDiff, Hunk};
+use arranger::proto::{FileDiff, Hunk, Ship};
 use std::collections::HashSet;
 
 pub const STRIP_H: f32 = 56.0;
@@ -29,6 +29,23 @@ pub struct ReviewView {
     error: bool,
     busy: bool,
     discard_armed: bool,
+    /// The Merge button's menu (commit only, open a PR) is open, and where it was drawn last frame.
+    ship_menu: Option<Rect>,
+    /// How the last commit went: (last line of git's output, ok). Shown in the emptied message box.
+    shipped: Option<(String, bool)>,
+    /// The commit in flight, for the button's "Merging…".
+    shipping: Option<Ship>,
+    /// The button's confirmation ("Merged into main") and when it started; it shows for FLASH.
+    flash: Option<(String, Instant)>,
+}
+
+pub const FLASH: Duration = Duration::from_millis(2000);
+
+impl ReviewView {
+    /// Something on screen moves: the button's dots while busy, or its confirmation fading.
+    pub fn animating(&self) -> bool {
+        self.busy || self.flash.as_ref().is_some_and(|f| f.1.elapsed() < FLASH)
+    }
 }
 
 pub struct Note {
@@ -52,7 +69,13 @@ pub enum ReviewAction {
     SaveNote,
     EditNote(usize),
     DeleteNote(usize),
-    Commit(bool),
+    Commit(Ship),
+    ShipMenu(bool),
+    /// Prompt the agent to resolve the merge's conflicts, then go back to its chat.
+    AskResolve,
+    AbortMerge,
+    /// Settle every conflict with the task's branch (true) or its base.
+    TakeSide(bool),
     Discard,
     FocusMessage,
 }
@@ -60,6 +83,7 @@ pub enum ReviewAction {
 pub enum Tag {
     Review(u64),
     Revert,
+    Resolve,
     Commit,
     Note,
     Discard,
@@ -197,6 +221,10 @@ impl App {
             error: false,
             busy: false,
             discard_armed: false,
+            ship_menu: None,
+            shipped: None,
+            shipping: None,
+            flash: None,
         });
         self.focus = self.rest();
         self.review_action(ReviewAction::Refresh);
@@ -226,11 +254,29 @@ impl App {
                     rv.status.clear();
                 }
             }
-            (Tag::Revert, Ok(_)) => refresh = true,
+            (Tag::Revert | Tag::Resolve, Ok(_)) => refresh = true,
             (Tag::Commit, Ok(Reply::JobDone { ok, output })) => {
                 rv.busy = false;
+                let line = output.lines().last().unwrap_or(if ok { "Done" } else { "Failed" }).to_string();
+                if ok {
+                    rv.message.clear();
+                    rv.status.clear();
+                } else {
+                    rv.status = line.clone();
+                }
                 rv.error = !ok;
-                rv.status = output.lines().last().unwrap_or(if ok { "Done" } else { "Failed" }).to_string();
+                if ok {
+                    let base = rv.data.as_ref().map_or("", |d| d.base.as_str());
+                    let label = match rv.shipping {
+                        Some(Ship::Merge) => format!("Merged into {base}"),
+                        Some(Ship::Pr) => "PR opened".into(),
+                        // "committed 1a2b3c4 subject"
+                        _ => format!("Committed {}", line.split(' ').nth(1).unwrap_or("")),
+                    };
+                    rv.flash = Some((label, Instant::now()));
+                }
+                rv.shipping = None;
+                rv.shipped = Some((line, ok));
                 refresh = true;
             }
             (Tag::Commit, _) => rv.busy = false,
@@ -318,16 +364,47 @@ impl App {
                 self.focus = rest;
                 self.spawn_request(host, Tag::Note, Request::Prompt { id, text });
             }
-            ReviewAction::Commit(pr) => {
+            ReviewAction::Commit(ship) => {
+                rv.ship_menu = None;
+                rv.shipped = None;
+                rv.flash = None;
                 if rv.busy {
                     return;
                 }
                 rv.busy = true;
                 rv.error = false;
-                rv.status = if pr { "Committing, pushing and opening a PR…".into() } else { "Committing…".into() };
+                rv.shipping = Some(ship);
+                rv.status = match ship {
+                    Ship::Commit => "Committing…",
+                    Ship::Merge => "Committing and merging…",
+                    Ship::Pr => "Committing, pushing and opening a PR…",
+                }
+                .into();
                 let message = rv.message.clone();
                 self.focus = rest;
-                self.spawn_request(host, Tag::Commit, Request::Commit { id, message, pr });
+                self.spawn_request(host, Tag::Commit, Request::Commit { id, message, ship });
+            }
+            ReviewAction::ShipMenu(open) => rv.ship_menu = open.then(Rect::default),
+            ReviewAction::AskResolve => {
+                let Some(d) = &rv.data else { return };
+                let files = d.conflicts.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ");
+                let text = format!(
+                    "Merging `{}` into this branch conflicts in {files}. Resolve the conflicts, keeping the intent of both sides, then `git add` the files and finish the merge with `git commit --no-edit`. Don't change anything else.",
+                    d.base
+                );
+                self.review = None;
+                self.focus = rest;
+                self.spawn_request(host, Tag::Note, Request::Prompt { id, text });
+            }
+            ReviewAction::AbortMerge => {
+                rv.ship_menu = None;
+                rv.status = "Aborting the merge…".into();
+                self.spawn_request(host, Tag::Resolve, Request::AbortMerge { id });
+            }
+            ReviewAction::TakeSide(ours) => {
+                rv.ship_menu = None;
+                rv.status = "Taking one side…".into();
+                self.spawn_request(host, Tag::Resolve, Request::TakeSide { id, ours });
             }
             ReviewAction::FocusMessage => self.focus = Focus::CommitMsg,
             ReviewAction::Discard => {
@@ -352,6 +429,11 @@ impl App {
         let task = self.task((rv.host, rv.task)).cloned();
         let agent = task.as_ref().map(|t| adapter::kind(&t.agent).to_string()).unwrap_or_default();
         let mut acts = Vec::new();
+        // A click on the open Merge menu is the menu's alone, whatever lies under it.
+        let menu_click = self.click.filter(|p| rv.ship_menu.is_some_and(|m| m.contains(*p)));
+        if menu_click.is_some() {
+            self.click = None;
+        }
 
         // Task strip.
         let strip = Rect::new(area.x, area.y, area.w, STRIP_H);
@@ -430,7 +512,8 @@ impl App {
             if on {
                 r.frame(row, 4.0, t.sel, t.sel_ring);
             }
-            let counts = format!("+{} −{}", f.added, f.removed);
+            let conflicted = rv.data.as_ref().is_some_and(|d| d.conflicts.contains(&f.path));
+            let counts = if conflicted { "conflict".to_string() } else { format!("+{} −{}", f.added, f.removed) };
             let cw = r.measure(MONO, 12.0, 400, &counts);
             let (dir, file) = f.path.rsplit_once('/').map_or(("", f.path.as_str()), |(d, n)| (d, n));
             let avail = row.w - cw - 30.0;
@@ -441,8 +524,12 @@ impl App {
             let fc = if f.status == 'D' { t.text3 } else if on { t.tc_on } else { t.tc };
             r.text(x, r.center(row, MONO, 12.0), file, MONO, 12.0, 400, fc, row.x + 10.0 + avail - x);
             let ax = row.x + row.w - 10.0 - cw;
-            let aw = r.text(ax, r.center(row, MONO, 12.0), &format!("+{}", f.added), MONO, 12.0, 400, t.add, 80.0);
-            r.text(ax + aw + r.measure(MONO, 12.0, 400, " "), r.center(row, MONO, 12.0), &format!("−{}", f.removed), MONO, 12.0, 400, t.del, 80.0);
+            if conflicted {
+                r.text(ax, r.center(row, MONO, 12.0), &counts, MONO, 12.0, 400, t.needs, 80.0);
+            } else {
+                let aw = r.text(ax, r.center(row, MONO, 12.0), &format!("+{}", f.added), MONO, 12.0, 400, t.add, 80.0);
+                r.text(ax + aw + r.measure(MONO, 12.0, 400, " "), r.center(row, MONO, 12.0), &format!("−{}", f.removed), MONO, 12.0, 400, t.del, 80.0);
+            }
             if self.hit(r, row) {
                 acts.push(ReviewAction::File(i));
             }
@@ -476,19 +563,78 @@ impl App {
         // Diff column and commit bar.
         let col = Rect::new(body.x + self.rail_w, body.y, body.w - self.rail_w, body.h - BAR_H);
         r.rect(col, 0.0, t.term);
+        // A merge under way: say so above the diff, with a way back out.
+        let mut view = col;
+        if let Some(d) = rv.data.as_ref().filter(|d| d.merging) {
+            let n = d.conflicts.len();
+            let (head, sub) = if n > 0 {
+                (format!("Merging into {} conflicts in {n} file{}", d.base, if n == 1 { "" } else { "s" }), format!("{} is untouched: it was merged into {} here, so the conflicts can be fixed in this worktree.", d.base, d.branch))
+            } else {
+                ("Conflicts resolved".to_string(), format!("Merge into {} to finish.", d.base))
+            };
+            let banner = Rect::new(col.x + 16.0, col.y + 16.0, col.w - 32.0, 62.0);
+            let c = if n > 0 { t.needs } else { t.done };
+            r.frame(banner, 6.0, blend(t.term, c, 0.08), alpha(c, 0x59));
+            r.path(10, "M32 8L60 56H4L32 8ZM32 26V38M32 46V47", Some(5.0), banner.x + 16.0, banner.y + 21.0, 18.0, c);
+            r.text(banner.x + 46.0, banner.y + 14.0, &head, UI, 13.0, 600, c, banner.w - 200.0);
+            r.text(banner.x + 46.0, banner.y + 34.0, &sub, UI, 12.5, 400, t.text2, banner.w - 200.0);
+            let label = "Abort merge";
+            let aw = r.measure(UI, 12.5, 400, label) + 24.0;
+            let abort = Rect::new(banner.x + banner.w - 16.0 - aw, banner.y + 16.0, aw, 30.0);
+            r.frame(abort, 4.0, blend(t.term, c, 0.08), t.border2);
+            r.text(abort.x + 12.0, r.center(abort, UI, 12.5), label, UI, 12.5, 400, t.text, aw);
+            if !rv.busy && self.hit(r, abort) {
+                acts.push(ReviewAction::AbortMerge);
+            }
+            view = Rect { y: col.y + 78.0, h: col.h - 78.0, ..col };
+        }
         if let Some(file) = files.get(rv.file) {
-            r.set_clip(Some(col));
-            let max_scroll = self.draw_file(r, t, col, file, &agent, &mut acts);
+            r.set_clip(Some(view));
+            let max_scroll = self.draw_file(r, t, view, file, &agent, &mut acts);
             r.set_clip(None);
             if let Some(rv) = &mut self.review {
                 rv.scroll = rv.scroll.min(max_scroll.max(0.0));
             }
         } else {
-            let msg = if rv.data.is_none() { "Loading…" } else { "Nothing to review: the worktree matches its base" };
-            let mw = r.measure(UI, 13.0, 400, msg);
-            r.text(col.x + (col.w - mw) / 2.0, col.y + col.h / 2.0 - 8.0, msg, UI, 13.0, 400, t.text3, col.w);
+            let shipped = task.as_ref().map_or("", |t| t.shipped.as_str());
+            if rv.data.is_some() && !shipped.is_empty() {
+                // Done: a big check, what happened, and (once merged) cleaning up.
+                let base = rv.data.as_ref().map_or("", |d| d.base.as_str());
+                let branch = rv.data.as_ref().map_or("", |d| d.branch.as_str());
+                let head = match shipped {
+                    "merged" => format!("Merged into {base}"),
+                    "PR" => "PR opened".into(),
+                    _ => format!("Committed on {branch}"),
+                };
+                let (cx, cy) = (col.x + col.w / 2.0, col.y + col.h / 2.0 - 40.0);
+                r.rect(Rect::new(cx - 28.0, cy - 28.0, 56.0, 56.0), 28.0, alpha(t.done, 0x26));
+                r.path(8, "M14 33.6L25.6 45.2L50 18.8", Some(7.0), cx - 14.0, cy - 14.0, 28.0, t.done);
+                let hw = r.measure(UI, 16.0, 600, &head);
+                r.text(cx - hw / 2.0, cy + 44.0, &head, UI, 16.0, 600, t.text, col.w);
+                let sub = "Nothing new to review";
+                let sw = r.measure(UI, 12.5, 400, sub);
+                r.text(cx - sw / 2.0, cy + 70.0, sub, UI, 12.5, 400, t.text3, col.w);
+                if shipped == "merged" {
+                    let label = if rv.discard_armed { "Click again to remove the worktree" } else { "Clean up worktree" };
+                    let bw = r.measure(UI, 13.0, 400, label) + 28.0;
+                    let b = Rect::new(cx - bw / 2.0, cy + 100.0, bw, 34.0);
+                    r.frame(b, 4.0, t.term, t.border2);
+                    r.text(b.x + 14.0, r.center(b, UI, 13.0), label, UI, 13.0, 400, t.text, bw);
+                    if !rv.busy && self.hit(r, b) {
+                        acts.push(ReviewAction::Discard);
+                    }
+                }
+            } else {
+                let msg = if rv.data.is_none() { "Loading…" } else { "Nothing to review: no changes yet" };
+                let mw = r.measure(UI, 13.0, 400, msg);
+                r.text(col.x + (col.w - mw) / 2.0, col.y + col.h / 2.0 - 8.0, msg, UI, 13.0, 400, t.text3, col.w);
+            }
         }
-        self.draw_commit_bar(r, t, Rect::new(col.x, col.y + col.h, col.w, BAR_H), &mut acts);
+        let ended = task.as_ref().is_some_and(|t| group(&t.state) == 4);
+        let menu = self.draw_commit_bar(r, t, Rect::new(col.x, col.y + col.h, col.w, BAR_H), &agent, ended, menu_click, &mut acts);
+        if let Some(rv) = self.review.as_mut().filter(|rv| rv.ship_menu.is_some()) {
+            rv.ship_menu = menu;
+        }
         self.actions.extend(acts.into_iter().map(Action::Review));
     }
 
@@ -717,28 +863,42 @@ impl App {
         }
     }
 
-    fn draw_commit_bar(&self, r: &mut Renderer, t: &Theme, bar: Rect, acts: &mut Vec<ReviewAction>) {
+    /// Commit message, Discard, and Merge with a menu for the other ways to ship. Returns where the
+    /// menu was drawn, if open.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_commit_bar(&self, r: &mut Renderer, t: &Theme, bar: Rect, agent: &str, ended: bool, menu_click: Option<(f32, f32)>, acts: &mut Vec<ReviewAction>) -> Option<Rect> {
         let rv = self.review.as_ref().unwrap();
         r.rect(bar, 0.0, t.bg);
         r.rect(Rect::new(bar.x, bar.y, bar.w, 1.0), 0.0, t.border);
         let h = 38.0;
         let by = bar.y + 12.0;
-        let pr_label = "Commit & open PR";
-        let pr_key = if cfg!(target_os = "macos") { "⌘⇧↵" } else { "Ctrl⇧↵" };
-        let pw = r.measure(UI, 13.0, 500, pr_label) + r.measure(MONO, 10.0, 400, pr_key) + 38.0;
-        let pr = Rect::new(bar.x + bar.w - 16.0 - pw, by, pw, h);
-        let cw = r.measure(UI, 13.0, 400, "Commit") + 28.0;
-        let commit = Rect::new(pr.x - 10.0 - cw, by, cw, h);
+        let base = rv.data.as_ref().map_or("", |d| d.base.as_str());
+        let branch = rv.data.as_ref().map_or("", |d| d.branch.as_str());
+        // Conflicts turn the main button into asking the agent; ▾ then settles them by side instead.
+        let conflicted = rv.data.as_ref().is_some_and(|d| !d.conflicts.is_empty());
+        let merge_label = match (conflicted, ended) {
+            (true, false) => format!("Ask {agent} to resolve"),
+            (true, true) => "Agent ended · resolve with ▾".to_string(),
+            _ if base.is_empty() => "Merge".to_string(),
+            _ => format!("Merge into {base}"),
+        };
+        let merge_key = if conflicted { "" } else if cfg!(target_os = "macos") { "⌘⇧↵" } else { "Ctrl⇧↵" };
+        let mw = r.measure(UI, 13.0, 500, &merge_label) + r.measure(MONO, 10.0, 400, merge_key) + 38.0;
+        let ship = Rect::new(bar.x + bar.w - 16.0 - mw - 30.0, by, mw + 30.0, h);
+        let (merge, chev) = (Rect { w: mw, ..ship }, Rect::new(ship.x + mw, by, 30.0, h));
         let discard_label = if rv.discard_armed { "Click again to discard" } else { "Discard worktree" };
         let dw = r.measure(UI, 13.0, 400, discard_label) + 28.0;
-        let discard = Rect::new(commit.x - 10.0 - dw, by, dw, h);
+        let discard = Rect::new(ship.x - 10.0 - dw, by, dw, h);
 
         let field = Rect::new(bar.x + 16.0, by, discard.x - 10.0 - bar.x - 16.0, h);
         let focused = self.focus == Focus::CommitMsg;
         r.frame(field, 4.0, t.panel, if focused { t.work } else { t.border2 });
         let lw = r.text(field.x + 12.0, r.center(field, UI, 11.0), "COMMIT", UI, 11.0, 400, t.text3, 80.0);
         let fx = field.x + 22.0 + lw;
-        if rv.message.is_empty() && !focused {
+        if let Some((line, ok)) = rv.shipped.as_ref().filter(|_| rv.message.is_empty() && !focused) {
+            let (mark, c) = if *ok { ("✓ ", t.done) } else { ("✕ ", t.del) };
+            r.text(fx, r.center(field, UI, 12.5), &format!("{mark}{line}"), UI, 12.5, 500, c, field.w - lw - 34.0);
+        } else if rv.message.is_empty() && !focused {
             r.text(fx, r.center(field, MONO, 12.5), "commit message", MONO, 12.5, 400, t.faint, field.w - lw - 34.0);
         } else {
             self.field_text(r, t, fx, r.center(field, MONO, 12.5), &rv.message, MONO, 12.5, field.w - lw - 34.0, focused, self.caret_for(Focus::CommitMsg, &rv.message), t.work);
@@ -750,19 +910,73 @@ impl App {
         let dim = |c: Rgba| if rv.busy { alpha(c, 110) } else { c };
         r.frame(discard, 4.0, t.bg, if rv.discard_armed { t.del } else { t.border2 });
         r.text(discard.x + 14.0, r.center(discard, UI, 13.0), discard_label, UI, 13.0, 400, dim(t.del), dw);
-        r.frame(commit, 4.0, t.dialog, t.border2);
-        r.text(commit.x + 14.0, r.center(commit, UI, 13.0), "Commit", UI, 13.0, 400, dim(t.text), cw);
-        r.rect(pr, 4.0, dim(t.primary_bg));
-        let plw = r.text(pr.x + 14.0, r.center(pr, UI, 13.0), pr_label, UI, 13.0, 500, t.primary_fg, pw);
-        r.text(pr.x + 24.0 + plw, r.center(pr, MONO, 10.0), pr_key, MONO, 10.0, 400, alpha(t.primary_fg, 150), 60.0);
+        // Confirmation: green with "✓ Merged into main", easing back to normal over its last fifth.
+        let flash = rv.flash.as_ref().map(|(l, at)| (l, at.elapsed().as_secs_f32() / FLASH.as_secs_f32())).filter(|f| f.1 < 1.0);
+        let fill = match flash {
+            Some((_, k)) => blend(t.done, t.primary_bg, ((k - 0.8) / 0.2).clamp(0.0, 1.0)),
+            None => dim(t.primary_bg),
+        };
+        r.rect(ship, 4.0, fill);
+        let fg = if flash.is_some() { readable(t.on_accent, t.done) } else { t.primary_fg };
+        if let Some((label, _)) = flash.filter(|f| f.1 < 0.8) {
+            r.text(ship.x + 14.0, r.center(ship, UI, 13.0), &format!("✓  {label}"), UI, 13.0, 600, fg, ship.w - 20.0);
+        } else if let Some(s) = rv.shipping.filter(|_| rv.busy) {
+            let verb = match s {
+                Ship::Commit => "Committing",
+                Ship::Merge => "Merging",
+                Ship::Pr => "Opening PR",
+            };
+            let ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
+            let dots = ".".repeat(1 + (ms / 400) as usize % 3);
+            r.text(ship.x + 14.0, r.center(ship, UI, 13.0), &format!("{verb}{dots}"), UI, 13.0, 500, alpha(t.primary_fg, 200), ship.w - 20.0);
+        } else {
+            let mlw = r.text(merge.x + 14.0, r.center(merge, UI, 13.0), &merge_label, UI, 13.0, 500, fg, mw);
+            r.text(merge.x + 24.0 + mlw, r.center(merge, MONO, 10.0), merge_key, MONO, 10.0, 400, alpha(fg, 150), 60.0);
+            r.rect(Rect::new(chev.x, by + 9.0, 1.0, h - 18.0), 0.0, alpha(fg, 70));
+            r.path(9, "M18 26L32 40L46 26", Some(6.0), chev.x + 9.0, by + 13.0, 12.0, fg);
+        }
+        let open = rv.ship_menu.is_some();
         if !rv.busy {
             if self.hit(r, discard) {
                 acts.push(ReviewAction::Discard);
-            } else if self.hit(r, commit) {
-                acts.push(ReviewAction::Commit(false));
-            } else if self.hit(r, pr) {
-                acts.push(ReviewAction::Commit(true));
+            } else if self.hit(r, merge) {
+                match (conflicted, ended) {
+                    (false, _) => acts.push(ReviewAction::Commit(Ship::Merge)),
+                    (true, false) => acts.push(ReviewAction::AskResolve),
+                    (true, true) => acts.push(ReviewAction::ShipMenu(!open)),
+                }
+            } else if self.hit(r, chev) {
+                acts.push(ReviewAction::ShipMenu(!open));
             }
         }
+        if !open {
+            return None;
+        }
+        if self.click.is_some_and(|p| !chev.contains(p)) {
+            acts.push(ReviewAction::ShipMenu(false)); // a click anywhere else closes it
+        }
+
+        // The menu opens upward from the button, right-aligned to it.
+        let items = if conflicted {
+            vec![(format!("Take all of {branch}"), String::new(), ReviewAction::TakeSide(true)), (format!("Take all of {base}"), String::new(), ReviewAction::TakeSide(false))]
+        } else {
+            vec![("Commit only".into(), "↵ in the message".into(), ReviewAction::Commit(Ship::Commit)), ("Commit & open PR".into(), String::new(), ReviewAction::Commit(Ship::Pr))]
+        };
+        let menu_w = 220.0f32.max(ship.w);
+        let menu = Rect::new(ship.x + ship.w - menu_w, ship.y - 8.0 - (8.0 + items.len() as f32 * 30.0), menu_w, 8.0 + items.len() as f32 * 30.0);
+        r.rect(Rect::new(menu.x - 1.0, menu.y + 3.0, menu.w + 2.0, menu.h + 2.0), 8.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
+        r.frame(menu, 6.0, t.bg, t.border2);
+        r.target(menu, Cursor::Arrow);
+        for (i, (label, hint, action)) in items.into_iter().enumerate() {
+            let row = Rect::new(menu.x + 4.0, menu.y + 4.0 + i as f32 * 30.0, menu.w - 8.0, 30.0);
+            r.text(row.x + 10.0, r.center(row, UI, 13.0), &label, UI, 13.0, 400, t.text, row.w - 20.0);
+            let hw = r.measure(UI, 11.0, 400, &hint);
+            r.text(row.x + row.w - 10.0 - hw, r.center(row, UI, 11.0), &hint, UI, 11.0, 400, t.text3, hw + 2.0);
+            r.target(row, Cursor::Pointer);
+            if menu_click.is_some_and(|p| row.contains(p)) {
+                acts.push(action);
+            }
+        }
+        Some(menu)
     }
 }

@@ -1,7 +1,7 @@
 //! `arranger serve`: one thread, one mio loop owning every PTY, client and task.
 
 use crate::adapter::{self, Osc};
-use crate::proto::{self, Event, Reply, Request, TaskInfo};
+use crate::proto::{self, Event, Reply, Request, Ship, TaskInfo};
 use crate::pty::{self, Pty};
 use crate::review;
 use alacritty_terminal::term::TermMode;
@@ -84,6 +84,10 @@ struct Job {
     out: std::io::PipeReader,
     buf: Vec<u8>,
     conn: Token,
+    task: u64,
+    /// The worktree's HEAD when the job started.
+    head: String,
+    ship: Ship,
 }
 
 struct Daemon {
@@ -141,6 +145,8 @@ pub fn run() -> io::Result<()> {
         "base TEXT NOT NULL DEFAULT ''",
         "base_commit TEXT NOT NULL DEFAULT ''",
         "summary TEXT NOT NULL DEFAULT ''",
+        "reviewed TEXT NOT NULL DEFAULT ''",
+        "shipped TEXT NOT NULL DEFAULT ''",
     ] {
         let _ = db.execute(&format!("ALTER TABLE tasks ADD COLUMN {col}"), []);
     }
@@ -375,6 +381,25 @@ impl Daemon {
                 Ok(r) => Reply::Review(r),
                 Err(e) => Reply::Error(e),
             },
+            Request::AbortMerge { id } => match self.task_paths(id).and_then(|(wt, _)| git(git_in(Path::new(&wt)).args(["merge", "--abort"]))) {
+                Ok(_) => Reply::Ok,
+                Err(e) => Reply::Error(e),
+            },
+            Request::TakeSide { id, ours } => {
+                let side = if ours { "--ours" } else { "--theirs" };
+                let taken = self.task_paths(id).and_then(|(wt, _)| {
+                    let (files, _) = review::conflicts(Path::new(&wt))?;
+                    if files.is_empty() {
+                        return Ok(());
+                    }
+                    git(git_in(Path::new(&wt)).args(["checkout", side, "--"]).args(&files))?;
+                    git(git_in(Path::new(&wt)).arg("add").arg("--").args(&files)).map(drop)
+                });
+                match taken {
+                    Ok(()) => Reply::Ok,
+                    Err(e) => Reply::Error(e),
+                }
+            }
             Request::Revert { id, path, header } => {
                 let reverted = self.task_paths(id).and_then(|(wt, base)| review::revert(Path::new(&wt), &base, &path, &header));
                 match reverted {
@@ -396,7 +421,7 @@ impl Daemon {
                 }
                 None => Reply::Error(format!("task {id} isn't running")),
             },
-            Request::Commit { id, message, pr } => match self.commit(t, id, &message, pr) {
+            Request::Commit { id, message, ship } => match self.commit(t, id, &message, ship) {
                 Ok(()) => return, // JobDone comes when the script finishes
                 Err(e) => Reply::Error(e),
             },
@@ -804,7 +829,7 @@ impl Daemon {
 
     fn list(&self, with_files: bool) -> Result<Vec<TaskInfo>, String> {
         let mut stmt =
-            self.db.prepare("SELECT id, agent, branch, worktree, state, title, created, summary FROM tasks ORDER BY id").map_err(e2s)?;
+            self.db.prepare("SELECT id, agent, branch, worktree, state, title, created, summary, shipped FROM tasks ORDER BY id").map_err(e2s)?;
         let rows = stmt.query_map([], |r| {
             Ok(TaskInfo {
                 id: r.get(0)?,
@@ -820,6 +845,7 @@ impl Daemon {
                 asking: false,
                 since: 0,
                 summary: r.get(7)?,
+                shipped: r.get(8)?,
                 machine: 0,
             })
         });
@@ -848,12 +874,13 @@ impl Daemon {
         stmt.query_map([id], |r| r.get(0))?.collect()
     }
 
-    /// (worktree, base commit). Tasks from before base_commit was stored fall back to the fork point.
+    /// (worktree, commit the review diffs against). Tasks from before base_commit was stored fall
+    /// back to the fork point.
     fn task_paths(&self, id: u64) -> Result<(String, String), String> {
-        let (repo, wt, base_commit): (String, String, String) = self
+        let (repo, wt, base_commit, reviewed, base_branch): (String, String, String, String, String) = self
             .db
-            .query_row("SELECT repo, worktree, base_commit FROM tasks WHERE id = ?1", [id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            .query_row("SELECT repo, worktree, base_commit, reviewed, base FROM tasks WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })
             .optional()
             .map_err(e2s)?
@@ -861,7 +888,15 @@ impl Daemon {
         if !Path::new(&wt).exists() {
             return Err(format!("task {id} has no worktree"));
         }
-        let base = if base_commit.is_empty() { review::fork_point(Path::new(&wt), Path::new(&repo))? } else { base_commit };
+        // What you committed from Review is done with; the diff shows only what came after.
+        let base = if !reviewed.is_empty() {
+            reviewed
+        } else if base_commit.is_empty() {
+            review::fork_point(Path::new(&wt), Path::new(&repo))?
+        } else {
+            base_commit
+        };
+        let base = review::diff_base(Path::new(&wt), &base, if base_branch == "HEAD" { "" } else { &base_branch });
         Ok((wt, base))
     }
 
@@ -876,7 +911,10 @@ impl Daemon {
             Event::Summary { text } => Some(text.clone()),
             _ => None,
         });
+        let (conflicts, merging) = review::conflicts(Path::new(&wt))?;
         Ok(proto::Review {
+            conflicts,
+            merging,
             branch,
             base: if base.is_empty() { "HEAD".into() } else { base },
             summary: summary.unwrap_or_default(),
@@ -885,7 +923,7 @@ impl Daemon {
         })
     }
 
-    fn commit(&mut self, conn: Token, id: u64, message: &str, pr: bool) -> Result<(), String> {
+    fn commit(&mut self, conn: Token, id: u64, message: &str, ship: Ship) -> Result<(), String> {
         let (wt, _) = self.task_paths(id)?;
         let (title, base): (String, String) = self
             .db
@@ -896,7 +934,7 @@ impl Daemon {
         let base = if base == "HEAD" { String::new() } else { base };
         let (out, write) = std::io::pipe().map_err(e2s)?;
         let child = Command::new("sh")
-            .args(["-c", review::COMMIT_SCRIPT, "arranger-commit", &message, if pr { "pr" } else { "" }, &summary, &base])
+            .args(["-c", review::COMMIT_SCRIPT, "arranger-commit", &message, match ship { Ship::Commit => "", Ship::Merge => "merge", Ship::Pr => "pr" }, &summary, &base])
             .current_dir(&wt)
             .stdin(std::process::Stdio::null())
             .stdout(write.try_clone().map_err(e2s)?)
@@ -907,7 +945,8 @@ impl Daemon {
         let n = self.next_job;
         self.next_job += 1;
         self.poll.registry().register(&mut SourceFd(&out.as_raw_fd()), Token(JOB + n), Interest::READABLE).map_err(e2s)?;
-        self.jobs.insert(n, Job { child, out, buf: Vec::new(), conn });
+        let head = review::resolve(Path::new(&wt), "HEAD").unwrap_or_default();
+        self.jobs.insert(n, Job { child, out, buf: Vec::new(), conn, task: id, head, ship });
         Ok(())
     }
 
@@ -927,6 +966,24 @@ impl Daemon {
         let mut job = self.jobs.remove(&n).unwrap();
         let ok = job.child.wait().is_ok_and(|s| s.success());
         let output = String::from_utf8_lossy(&job.buf).trim().to_string();
+        // Review now starts from what was committed. A failed merge or PR may still have committed
+        // first, so a moved HEAD counts too.
+        if let Ok(head) = self.task_paths(job.task).and_then(|(wt, _)| review::resolve(Path::new(&wt), "HEAD")) {
+            // Not mid-merge, though: those changes aren't settled yet.
+            let merging = self.task_paths(job.task).is_ok_and(|(wt, _)| review::conflicts(Path::new(&wt)).is_ok_and(|c| c.1));
+            if (ok || head != job.head) && !merging {
+                let _ = self.db.execute("UPDATE tasks SET reviewed = ?1 WHERE id = ?2", params![head, job.task]);
+            }
+        }
+        if ok {
+            let shipped = match job.ship {
+                Ship::Commit => "committed",
+                Ship::Merge => "merged",
+                Ship::Pr => "PR",
+            };
+            let _ = self.db.execute("UPDATE tasks SET shipped = ?1 WHERE id = ?2", params![shipped, job.task]);
+            self.dirty = true;
+        }
         self.send(job.conn, &proto::frame(&Reply::JobDone { ok, output }));
     }
 

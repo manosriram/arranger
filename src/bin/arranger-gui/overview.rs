@@ -122,7 +122,9 @@ impl App {
             }
             state_icon(r, t, &task.state, col_x[0], row.y + row.h / 2.0, bg);
             let (x, w) = col("TASK");
-            r.text(x, r.center(row, UI, 12.5), &title(task), UI, 12.5, 400, if g == 4 { t.text3 } else if on { t.tc_on } else { t.text }, w);
+            let bw = if task.shipped.is_empty() { 0.0 } else { r.measure(UI, 10.5, 500, &format!("✓ {}", task.shipped)) + 16.0 };
+            let tw = r.text(x, r.center(row, UI, 12.5), &title(task), UI, 12.5, 400, if g == 4 { t.text3 } else if on { t.tc_on } else { t.text }, w - bw);
+            ship_badge(r, t, &task.shipped, x + tw + 6.0, row.y + row.h / 2.0);
             if multi {
                 let (x, w) = col("MACHINE");
                 r.text(x, r.center(row, MONO, 11.0), self.hosts[task.machine].name(), MONO, 11.0, 400, t.text2, w);

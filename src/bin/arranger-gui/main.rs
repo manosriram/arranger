@@ -10,7 +10,7 @@ mod theme;
 use arranger::adapter;
 use arranger::client::{connect, connect_at, request_at};
 use arranger::machine::{self, Machine};
-use arranger::proto::{self, Event, Reply, Request, TaskInfo};
+use arranger::proto::{self, Event, Reply, Request, Ship, TaskInfo};
 use arranger::screen::Screen;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
@@ -421,18 +421,21 @@ const BLINK: Duration = Duration::from_millis(530);
 impl ApplicationHandler<Msg> for App {
     fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
         if let StartCause::ResumeTimeReached { .. } = cause {
-            self.caret_on = !self.caret_on;
-            self.blink_at = Instant::now() + BLINK;
+            if Instant::now() >= self.blink_at {
+                self.caret_on = !self.caret_on;
+                self.blink_at = Instant::now() + BLINK;
+            }
             self.redraw();
         }
     }
 
-    /// Wakes only to blink the caret, and only while a text field has focus.
+    /// Wakes only to blink the caret while a text field has focus, or to animate the Review button.
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        if matches!(self.focus, Focus::Term | Focus::Normal) {
-            el.set_control_flow(ControlFlow::Wait);
-        } else {
-            el.set_control_flow(ControlFlow::WaitUntil(self.blink_at));
+        let blink = (!matches!(self.focus, Focus::Term | Focus::Normal)).then_some(self.blink_at);
+        let frame = self.review.as_ref().filter(|rv| rv.animating()).map(|_| Instant::now() + Duration::from_millis(33));
+        match blink.into_iter().chain(frame).min() {
+            Some(at) => el.set_control_flow(ControlFlow::WaitUntil(at)),
+            None => el.set_control_flow(ControlFlow::Wait),
         }
     }
 
@@ -1359,7 +1362,7 @@ impl App {
                 Key::Named(NamedKey::Enter) if self.dialog.is_some() => self.actions.push(Action::Start(true)),
                 Key::Named(NamedKey::Enter) if self.review.is_some() => {
                     let note = self.review.as_ref().and_then(|rv| rv.editing).filter(|_| self.focus == Focus::Note);
-                    self.actions.push(Action::Review(note.map_or(ReviewAction::Commit(true), ReviewAction::SendNote)));
+                    self.actions.push(Action::Review(note.map_or(ReviewAction::Commit(Ship::Merge), ReviewAction::SendNote)));
                 }
                 _ => {}
             }
@@ -1506,7 +1509,7 @@ impl App {
                     }
                 }
                 Focus::Note => self.actions.push(Action::Review(ReviewAction::SaveNote)),
-                Focus::CommitMsg => self.actions.push(Action::Review(ReviewAction::Commit(false))),
+                Focus::CommitMsg => self.actions.push(Action::Review(ReviewAction::Commit(Ship::Commit))),
                 Focus::Prompt | Focus::Base | Focus::Repo => self.actions.push(Action::Start(false)),
                 Focus::HostSsh | Focus::HostName | Focus::HostRepo => self.actions.push(Action::AddHost),
                 _ => self.focus = self.rest(),
@@ -2028,7 +2031,10 @@ impl App {
             tw + 11.0
         };
         let tc = if g == 4 { t.text3 } else if on { t.tc_on } else { t.tc };
-        r.text(text_x, r.center(top, UI, 12.5), &title(task), UI, 12.5, 400, tc, row.w - 28.0 - right_w - 14.0);
+        let room = row.w - 28.0 - right_w - 14.0;
+        let bw = if task.shipped.is_empty() { 0.0 } else { r.measure(UI, 10.5, 500, &format!("✓ {}", task.shipped)) + 16.0 };
+        let tw = r.text(text_x, r.center(top, UI, 12.5), &title(task), UI, 12.5, 400, tc, room - bw);
+        ship_badge(r, t, &task.shipped, text_x + tw + 6.0, top.y + top.h / 2.0);
         let sub = Rect::new(text_x, top.y + top.h - 3.0, row.w - 36.0, 16.0);
         let sc = match g {
             0 => t.needs,
@@ -2075,7 +2081,7 @@ impl App {
         if self.hit(r, review) {
             self.actions.push(Action::OpenReview);
         }
-        let tx = pill.x + pw + 10.0;
+        let tx = pill.x + pw + 6.0 + ship_badge(r, t, &task.shipped, pill.x + pw + 6.0, pill.y + pill.h / 2.0) + 4.0;
         let title_w = r.text(tx, r.center(head, UI, 13.5), &title(&task), UI, 13.5, 500, t.text, (head.w - (tx - head.x) - meta_w - 26.0 - bw).max(40.0));
         let mx = tx + title_w + 10.0;
         let kw = r.text(mx, r.center(head, MONO, 11.0), kind, MONO, 11.0, 400, accent(kind), 100.0);
@@ -2647,6 +2653,19 @@ fn caret_line(text: &str, lines: &[String], at: usize) -> (usize, usize) {
 }
 
 /// State icon in a 12px box at (x, cy): square, ring, faint ring, check.
+/// Green "✓ merged" chip for a task whose work left Review; its width (0 if none).
+fn ship_badge(r: &mut Renderer, t: &Theme, shipped: &str, x: f32, cy: f32) -> f32 {
+    if shipped.is_empty() {
+        return 0.0;
+    }
+    let label = format!("✓ {shipped}");
+    let w = r.measure(UI, 10.5, 500, &label) + 10.0;
+    let chip = Rect::new(x, cy - 8.0, w, 16.0);
+    r.rect(chip, 3.0, alpha(t.done, 0x26));
+    r.text(chip.x + 5.0, r.center(chip, UI, 10.5), &label, UI, 10.5, 500, t.done, w);
+    w
+}
+
 fn state_icon(r: &mut Renderer, t: &Theme, state: &str, x: f32, cy: f32, bg: Rgba) {
     let c = state_color(t, state);
     match group(state) {

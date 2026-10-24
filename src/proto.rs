@@ -9,7 +9,7 @@ use std::path::PathBuf;
 const MAX_FRAME: usize = 64 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 8;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -39,10 +39,24 @@ pub enum Request {
     Revert { id: u64, path: String, header: String },
     /// Type `text` into the agent and submit it, as a new prompt.
     Prompt { id: u64, text: String },
-    /// Commit everything in the worktree; with `pr`, push and open a PR. Replied to with JobDone.
-    Commit { id: u64, message: String, pr: bool },
+    /// Commit everything in the worktree, then maybe merge or open a PR. Replied to with JobDone.
+    Commit { id: u64, message: String, ship: Ship },
     /// The task's recorded PTY output (zstd), for replaying a finished task's chat.
     Log { id: u64 },
+    /// Undo the merge under way in the task's worktree.
+    AbortMerge { id: u64 },
+    /// Settle every conflict with one side: the task's branch (`ours`) or its base.
+    TakeSide { id: u64, ours: bool },
+}
+
+/// What happens after the commit.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum Ship {
+    Commit,
+    /// Into the task's base branch.
+    Merge,
+    /// Push and open a PR against the base branch.
+    Pr,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -86,6 +100,8 @@ pub struct TaskInfo {
     pub since: u64,
     /// First line of the agent's last reply, or "".
     pub summary: String,
+    /// How its work last left Review: "committed", "merged" or "PR"; "" if it hasn't.
+    pub shipped: String,
     /// Which machine the GUI got this task from (an index into its machine list); not sent.
     #[serde(skip)]
     pub machine: usize,
@@ -101,6 +117,10 @@ pub struct Review {
     /// Check-like commands the agent ran (test, build, lint…): ok is None while running.
     pub checks: Vec<(String, Option<bool>)>,
     pub files: Vec<FileDiff>,
+    /// Files a merge left with conflict markers in the worktree.
+    pub conflicts: Vec<String>,
+    /// A merge is under way in the worktree (conflicts, or resolved and not yet committed).
+    pub merging: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
