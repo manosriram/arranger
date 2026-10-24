@@ -3,6 +3,7 @@
 //! that triggered it. Redraws happen only on input or daemon pushes, so idle CPU is zero.
 
 mod overview;
+mod sound;
 mod render;
 mod review;
 mod theme;
@@ -307,6 +308,9 @@ struct App {
     anchor: Option<(Focus, usize)>,
     /// The text field a mouse press landed in, while the button is held: moving drags a selection.
     text_drag: Option<Focus>,
+    chat_selection: Option<(TaskKey, (i32, usize), (i32, usize))>,
+    chat_drag: bool,
+    chat_copy: String,
     /// The field and byte offset under a press or drag, found while drawing that field.
     text_hit: std::cell::Cell<Option<(Focus, usize)>>,
     /// Caret in the focused field, as a byte offset; None (or another field) is its end.
@@ -398,6 +402,9 @@ fn run() -> io::Result<()> {
         collapsed: Default::default(),
         anchor: None,
         text_drag: None,
+        chat_selection: None,
+        chat_drag: false,
+        chat_copy: String::new(),
         text_hit: Default::default(),
         caret: None,
         sidebar_w: SIDEBAR_W,
@@ -633,7 +640,7 @@ impl ApplicationHandler<Msg> for App {
                     *if d == Divider::Sidebar { &mut self.sidebar_w } else { &mut self.rail_w } = w;
                     self.redraw();
                 }
-                if self.text_drag.is_some() {
+                if self.text_drag.is_some() || self.chat_drag {
                     self.redraw();
                 }
                 self.hover_changed();
@@ -643,13 +650,18 @@ impl ApplicationHandler<Msg> for App {
                 self.hover_changed();
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                self.chat_drag = false;
                 self.dragging = self.divider_at(self.mouse);
                 if self.dragging.is_none() {
                     self.click = Some(self.mouse);
                 }
                 self.redraw();
             }
-            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => (self.dragging, self.text_drag) = (None, None),
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                self.dragging = None;
+                self.text_drag = None;
+                self.chat_drag = false;
+            },
             WindowEvent::MouseWheel { delta, .. } => match delta {
                 // A wheel notch glides; a trackpad already sends fine steps.
                 MouseScrollDelta::LineDelta(_, y) => {
@@ -1130,6 +1142,13 @@ impl App {
             t.machine = m;
         }
         if let Some(h) = self.hosts.get_mut(m).filter(|h| !h.removed) {
+            if tasks.iter().any(|task| {
+                h.tasks.iter().find(|old| old.id == task.id).is_some_and(|old| {
+                    sound::should_ding(&old.state, &task.state)
+                })
+            }) {
+                sound::ding();
+            }
             h.tasks = tasks;
         }
     }
@@ -1586,6 +1605,7 @@ impl App {
                     "i" => self.actions.push(Action::Focus(Focus::Message)),
                     "v" => self.paste(),
                     "a" if self.focus != Focus::Term => self.select_all(),
+                    "c" if self.focus == Focus::Term && !self.chat_copy.is_empty() => set_clipboard(&self.chat_copy),
                     "c" | "x" if self.focus != Focus::Term => {
                         if let Some((from, to)) = self.selection() {
                             let focus = self.focus;
@@ -2581,10 +2601,34 @@ impl App {
                 let rows = found.or((scrolled && extra > 0).then(|| screen.grid().screen_lines() - extra)).unwrap_or(screen.grid().screen_lines()) as f32;
                 // The last text sits on the pane's bottom, just above our input box, with scrollback
                 // filling the space above it. When everything fits, the first text sits at the top instead.
+                let off = g.display_offset() as i32;
                 let shift = chat_shift(screen, rows as usize, grid.h);
                 let frac = self.wheel * LINE_H; // scrolled partway into the line above
                 r.set_clip(Some(Rect::new(sec.x, sec.y, sec.w, (sec.h - bar_h).min(grid.y + shift + frac - sec.y + rows * LINE_H))));
-                draw_term(r, t, screen, Rect { y: grid.y + shift + frac, ..grid }, sec.y, cell_w, term_focus);
+                let origin = grid.y + shift + frac;
+                let key = (task.machine, task.id);
+                if self.chat_selection.is_some_and(|s| s.0 != key) {
+                    self.chat_selection = None;
+                    self.chat_copy.clear();
+                }
+                let visible_bottom = (sec.y + sec.h - bar_h).min(origin + rows * LINE_H).min(if ended { input_area.y } else { ib.y - 9.0 });
+                let selectable = Rect::new(sec.x, sec.y, sec.w, (visible_bottom - sec.y).max(0.0));
+                let pressed = self.click.is_some_and(|p| selectable.contains(p)) && self.dialog.is_none() && self.add_host.is_none() && !self.menu;
+                if pressed || self.chat_drag {
+                    let row = (((self.mouse.1.clamp(sec.y, visible_bottom.max(sec.y)) - origin) / LINE_H).floor() as i32 - off)
+                        .clamp(-(g.history_size() as i32), g.screen_lines() as i32 - 1);
+                    let col = (((self.mouse.0 - grid.x) / cell_w).round().max(0.0) as usize).min(g.columns());
+                    let point = (row, col);
+                    if pressed {
+                        self.chat_selection = Some((key, point, point));
+                        self.chat_drag = true;
+                    } else if let Some(selection) = &mut self.chat_selection {
+                        selection.2 = point;
+                    }
+                }
+                let selection = self.chat_selection.filter(|s| s.0 == key).map(|s| if s.1 <= s.2 { (s.1, s.2) } else { (s.2, s.1) });
+                self.chat_copy = selection.map_or_else(String::new, |(a, b)| chat_selected_text(screen, a, b));
+                draw_term(r, t, screen, Rect { y: origin, ..grid }, sec.y, cell_w, term_focus, selection);
                 r.set_clip(None);
             }
             None => {
@@ -3295,6 +3339,31 @@ fn logo(r: &mut Renderer, x: f32, y: f32, size: f32, ink: Rgba, amber: Rgba) {
     r.path(4, "M27.5 45a4.5 4.5 0 1 0 9 0a4.5 4.5 0 1 0 -9 0", None, x, y, size, amber);
 }
 
+/// Extract a half-open range, preserving terminal wraps and Unicode combining characters.
+fn chat_selected_text(screen: &Screen, a: (i32, usize), b: (i32, usize)) -> String {
+    let g = screen.grid();
+    let mut text = String::new();
+    let first = a.0.max(-(g.history_size() as i32));
+    let last = b.0.min(g.screen_lines() as i32 - 1);
+    for row in first..=last {
+        let line = &g[Line(row)];
+        let start = if row == a.0 { a.1 } else { 0 };
+        let end = if row == b.0 { b.1 } else { g.columns() }.min(g.columns());
+        let mut part = String::new();
+        for col in start..end {
+            let cell = &line[Column(col)];
+            if !cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::HIDDEN) {
+                part.push(cell.c);
+                part.extend(cell.zerowidth().into_iter().flatten());
+            }
+        }
+        let wrapped = end == g.columns() && line[Column(g.columns() - 1)].flags.contains(Flags::WRAPLINE);
+        text.push_str(if wrapped { &part } else { part.trim_end() });
+        if row < last && !wrapped { text.push('\n'); }
+    }
+    text
+}
+
 /// Anchor layout to live content, independent of which scrollback rows are visible.
 /// Recomputing this from the viewport makes blank lines move the entire chat while scrolling.
 fn chat_shift(screen: &Screen, rows: usize, height: f32) -> f32 {
@@ -3311,7 +3380,7 @@ fn chat_shift(screen: &Screen, rows: usize, height: f32) -> f32 {
 }
 
 /// Draws the screen with its first row at `area.y`, and scrollback above that up to `top`.
-fn draw_term(r: &mut Renderer, t: &Theme, screen: &Screen, area: Rect, top: f32, cell_w: f32, focused: bool) {
+fn draw_term(r: &mut Renderer, t: &Theme, screen: &Screen, area: Rect, top: f32, cell_w: f32, focused: bool, selection: Option<((i32, usize), (i32, usize))>) {
     let grid = screen.grid();
     let mode = screen.mode();
     let (asc, desc) = r.vmetrics(MONO, TERM_SIZE);
@@ -3339,6 +3408,9 @@ fn draw_term(r: &mut Renderer, t: &Theme, screen: &Screen, area: Rect, top: f32,
             let width = if cell.flags.contains(Flags::WIDE_CHAR) { cell_w * 2.0 } else { cell_w };
             if let Some(bg) = bg {
                 r.rect(Rect::new(x, y, width, LINE_H), 0.0, bg);
+            }
+            if selection.is_some_and(|(a, b)| a <= (row - offset, col) && (row - offset, col) < b) {
+                r.rect(Rect::new(x, y, width, LINE_H), 0.0, alpha(t.work, 90));
             }
             if cell.c != ' ' && !cell.flags.contains(Flags::HIDDEN) {
                 let weight = if cell.flags.contains(Flags::BOLD) { 600 } else { 400 };
@@ -3371,6 +3443,16 @@ fn draw_term(r: &mut Renderer, t: &Theme, screen: &Screen, area: Rect, top: f32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_selection_copies_ranges_and_wraps() {
+        let mut screen = Screen::new(8, 4);
+        screen.feed("hello world\r\n你好 e\u{301}".as_bytes());
+        assert_eq!(chat_selected_text(&screen, (0, 1), (0, 4)), "ell");
+        assert_eq!(chat_selected_text(&screen, (0, 0), (1, 3)), "hello world");
+        assert_eq!(chat_selected_text(&screen, (1, 0), (2, 6)), "rld\n你好 e\u{301}");
+        assert_eq!(chat_selected_text(&screen, (0, 2), (0, 2)), "");
+    }
 
     #[test]
     fn chat_anchor_stays_fixed_while_scrolling_across_blank_lines() {
