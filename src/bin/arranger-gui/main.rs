@@ -215,6 +215,8 @@ enum Action {
     Welcome,
     /// Start an ended task's agent again (resuming its session), sending it this prompt if any.
     Revive(TaskKey, String),
+    /// Stop the task's agent and remove it: its worktree, log and history.
+    Delete(TaskKey),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -243,6 +245,8 @@ struct App {
     help: bool,
     /// `g` was pressed and waits for a second `g`.
     pending_g: bool,
+    /// `d` was pressed on this task and waits for `y` (delete it) or `n`.
+    confirm_delete: Option<TaskKey>,
     /// When Esc was last pressed in vim mode: a second one soon after goes to the agent.
     last_esc: Option<Instant>,
     /// New-task prompts, oldest first (saved in gui.json), for ↑ in the dialog.
@@ -356,6 +360,7 @@ fn run() -> io::Result<()> {
         menu: false,
         scheme_btn: Rect::new(0.0, 0.0, 0.0, 0.0),
         help: false,
+        confirm_delete: None,
         pending_g: false,
         last_esc: None,
         prompts: Vec::new(),
@@ -1209,6 +1214,13 @@ impl App {
             _ => return,
         };
         let g = std::mem::take(&mut self.pending_g);
+        // `d` asked to delete a task: `y` does, any other key doesn't.
+        if let Some(task) = self.confirm_delete.take() {
+            if key == "y" {
+                self.actions.push(Action::Delete(task));
+            }
+            return;
+        }
         let files = self.review.as_ref().and_then(|rv| rv.data.as_ref()).map_or(0, |d| d.files.len());
         let file = self.review.as_ref().map(|rv| rv.file);
         match key.as_str() {
@@ -1236,6 +1248,7 @@ impl App {
             }
             "a" => self.actions.push(Action::Answer(true)),
             "x" => self.actions.push(Action::Answer(false)),
+            "d" if self.review.is_none() && !self.overview => self.confirm_delete = self.current().map(|t| (t.machine, t.id)),
             "r" => self.actions.push(Action::OpenReview),
             "n" => self.actions.push(Action::NewTask),
             "m" if self.review.is_none() && !self.overview => self.actions.push(Action::OpenAddHost),
@@ -1839,6 +1852,7 @@ impl App {
                 // An ended agent has no message box to type into.
                 Action::Focus(Focus::Message) if self.current().is_none_or(|t| group(&t.state) == 4) => {}
                 Action::Focus(f) => {
+                    self.confirm_delete = None;
                     if self.focus != f {
                         self.anchor = None;
                     }
@@ -1894,6 +1908,11 @@ impl App {
                         Ok(r) => self.revive_error = Some((key, format!("unexpected reply: {r:?}"))),
                         Err(e) => self.revive_error = Some((key, e.to_string())),
                     }
+                }
+                Action::Delete(key @ (m, id)) => {
+                    self.spawn_request(m, Tag::Delete, Request::Kill { id });
+                    self.stats.remove(&key);
+                    self.changes.remove(&key);
                 }
                 Action::OvHost(m) => {
                     self.ov_host = m;
@@ -2687,7 +2706,13 @@ impl App {
             r.text(9.0, y, label, MONO, 10.5, 500, if insert { t.on_accent } else { t.text }, pw);
             x = pw + 12.0;
         }
-        for (i, (sym, label)) in [("■", "need you"), ("●", "running"), ("○", "queued"), ("✓", "done")].iter().enumerate() {
+        let confirm = self.confirm_delete.filter(|_| self.focus == Focus::Normal).and_then(|k| self.task(k)).map(title);
+        if let Some(name) = &confirm {
+            // In place of the counts: the question `d` asked.
+            let qw = r.text(x, y, &format!("Delete task “{name}” and its worktree?"), MONO, 10.5, 500, t.del, (w / 2.0 - x).max(80.0));
+            r.text(x + qw + 10.0, y, "y / n", MONO, 10.5, 400, t.text2, 60.0);
+        }
+        for (i, (sym, label)) in [("■", "need you"), ("●", "running"), ("○", "queued"), ("✓", "done")].iter().enumerate().filter(|_| confirm.is_none()) {
             let c = [t.needs, t.work, t.text3, t.done][i];
             x += r.text(x, y, &format!("{sym} {} {label}", counts[i]), MONO, 10.5, 400, c, 200.0) + 14.0;
         }
