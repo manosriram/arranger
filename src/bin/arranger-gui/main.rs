@@ -1371,6 +1371,7 @@ impl App {
         } else if self.mouse.0 < self.sidebar_w {
             self.scroll = (self.scroll - dy).max(0.0);
         } else if self.review.is_none() && !self.welcome {
+            let dy = dy * 2.0;
             let id = self.selected;
             if let Some(s) = self.session.as_ref().filter(|s| Some(s.task) == id && s.screen.mode().contains(TermMode::ALT_SCREEN)) {
                 // Mouse-aware agents move several lines per wheel report; arrow-key fallback
