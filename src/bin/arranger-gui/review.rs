@@ -1043,9 +1043,11 @@ fn open_worktree_terminal(path: &str, remote: Option<&str>) -> std::io::Result<(
         None => script,
     };
     if cfg!(target_os = "macos") {
+        // Create the worktree window before activating Terminal: activating a
+        // stopped app first also opens an empty startup window.
         // Pass the shell command as argv, never as AppleScript source.
         let status = Command::new("osascript")
-            .args(["-e", "on run argv\ntell application \"Terminal\"\nactivate\ndo script (item 1 of argv)\nend tell\nend run", "--", &command])
+            .args(["-e", "on run argv\ntell application \"Terminal\"\ndo script (item 1 of argv)\nactivate\nend tell\nend run", "--", &command])
             .status()?;
         if status.success() { return Ok(()); }
         return Err(std::io::Error::other("Could not open Terminal"));

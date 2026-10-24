@@ -46,6 +46,8 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+#[cfg(target_os = "macos")]
+use winit::platform::macos::WindowAttributesExtMacOS;
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 const TITLE_H: f32 = 36.0;
@@ -477,6 +479,10 @@ fn init_gfx(el: &ActiveEventLoop) -> Result<Gfx, String> {
         .with_inner_size(LogicalSize::new(1280.0, 800.0))
         .with_visible(!snapshot) // dev snapshots render without showing a window or taking focus
         .with_active(!snapshot);
+    // Returning from a worktree terminal should focus the window and run the
+    // clicked action in one click.
+    #[cfg(target_os = "macos")]
+    let attrs = attrs.with_accepts_first_mouse(true);
     let (window, config) = DisplayBuilder::new()
         .with_window_attributes(Some(attrs))
         .build(el, ConfigTemplateBuilder::new(), |mut configs| configs.next().expect("a GL config"))
