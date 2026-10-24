@@ -14,12 +14,15 @@ pub struct Entry {
     pub id: Option<String>,
     pub role: Role,
     pub text: String,
+    /// Wrapped body lines for `Chat::width`; cleared whenever `text` changes.
+    lines: Option<Vec<Line>>,
 }
 #[derive(Default)]
 pub struct Chat {
     pub entries: Vec<Entry>,
     streamed: bool,
     height: f32,
+    width: f32,
 }
 impl Chat {
     pub fn event(&mut self, event: Event) {
@@ -30,17 +33,20 @@ impl Chat {
             Event::TurnDone | Event::TurnStarted => self.streamed = false,
             Event::Message { id, text, append } => {
                 self.streamed = true;
-                if let Some(entry) = self.entries.iter_mut().find(|e| e.id.as_ref() == Some(&id)) {
+                // Streams append to the latest message, so search from the end.
+                if let Some(entry) = self.entries.iter_mut().rev().find(|e| e.id.as_ref() == Some(&id)) {
                     if append {
                         entry.text.push_str(&text);
                     } else {
                         entry.text = text;
                     }
+                    entry.lines = None;
                 } else {
                     self.entries.push(Entry {
                         id: Some(id),
                         role: Role::Assistant,
                         text,
+                        lines: None,
                     });
                 }
             }
@@ -50,6 +56,7 @@ impl Chat {
             Event::ToolEnd { ok } => {
                 if let Some(entry) = self.entries.iter_mut().rev().find(|e| e.role == Role::Tool) {
                     entry.text.push_str(if ok { "  ✓" } else { "  failed" });
+                    entry.lines = None;
                 }
             }
             Event::Retrying { message } => self.push(Role::Notice, format!("Retrying: {message}")),
@@ -69,47 +76,83 @@ impl Chat {
                 id: None,
                 role,
                 text,
+                lines: None,
             });
         }
     }
 }
-struct Row {
+struct Line {
     text: String,
+    code: bool,
+}
+struct Row<'a> {
+    text: &'a str,
     role: Role,
     label: bool,
     code: bool,
 }
 const ROW: f32 = 21.0;
 
-/// Wrap at character boundaries, retaining indentation and supporting long paths/URLs.
-fn body_lines(text: &str, fits: impl Fn(&str) -> bool) -> Vec<String> {
+/// Wrap at character boundaries, retaining indentation and supporting long paths/URLs. Widths
+/// are summed per character so a paragraph wraps in linear time.
+fn body_lines(text: &str, width: f32, advance: impl Fn(char) -> f32) -> Vec<String> {
     let mut out = Vec::new();
     for paragraph in text.split('\n') {
         let mut line = String::new();
+        let mut w = 0.0;
         for ch in paragraph.chars() {
-            line.push(ch);
-            if line.chars().count() > 1 && !fits(&line) {
-                let last = line.pop().unwrap();
+            let a = advance(ch);
+            if !line.is_empty() && w + a > width {
                 let split = line.rfind(' ').filter(|&i| i > 0);
                 if let Some(at) = split {
                     let rest = line.split_off(at + 1);
                     line.pop();
                     out.push(std::mem::take(&mut line));
+                    w = rest.chars().map(&advance).sum();
                     line = rest;
                 } else {
                     out.push(std::mem::take(&mut line));
+                    w = 0.0;
                 }
-                line.push(last);
             }
+            line.push(ch);
+            w += a;
         }
         out.push(line);
     }
     out
 }
 
+/// An entry's body wrapped to `width`, with fenced code blocks in the mono font.
+fn layout(r: &Renderer, entry: &Entry, width: f32) -> Vec<Line> {
+    let mut lines = Vec::new();
+    let mut code = entry.role == Role::Tool;
+    for paragraph in entry.text.split('\n') {
+        if paragraph.trim_start().starts_with("```") {
+            code = !code;
+            continue;
+        }
+        let font = if code { MONO } else { UI };
+        for text in body_lines(paragraph, width, |c| r.advance(font, 13.0, 400, c)) {
+            lines.push(Line { text, code });
+        }
+    }
+    lines
+}
+
 impl App {
     pub fn draw_chat(&mut self, r: &mut Renderer, t: &Theme, area: Rect, task: &TaskInfo) {
         let key = (task.machine, task.id);
+        let width = area.w - 24.0;
+        if self.chat.width != width {
+            self.chat.width = width;
+            self.chat.entries.iter_mut().for_each(|e| e.lines = None);
+        }
+        for entry in &mut self.chat.entries {
+            if entry.lines.is_none() {
+                entry.lines = Some(layout(r, entry, width));
+            }
+        }
         let mut rows = Vec::new();
         for entry in &self.chat.entries {
             let label = match entry.role {
@@ -121,32 +164,22 @@ impl App {
             };
             if !label.is_empty() {
                 rows.push(Row {
-                    text: label.into(),
+                    text: label,
                     role: entry.role,
                     label: true,
                     code: false,
                 });
             }
-            let mut code = entry.role == Role::Tool;
-            for paragraph in entry.text.split('\n') {
-                if paragraph.trim_start().starts_with("```") {
-                    code = !code;
-                    continue;
-                }
-                let font = if code { MONO } else { UI };
-                for text in body_lines(paragraph, |line| {
-                    r.measure(font, 13.0, 400, line) <= area.w - 24.0
-                }) {
-                    rows.push(Row {
-                        text,
-                        role: entry.role,
-                        label: false,
-                        code,
-                    });
-                }
+            for line in entry.lines.iter().flatten() {
+                rows.push(Row {
+                    text: &line.text,
+                    role: entry.role,
+                    label: false,
+                    code: line.code,
+                });
             }
             rows.push(Row {
-                text: String::new(),
+                text: "",
                 role: entry.role,
                 label: false,
                 code: false,
@@ -195,7 +228,7 @@ impl App {
             .chat_selection
             .filter(|s| s.0 == key)
             .map(|s| (s.1.min(s.2), s.1.max(s.2)));
-        let strings: Vec<_> = rows.iter().map(|r| r.text.as_str()).collect();
+        let strings: Vec<_> = rows.iter().map(|r| r.text).collect();
         self.chat_copy = selection.map_or_else(String::new, |(a, b)| selected(&strings, a, b));
         r.set_clip(Some(area));
         if rows.is_empty() {
@@ -253,7 +286,7 @@ impl App {
             r.text(
                 area.x + 12.0,
                 y + 2.0,
-                &row.text,
+                row.text,
                 font,
                 if row.label { 11.0 } else { 13.0 },
                 if row.label { 600 } else { 400 },
@@ -330,7 +363,7 @@ mod tests {
     #[test]
     fn wraps_long_words_and_copies_unicode() {
         assert_eq!(
-            body_lines("你好abc", |s| s.chars().count() <= 2),
+            body_lines("你好abc", 2.0, |_| 1.0),
             vec!["你好", "ab", "c"]
         );
         assert_eq!(selected(&["你好", "world"], (0, 3), (1, 3)), "好\nwor");

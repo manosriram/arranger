@@ -137,6 +137,8 @@ pub fn run() -> io::Result<()> {
     std::env::set_current_dir(&data)?;
 
     let db = Connection::open(data.join("arranger.db")).map_err(io::Error::other)?;
+    // Chat streams record an event per token; WAL keeps each insert from forcing a journal sync.
+    db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;").map_err(io::Error::other)?;
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,6 +147,7 @@ pub fn run() -> io::Result<()> {
          CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY, task INTEGER NOT NULL, ts INTEGER NOT NULL, event TEXT NOT NULL);
          CREATE INDEX IF NOT EXISTS events_task ON events (task);
+         CREATE INDEX IF NOT EXISTS events_task_ts ON events (task, ts);
          UPDATE tasks SET state = 'dead' WHERE state = 'running';
          DELETE FROM tasks WHERE state = 'new';",
     )
@@ -701,7 +704,8 @@ impl Daemon {
 
     /// Stores an event and updates the task's derived state and action line.
     fn record(&mut self, id: u64, event: Event) {
-        self.dirty = true;
+        // Streamed text leaves the task list unchanged; pushing it per token floods every viewer.
+        self.dirty |= !matches!(event, Event::Message { .. } | Event::Usage { .. } | Event::ToolOutput { .. });
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let json = serde_json::to_string(&event).unwrap();
         if let Err(e) = self.db.execute("INSERT INTO events (task, ts, event) VALUES (?1, ?2, ?3)", params![id, ts, json]) {
@@ -721,7 +725,10 @@ impl Daemon {
                 let _ = self.db.execute("UPDATE tasks SET summary = ?1 WHERE id = ?2", params![line, id]);
                 return;
             }
-            Event::Message { text, append: true, .. } if task.activity == Activity::Retrying && !text.is_empty() => (Activity::Running, "working".into()),
+            Event::Message { text, append: true, .. } if task.activity == Activity::Retrying && !text.is_empty() => {
+                self.dirty = true;
+                (Activity::Running, "working".into())
+            }
             Event::Usage { .. } | Event::Message { .. } | Event::ToolOutput { .. } => return,
             // Completion/cleanup events do not erase a provider failure. Only real work or a new
             // prompt can recover it; the process may stay alive while the model is unavailable.

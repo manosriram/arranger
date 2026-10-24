@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Arranger · Chat UI prototypes</title>
+<style>
+  :root {
+    --bg:#0B0C0E; --panel:#0D0E10; --term:#090A0C; --raised:#1A1D22; --border:#1D2025; --border2:#2A2E35;
+    --row:#15181B; --text:#E8EAED; --text2:#A3A9B2; --text3:#7D848E; --faint:#4E555E; --sel:#16191D;
+    --add:#7EE2A8; --del:#FF8F80; --needs:#FFB547; --work:#6AA8FF; --done:#5FAE84; --dialog:#0F1113;
+    --ui: "Geist", -apple-system, BlinkMacSystemFont, "Inter", system-ui, sans-serif;
+    --mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; background:var(--bg); color:var(--text); font:13px/1.6 var(--ui); }
+  header { display:flex; align-items:center; gap:16px; padding:14px 20px; border-bottom:1px solid var(--border); position:sticky; top:0; background:var(--bg); z-index:5; }
+  header h1 { font-size:13px; font-weight:600; margin:0; letter-spacing:.2px; }
+  header .sub { color:var(--text3); font-size:12px; }
+  nav { display:flex; gap:4px; margin-left:auto; }
+  nav button { background:none; border:1px solid transparent; color:var(--text2); font:12px var(--ui); padding:5px 10px; border-radius:6px; cursor:pointer; }
+  nav button:hover { background:var(--sel); }
+  nav button.on { background:var(--raised); border-color:var(--border2); color:var(--text); }
+  nav kbd { font:10px var(--mono); color:var(--faint); margin-right:6px; }
+
+  .proto { display:none; padding:20px; }
+  .proto.on { display:block; }
+  .brief { max-width:1180px; margin:0 auto 14px; display:flex; gap:24px; align-items:flex-start; }
+  .brief h2 { font-size:15px; margin:0 0 4px; font-weight:600; }
+  .brief p { margin:0; color:var(--text2); max-width:640px; }
+  .brief ul { margin:0; padding:0; list-style:none; color:var(--text3); font-size:12px; min-width:280px; }
+  .brief li::before { content:"· "; color:var(--faint); }
+  .brief .pro { color:var(--add); } .brief .con { color:var(--del); }
+
+  /* App window chrome shared by every prototype */
+  .win { max-width:1180px; height:640px; margin:0 auto; border:1px solid var(--border); border-radius:10px; overflow:hidden; display:grid; grid-template-columns:220px 1fr; background:var(--panel); }
+  .side { border-right:1px solid var(--border); padding:10px 8px; background:var(--bg); }
+  .side .t { padding:7px 10px; border-radius:6px; color:var(--text2); display:flex; gap:8px; align-items:center; font-size:12px; }
+  .side .t.on { background:var(--sel); color:var(--text); box-shadow:inset 0 0 0 1px #262A30; }
+  .dot { width:7px; height:7px; border-radius:50%; flex:none; }
+  .d-work { background:var(--work); } .d-needs { background:var(--needs); } .d-done { background:var(--done); }
+  .main { display:flex; flex-direction:column; min-width:0; min-height:0; }
+  .top { padding:10px 16px; border-bottom:1px solid var(--border); display:flex; gap:10px; align-items:center; font-size:12px; color:var(--text3); }
+  .top b { color:var(--text); font-weight:600; }
+  .pill { font:11px var(--mono); padding:1px 7px; border-radius:99px; border:1px solid var(--border2); color:var(--text2); }
+  .pill.work { color:var(--work); border-color:#24406a; }
+  .scroll { flex:1; overflow:auto; min-height:0; }
+  .composer { border-top:1px solid var(--border); padding:10px 14px; display:flex; gap:10px; align-items:flex-end; }
+  .composer .box { flex:1; background:var(--term); border:1px solid var(--border2); border-radius:8px; padding:9px 12px; color:var(--text3); min-height:38px; }
+  .composer .hint { font:11px var(--mono); color:var(--faint); white-space:nowrap; padding-bottom:9px; }
+  .btn { font:12px var(--ui); padding:5px 12px; border-radius:6px; border:1px solid var(--border2); background:var(--raised); color:var(--text); cursor:pointer; }
+  .btn.primary { background:var(--text); color:var(--bg); border-color:var(--text); font-weight:600; }
+  .btn kbd { font:10px var(--mono); opacity:.6; margin-left:6px; }
+  code, pre { font-family:var(--mono); font-size:12px; }
+  pre { margin:6px 0; background:var(--term); border:1px solid var(--border); border-radius:6px; padding:10px 12px; overflow:auto; color:var(--text2); }
+  .caret { display:inline-block; width:7px; height:14px; background:var(--text); vertical-align:-2px; animation:blink 1.06s steps(1) infinite; }
+  @keyframes blink { 50% { opacity:0; } }
+  .muted { color:var(--text3); } .ok { color:var(--add); } .bad { color:var(--del); }
+  details > summary { cursor:pointer; list-style:none; }
+  details > summary::-webkit-details-marker { display:none; }
+
+  /* 1 · Transcript+ */
+  .p1 .msg { padding:10px 18px; }
+  .p1 .who { font-size:11px; font-weight:600; color:var(--text3); text-transform:uppercase; letter-spacing:.5px; margin-bottom:2px; }
+  .p1 .msg.user { background:var(--raised); border-left:2px solid var(--text3); }
+  .p1 .steps { margin:4px 18px 4px; border:1px solid var(--border); border-radius:6px; }
+  .p1 .steps summary { padding:6px 10px; color:var(--text3); font-size:12px; display:flex; gap:8px; }
+  .p1 .steps summary::before { content:"▸"; color:var(--faint); }
+  .p1 .steps[open] summary::before { content:"▾"; }
+  .p1 .step { font:12px var(--mono); padding:3px 10px 3px 26px; color:var(--text2); border-top:1px solid var(--row); display:flex; gap:8px; }
+  .p1 .step .k { color:var(--text3); width:44px; flex:none; }
+  .p1 .step .r { margin-left:auto; }
+  .p1 .ask { margin:8px 18px; border:1px solid #5a4318; background:#1a140a; border-radius:8px; padding:10px 12px; }
+  .p1 .ask .h { color:var(--needs); font-size:11px; font-weight:600; letter-spacing:.5px; }
+
+  /* 2 · Bubbles */
+  .p2 .scroll { padding:16px 0; }
+  .p2 .row { display:flex; padding:4px 22px; }
+  .p2 .row.user { justify-content:flex-end; }
+  .p2 .bub { max-width:68%; padding:9px 13px; border-radius:14px; }
+  .p2 .user .bub { background:#1f2a3c; border-bottom-right-radius:4px; }
+  .p2 .agent .bub { background:transparent; padding-left:0; max-width:78%; }
+  .p2 .av { width:22px; height:22px; border-radius:6px; background:var(--raised); border:1px solid var(--border2); font:10px var(--mono); display:grid; place-items:center; color:var(--text2); margin:9px 10px 0 0; flex:none; }
+  .p2 .chips { display:flex; flex-wrap:wrap; gap:6px; padding:2px 22px 6px 54px; }
+  .p2 .chip { font:11px var(--mono); padding:3px 9px; border-radius:99px; background:var(--sel); border:1px solid var(--border2); color:var(--text2); }
+  .p2 .chip .ok, .p2 .chip .bad { margin-left:4px; }
+  .p2 .meta { font-size:11px; color:var(--faint); padding:0 22px 0 54px; }
+  .p2 .ask { margin:8px 22px 8px 54px; max-width:68%; border-radius:14px; border:1px solid #5a4318; padding:10px 13px; background:#1a140a; }
+
+  /* 3 · Timeline */
+  .p3 .scroll { padding:14px 22px; }
+  .p3 .turn { position:relative; padding-left:26px; }
+  .p3 .turn::before { content:""; position:absolute; left:7px; top:6px; bottom:0; width:1px; background:var(--border2); }
+  .p3 .ev { position:relative; padding:3px 0 9px; }
+  .p3 .ev::before { content:""; position:absolute; left:-23px; top:8px; width:9px; height:9px; border-radius:50%; background:var(--bg); border:2px solid var(--faint); }
+  .p3 .ev.user::before { border-color:var(--text); background:var(--text); }
+  .p3 .ev.tool::before { border-color:var(--done); width:7px; height:7px; left:-22px; top:9px; }
+  .p3 .ev.tool.fail::before { border-color:var(--del); }
+  .p3 .ev.agent::before { border-color:var(--work); }
+  .p3 .ev.ask::before { border-color:var(--needs); background:var(--needs); }
+  .p3 .ev.live::before { border-color:var(--work); animation:pulse 1.2s infinite; }
+  @keyframes pulse { 50% { box-shadow:0 0 0 5px #6aa8ff22; } }
+  .p3 .ts { font:11px var(--mono); color:var(--faint); margin-right:8px; }
+  .p3 .tool .line { font:12px var(--mono); color:var(--text2); }
+  .p3 .user .body { font-weight:500; }
+  .p3 .askcard { border:1px solid #5a4318; border-radius:6px; padding:8px 10px; margin-top:4px; background:#1a140a; }
+
+  /* 4 · Split */
+  .p4 .split { flex:1; display:grid; grid-template-columns:1fr 380px; min-height:0; }
+  .p4 .conv { overflow:auto; padding:14px 0; border-right:1px solid var(--border); }
+  .p4 .conv .m { padding:8px 18px; }
+  .p4 .conv .m.user { color:var(--text); }
+  .p4 .conv .m.user .body { background:var(--raised); padding:8px 12px; border-radius:8px; display:inline-block; }
+  .p4 .conv .ref { font:11px var(--mono); color:var(--work); cursor:pointer; padding:0 18px; }
+  .p4 .act { overflow:auto; background:var(--term); display:flex; flex-direction:column; }
+  .p4 .act .tabs { display:flex; gap:2px; padding:8px; border-bottom:1px solid var(--border); }
+  .p4 .act .tabs span { font-size:11px; padding:3px 9px; border-radius:5px; color:var(--text3); }
+  .p4 .act .tabs span.on { background:var(--raised); color:var(--text); }
+  .p4 .act .it { border-bottom:1px solid var(--row); padding:7px 12px; font:12px var(--mono); }
+  .p4 .act .it .h { display:flex; gap:8px; color:var(--text2); }
+  .p4 .act .it .h .r { margin-left:auto; }
+  .p4 .act .it.on { background:var(--sel); box-shadow:inset 2px 0 var(--work); }
+  .p4 .act .it pre { margin:6px 0 2px; font-size:11px; }
+  .p4 .act .diff .a { color:var(--add); } .p4 .act .diff .d { color:var(--del); }
+  .p4 .askbar { border-top:1px solid #5a4318; background:#1a140a; padding:9px 14px; display:flex; gap:10px; align-items:center; }
+
+  /* 5 · Turn cards + dock */
+  .p5 .scroll { padding:16px 22px; display:flex; flex-direction:column; gap:12px; }
+  .p5 .card { border:1px solid var(--border); border-radius:10px; background:var(--bg); }
+  .p5 .card.cur { border-color:var(--border2); }
+  .p5 .q { padding:10px 14px; border-bottom:1px solid var(--border); display:flex; gap:10px; align-items:baseline; }
+  .p5 .q .n { font:11px var(--mono); color:var(--faint); }
+  .p5 .q .t { font-weight:600; }
+  .p5 .q .s { margin-left:auto; font-size:11px; color:var(--text3); white-space:nowrap; }
+  .p5 .work { padding:6px 14px; font-size:12px; color:var(--text3); display:flex; gap:10px; align-items:center; border-bottom:1px solid var(--row); }
+  .p5 .bar { flex:1; height:3px; background:var(--row); border-radius:2px; overflow:hidden; display:flex; gap:2px; }
+  .p5 .bar i { flex:1; background:var(--done); } .p5 .bar i.f { background:var(--del); } .p5 .bar i.l { background:var(--work); animation:pulse 1.2s infinite; }
+  .p5 .a { padding:10px 14px; }
+  .p5 .files { display:flex; gap:6px; flex-wrap:wrap; padding:0 14px 10px; }
+  .p5 .files span { font:11px var(--mono); padding:2px 8px; border:1px solid var(--border2); border-radius:5px; color:var(--text2); }
+  .p5 .files .a2 { color:var(--add); } .p5 .files .d2 { color:var(--del); }
+  .p5 .dock { margin:0 14px 10px; border:1px solid #5a4318; border-radius:10px; background:#1a140a; padding:10px 12px; box-shadow:0 -8px 24px #0008; }
+  .p5 .dock .h { display:flex; gap:8px; align-items:center; color:var(--needs); font-size:11px; font-weight:600; letter-spacing:.5px; }
+  .p5 .dock pre { background:#0f0c06; border-color:#3a2c12; color:var(--text); }
+  .p5 .dock .acts { display:flex; gap:8px; justify-content:flex-end; }
+  footer { max-width:1180px; margin:14px auto 30px; color:var(--faint); font-size:11px; padding:0 20px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Arranger · Chat UI prototypes</h1>
+  <span class="sub">Same conversation, five layouts. Keys 1–5 switch.</span>
+  <nav id="nav"></nav>
+</header>
+
+<!-- ───────────────────────── 1 · Transcript+ ───────────────────────── -->
+<section class="proto p1" data-name="Transcript+">
+  <div class="brief">
+    <div><h2>1 · Transcript+</h2><p>The current layout, refined. Messages stay full-width and labelled, but each turn's tool calls fold into one collapsible "steps" group, so the agent's prose reads uninterrupted. Approvals appear as an inline amber card.</p></div>
+    <ul><li class="pro">Smallest change from today's renderer</li><li class="pro">Dense; scales to long sessions</li><li class="con">Weak visual distinction between turns</li></ul>
+  </div>
+  <div class="win">
+    <div class="side"><div class="t on"><span class="dot d-needs"></span>Fix chat lag</div><div class="t"><span class="dot d-work"></span>Vim y/n answers</div><div class="t"><span class="dot d-done"></span>Worktree runs</div></div>
+    <div class="main">
+      <div class="top"><b>Fix chat lag</b><span class="pill">claude</span><span class="pill work">needs approval</span><span style="margin-left:auto">arranger/32 · 41.2k tok · $0.38</span></div>
+      <div class="scroll">
+        <div class="msg user"><div class="who">You</div>When the agent streams, the whole app lags. Can you find out why?</div>
+        <div class="msg"><div class="who">claude</div>I'll look at how streamed events reach the GUI and what each one costs.</div>
+        <details class="steps"><summary>6 steps · read 3 files, ran 2 commands <span style="margin-left:auto" class="ok">✓</span></summary>
+          <div class="step"><span class="k">Read</span>src/bin/arranger-gui/chat.rs<span class="r ok">✓</span></div>
+          <div class="step"><span class="k">Read</span>src/background.rs<span class="r ok">✓</span></div>
+          <div class="step"><span class="k">Grep</span>dirty|push_tasks src/daemon.rs<span class="r ok">✓</span></div>
+          <div class="step"><span class="k">Read</span>src/daemon.rs:700-760<span class="r ok">✓</span></div>
+          <div class="step"><span class="k">Bash</span>cargo build --release<span class="r ok">✓</span></div>
+          <div class="step"><span class="k">Bash</span>cargo test<span class="r bad">1 failed</span></div>
+        </details>
+        <div class="msg"><div class="who">claude</div>Two causes compound. Each token triggers a full task-list push from the daemon, and the chat re-wraps every line of history on every frame:
+<pre>for text in body_lines(paragraph, |line| {
+    r.measure(font, 13.0, 400, line) &lt;= area.w - 24.0
+})</pre>
+I'll cache the wrapped lines per entry and stop pushing the task list for text deltas.<span class="caret"></span></div>
+        <div class="ask"><div class="h">PERMISSION · EDIT</div><div style="margin:4px 0 8px"><code>src/daemon.rs</code> <span class="muted">+4 −1</span></div>
+          <button class="btn primary">Allow<kbd>y</kbd></button> <button class="btn">Deny<kbd>n</kbd></button></div>
+      </div>
+      <div class="composer"><div class="box">Message claude…</div><span class="hint">⏎ send · esc stop</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── 2 · Bubbles ───────────────────────── -->
+<section class="proto p2" data-name="Bubbles">
+  <div class="brief">
+    <div><h2>2 · Messenger</h2><p>Familiar chat-app framing. Your messages are right-aligned bubbles, while the agent's replies are borderless prose with an avatar. Tool calls collapse to small chips under the reply, and you can click a chip to see its output.</p></div>
+    <ul><li class="pro">Instantly readable for anyone</li><li class="pro">Who-said-what is obvious at a glance</li><li class="con">Wastes width; code and diffs get cramped</li></ul>
+  </div>
+  <div class="win">
+    <div class="side"><div class="t on"><span class="dot d-needs"></span>Fix chat lag</div><div class="t"><span class="dot d-work"></span>Vim y/n answers</div><div class="t"><span class="dot d-done"></span>Worktree runs</div></div>
+    <div class="main">
+      <div class="top"><b>Fix chat lag</b><span class="pill">claude</span><span class="pill work">needs approval</span></div>
+      <div class="scroll">
+        <div class="row user"><div class="bub">When the agent streams, the whole app lags. Can you find out why?</div></div>
+        <div class="row agent"><div class="av">C</div><div class="bub">I'll look at how streamed events reach the GUI and what each one costs.</div></div>
+        <div class="chips"><span class="chip">chat.rs<span class="ok">✓</span></span><span class="chip">background.rs<span class="ok">✓</span></span><span class="chip">grep dirty<span class="ok">✓</span></span><span class="chip">cargo build<span class="ok">✓</span></span><span class="chip">cargo test<span class="bad">✗</span></span></div>
+        <div class="row agent"><div class="av">C</div><div class="bub">Two causes compound: a full task-list push per token, and the chat re-wrapping all history every frame.
+<pre>r.measure(font, 13.0, 400, line)</pre>I'll cache wrapped lines per entry.<span class="caret"></span></div></div>
+        <div class="ask"><b style="color:var(--needs)">Edit src/daemon.rs?</b> <span class="muted">+4 −1</span><div style="margin-top:8px"><button class="btn primary">Allow<kbd>y</kbd></button> <button class="btn">Deny<kbd>n</kbd></button></div></div>
+        <div class="meta">claude · streaming · 41.2k tokens</div>
+      </div>
+      <div class="composer"><div class="box">Message claude…</div><button class="btn primary">Send</button></div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── 3 · Timeline ───────────────────────── -->
+<section class="proto p3" data-name="Timeline">
+  <div class="brief">
+    <div><h2>3 · Timeline</h2><p>Treats the session as a work log rather than a dialogue. Every prompt, tool call, reply and approval is a node on a vertical rail, colored by status and timestamped. You can tell where time went and where things failed without reading any prose.</p></div>
+    <ul><li class="pro">Best for supervising long autonomous runs</li><li class="pro">Status visible in peripheral vision</li><li class="con">Prose feels secondary; noisier for Q&amp;A chats</li></ul>
+  </div>
+  <div class="win">
+    <div class="side"><div class="t on"><span class="dot d-needs"></span>Fix chat lag</div><div class="t"><span class="dot d-work"></span>Vim y/n answers</div><div class="t"><span class="dot d-done"></span>Worktree runs</div></div>
+    <div class="main">
+      <div class="top"><b>Fix chat lag</b><span class="pill">claude</span><span class="pill work">needs approval</span><span style="margin-left:auto">2m 14s · 7 tools · 1 failure</span></div>
+      <div class="scroll"><div class="turn">
+        <div class="ev user"><span class="ts">23:31:02</span><span class="body">When the agent streams, the whole app lags. Can you find out why?</span></div>
+        <div class="ev agent"><span class="ts">23:31:04</span>I'll look at how streamed events reach the GUI.</div>
+        <div class="ev tool"><span class="ts">23:31:05</span><span class="line">Read  src/bin/arranger-gui/chat.rs</span></div>
+        <div class="ev tool"><span class="ts">23:31:06</span><span class="line">Read  src/background.rs</span></div>
+        <div class="ev tool"><span class="ts">23:31:09</span><span class="line">Grep  dirty|push_tasks  <span class="muted">→ 14 matches</span></span></div>
+        <div class="ev tool"><span class="ts">23:32:20</span><span class="line">Bash  cargo build --release  <span class="muted">48s</span></span></div>
+        <div class="ev tool fail"><span class="ts">23:33:01</span><span class="line">Bash  cargo test  <span class="bad">1 failed · chat::wraps_long_words</span></span></div>
+        <div class="ev agent live"><span class="ts">23:33:10</span>The wrap test asserted the old closure signature; updating it to the per-char advance API.<span class="caret"></span></div>
+        <div class="ev ask"><span class="ts">23:33:12</span><b style="color:var(--needs)">Wants to edit</b> <code>src/daemon.rs</code>
+          <div class="askcard"><pre style="margin:0 0 8px">- self.dirty = true;
++ self.dirty |= !matches!(event, Event::Message { .. } | …);</pre><button class="btn primary">Allow<kbd>y</kbd></button> <button class="btn">Deny<kbd>n</kbd></button></div></div>
+      </div></div>
+      <div class="composer"><div class="box">Message claude…</div><span class="hint">⏎ send</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── 4 · Split ───────────────────────── -->
+<section class="proto p4" data-name="Split pane">
+  <div class="brief">
+    <div><h2>4 · Conversation + Activity</h2><p>The conversation holds only human-readable messages. Tool calls, outputs and diffs stream into a dedicated activity pane on the right, in the style of an IDE debug console. Inline refs in a message jump to the matching activity row. Approvals pin to the bottom bar.</p></div>
+    <ul><li class="pro">Clean reading and deep inspection at the same time</li><li class="pro">Diffs and logs get proper width and mono space</li><li class="con">Needs a wide window; two places to look</li></ul>
+  </div>
+  <div class="win">
+    <div class="side"><div class="t on"><span class="dot d-needs"></span>Fix chat lag</div><div class="t"><span class="dot d-work"></span>Vim y/n answers</div><div class="t"><span class="dot d-done"></span>Worktree runs</div></div>
+    <div class="main">
+      <div class="top"><b>Fix chat lag</b><span class="pill">claude</span><span class="pill work">needs approval</span></div>
+      <div class="split">
+        <div class="conv">
+          <div class="m user"><div class="body">When the agent streams, the whole app lags. Can you find out why?</div></div>
+          <div class="m">I'll look at how streamed events reach the GUI and what each one costs.</div>
+          <div class="ref">↳ 5 steps · 1 failed</div>
+          <div class="m">Two causes compound. Every token triggers a full task-list push from the daemon, and the chat re-wraps all history every frame. I'll cache wrapped lines per entry and skip list pushes for text deltas.<span class="caret"></span></div>
+          <div class="ref">↳ edit src/daemon.rs (awaiting approval)</div>
+        </div>
+        <div class="act">
+          <div class="tabs"><span class="on">Activity 7</span><span>Files 2</span><span>Log</span></div>
+          <div class="it"><div class="h">Read chat.rs<span class="r ok">✓</span></div></div>
+          <div class="it"><div class="h">Read background.rs<span class="r ok">✓</span></div></div>
+          <div class="it"><div class="h">Grep dirty|push_tasks<span class="r muted">14</span></div></div>
+          <div class="it"><div class="h">cargo build --release<span class="r muted">48s ✓</span></div></div>
+          <div class="it"><div class="h">cargo test<span class="r bad">✗</span></div><pre>test chat::tests::wraps_long_words ... FAILED
+expected ["你好","ab","c"]</pre></div>
+          <div class="it on diff"><div class="h">Edit daemon.rs<span class="r" style="color:var(--needs)">pending</span></div><pre><span class="d">-        self.dirty = true;</span>
+<span class="a">+        self.dirty |= !matches!(event,</span>
+<span class="a">+            Event::Message { .. } | Event::Usage { .. }</span>
+<span class="a">+            | Event::ToolOutput { .. });</span></pre></div>
+        </div>
+      </div>
+      <div class="askbar"><span style="color:var(--needs);font-weight:600;font-size:11px">APPROVE</span><code>Edit src/daemon.rs</code><span class="muted">+4 −1</span><span style="margin-left:auto"></span><button class="btn primary">Allow<kbd>y</kbd></button><button class="btn">Deny<kbd>n</kbd></button></div>
+      <div class="composer"><div class="box">Message claude…</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── 5 · Turn cards ───────────────────────── -->
+<section class="proto p5" data-name="Turn cards">
+  <div class="brief">
+    <div><h2>5 · Turn cards + action dock</h2><p>Each prompt and its outcome form one card. The card shows your ask as a title, a compact progress strip with one segment per tool call (red where one failed), the agent's answer, and chips for the files it touched. Past turns collapse to their title. Pending approvals rise into a dock above the composer, which keeps y/n in thumb's reach.</p></div>
+    <ul><li class="pro">Maps to how you think: "what did I ask, what changed"</li><li class="pro">Collapsed history makes long sessions skimmable</li><li class="con">Most custom rendering work</li></ul>
+  </div>
+  <div class="win">
+    <div class="side"><div class="t on"><span class="dot d-needs"></span>Fix chat lag</div><div class="t"><span class="dot d-work"></span>Vim y/n answers</div><div class="t"><span class="dot d-done"></span>Worktree runs</div></div>
+    <div class="main">
+      <div class="top"><b>Fix chat lag</b><span class="pill">claude</span><span class="pill work">needs approval</span></div>
+      <div class="scroll">
+        <div class="card"><div class="q"><span class="n">#1</span><span class="t">Run the GUI against the worktree build</span><span class="s ok">done · 3 files · 1m</span></div></div>
+        <div class="card cur">
+          <div class="q"><span class="n">#2</span><span class="t">When the agent streams, the whole app lags. Can you find out why?</span><span class="s">2m 14s</span></div>
+          <div class="work"><span>7 steps</span><div class="bar"><i></i><i></i><i></i><i></i><i class="f"></i><i></i><i class="l"></i></div><span class="bad">1 failed</span></div>
+          <div class="a">Two causes compound. Every token triggers a full task-list push from the daemon, and the chat re-wraps all history every frame. I'm caching wrapped lines per entry and skipping list pushes for text deltas.<span class="caret"></span></div>
+          <div class="files"><span>chat.rs <b class="a2">+48</b> <b class="d2">−31</b></span><span>daemon.rs <b class="a2">+4</b> <b class="d2">−1</b></span></div>
+        </div>
+      </div>
+      <div class="dock"><div class="h">● NEEDS YOU · EDIT src/daemon.rs</div>
+        <pre>- self.dirty = true;
++ self.dirty |= !matches!(event, Event::Message { .. } | …);</pre>
+        <div class="acts"><button class="btn">Deny<kbd>n</kbd></button><button class="btn primary">Allow<kbd>y</kbd></button></div></div>
+      <div class="composer"><div class="box">Reply, or ask a follow-up…</div><span class="hint">⏎ send · esc stop</span></div>
+    </div>
+  </div>
+</section>
+
+<footer>Colors are Arranger's dark theme tokens (theme.rs). These are static mockups: the summaries and details expand, and nothing else is live.</footer>
+
+<script>
+  const protos = [...document.querySelectorAll('.proto')];
+  const nav = document.getElementById('nav');
+  const show = i => {
+    protos.forEach((p, j) => p.classList.toggle('on', i === j));
+    [...nav.children].forEach((b, j) => b.classList.toggle('on', i === j));
+    location.hash = i + 1;
+  };
+  protos.forEach((p, i) => {
+    const b = document.createElement('button');
+    b.innerHTML = `<kbd>${i + 1}</kbd>${p.dataset.name}`;
+    b.onclick = () => show(i);
+    nav.appendChild(b);
+  });
+  addEventListener('keydown', e => { const n = +e.key; if (n >= 1 && n <= protos.length) show(n - 1); });
+  show(Math.max(0, Math.min(protos.length - 1, (+location.hash.slice(1) || 1) - 1)));
+</script>
+</body>
+</html>
