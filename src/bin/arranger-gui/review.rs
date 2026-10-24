@@ -577,6 +577,9 @@ impl App {
         // Diff column and commit bar.
         let col = Rect::new(body.x + self.rail_w, body.y, body.w - self.rail_w, body.h - BAR_H);
         r.rect(col, 0.0, t.term);
+        // Nothing to merge: no changes, not mid-merge, and nothing committed but not yet merged.
+        let idle = rv.data.as_ref().is_some_and(|d| d.files.is_empty() && !d.merging)
+            && task.as_ref().is_some_and(|t| matches!(t.shipped.as_str(), "" | "merged"));
         // A merge under way: say so above the diff, with a way back out.
         let mut view = col;
         if let Some(d) = rv.data.as_ref().filter(|d| d.merging) {
@@ -645,7 +648,7 @@ impl App {
             }
         }
         let ended = task.as_ref().is_some_and(|t| group(&t.state) == 4);
-        let menu = self.draw_commit_bar(r, t, Rect::new(col.x, col.y + col.h, col.w, BAR_H), &agent, ended, menu_click, &mut acts);
+        let menu = self.draw_commit_bar(r, t, Rect::new(col.x, col.y + col.h, col.w, BAR_H), &agent, ended, idle, menu_click, &mut acts);
         if let Some(rv) = self.review.as_mut().filter(|rv| rv.ship_menu.is_some()) {
             rv.ship_menu = menu;
         }
@@ -880,7 +883,7 @@ impl App {
     /// Commit message, Discard, and Merge with a menu for the other ways to ship. Returns where the
     /// menu was drawn, if open.
     #[allow(clippy::too_many_arguments)]
-    fn draw_commit_bar(&self, r: &mut Renderer, t: &Theme, bar: Rect, agent: &str, ended: bool, menu_click: Option<(f32, f32)>, acts: &mut Vec<ReviewAction>) -> Option<Rect> {
+    fn draw_commit_bar(&self, r: &mut Renderer, t: &Theme, bar: Rect, agent: &str, ended: bool, idle: bool, menu_click: Option<(f32, f32)>, acts: &mut Vec<ReviewAction>) -> Option<Rect> {
         let rv = self.review.as_ref().unwrap();
         r.rect(bar, 0.0, t.bg);
         r.rect(Rect::new(bar.x, bar.y, bar.w, 1.0), 0.0, t.border);
@@ -928,10 +931,11 @@ impl App {
         let flash = rv.flash.as_ref().map(|(l, at)| (l, at.elapsed().as_secs_f32() / FLASH.as_secs_f32())).filter(|f| f.1 < 1.0);
         let fill = match flash {
             Some((_, k)) => blend(t.done, t.primary_bg, ((k - 0.8) / 0.2).clamp(0.0, 1.0)),
+            None if idle => t.raised,
             None => dim(t.primary_bg),
         };
         r.rect(ship, 4.0, fill);
-        let fg = if flash.is_some() { readable(t.on_accent, t.done) } else { t.primary_fg };
+        let fg = if flash.is_some() { readable(t.on_accent, t.done) } else if idle { t.text3 } else { t.primary_fg };
         if let Some((label, _)) = flash.filter(|f| f.1 < 0.8) {
             r.text(ship.x + 14.0, r.center(ship, UI, 13.0), &format!("✓  {label}"), UI, 13.0, 600, fg, ship.w - 20.0);
         } else if let Some(s) = rv.shipping.filter(|_| rv.busy) {
@@ -953,7 +957,7 @@ impl App {
         if !rv.busy {
             if self.hit(r, discard) {
                 acts.push(ReviewAction::Discard);
-            } else if self.hit(r, merge) {
+            } else if self.hit(r, merge) && !idle {
                 // An ended agent is revived first, with the resolve prompt.
                 acts.push(if conflicted { ReviewAction::AskResolve } else { ReviewAction::Commit(Ship::Merge) });
             } else if self.hit(r, chev) {

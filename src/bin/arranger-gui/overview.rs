@@ -245,9 +245,10 @@ impl App {
         const SECTIONS: [(&str, &[(&str, &str)]); 3] = [
             ("MOVE", &[("j / k", "next / prev agent"), ("gg  G", "first / last"), ("J / K", "next / prev needing you"), ("h / l", "prev / next view"), ("/", "filter agents")]),
             ("ACT", &[("o  ↵", "attach to agent"), ("a", "allow command"), ("x", "deny command"), ("r", "review diff"), ("n", "new task"), ("m", "add machine")]),
-            ("MODE", &[("i", "message agent"), ("esc", "normal mode, from anywhere"), ("esc esc", "stop the agent"), ("?", "this sheet")]),
+            ("MODE", &[("i", "message agent"), ("esc", "normal mode"), ("esc esc", "stop the agent"), ("?", "this sheet")]),
         ];
-        let sheet = Rect::new(w - 12.0 - 600.0_f32.min(w - 24.0), h - STATUS_H - 8.0 - 210.0, 600.0_f32.min(w - 24.0), 210.0);
+        let sw = 720.0_f32.min(w - 24.0);
+        let sheet = Rect::new(w - 12.0 - sw, h - STATUS_H - 8.0 - 210.0, sw, 210.0);
         r.rect(Rect::new(sheet.x - 1.0, sheet.y + 4.0, sheet.w + 2.0, sheet.h + 2.0), 8.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
         r.frame(sheet, 6.0, t.bg, t.border2);
         r.target(sheet, Cursor::Arrow);
@@ -267,12 +268,14 @@ impl App {
             let mut y = head.y + head.h + 12.0;
             r.text(x, y, label, UI, 10.5, 500, t.text3, cw);
             y += 20.0;
+            // One key column per section, so the descriptions line up.
+            let col = keys.iter().map(|(k, _)| r.measure(MONO, 10.5, 400, k).max(22.0) + 8.0).fold(0.0, f32::max);
             for (k, d) in keys.iter() {
                 let kw = r.measure(MONO, 10.5, 400, k).max(22.0) + 8.0;
                 let kb = Rect::new(x, y, kw, 19.0);
                 r.frame(kb, 3.0, t.panel, t.border2);
                 r.text(kb.x + (kw - r.measure(MONO, 10.5, 400, k)) / 2.0, r.center(kb, MONO, 10.5), k, MONO, 10.5, 400, t.text, kw);
-                r.text(x + kw + 8.0, r.center(kb, UI, 12.0), d, UI, 12.0, 400, t.text2, cw - kw - 8.0);
+                r.text(x + col + 8.0, r.center(kb, UI, 12.0), d, UI, 12.0, 400, t.text2, cw - col - 8.0);
                 y += 23.0;
             }
         }

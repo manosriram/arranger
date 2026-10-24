@@ -134,6 +134,8 @@ pub struct Renderer {
     vmetrics: RefCell<HashMap<(usize, u32), (f32, f32)>>,
     /// This frame's click targets in draw order, with the clip they were drawn under.
     targets: Vec<(Rect, Option<Rect>, Cursor)>,
+    /// This frame's buttons are square (the welcome screen): so is their hover tint.
+    pub sharp: bool,
 }
 
 /// Added to every requested weight: Geist at its nominal weights reads too thin on screen.
@@ -230,6 +232,7 @@ impl Renderer {
                 advances: RefCell::default(),
                 vmetrics: RefCell::default(),
                 targets: Vec::new(),
+                sharp: false,
             })
         }
     }
@@ -238,6 +241,7 @@ impl Renderer {
         self.size = (width.max(1), height.max(1));
         self.dpi = dpi;
         self.targets.clear();
+        self.sharp = false;
         unsafe {
             self.gl.viewport(0, 0, self.size.0 as i32, self.size.1 as i32);
             let c = clear.map(|v| v as f32 / 255.0);
@@ -252,7 +256,7 @@ impl Renderer {
         if let Some((r, clip, Cursor::Pointer)) = hot {
             self.set_clip(clip);
             // Mid grey: lightens dark buttons and darkens light ones, in either theme.
-            self.rect(r, 3.0, [128, 128, 128, 0x24]);
+            self.rect(r, if self.sharp { 0.0 } else { 3.0 }, [128, 128, 128, 0x24]);
         }
         self.flush();
         self.set_clip(None);

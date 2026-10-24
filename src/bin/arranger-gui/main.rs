@@ -272,8 +272,13 @@ struct App {
     changes: std::collections::HashMap<TaskKey, (String, Option<bool>)>,
     /// Replay of a finished task's log, shown in place of a live session.
     history: Option<(TaskKey, Screen)>,
-    /// Wheel movement over the terminal not yet worth a whole line.
+    /// How far into the top line the chat is scrolled, 0..1 of a line: the chat scrolls by pixel
+    /// though the terminal keeps whole lines.
     wheel: f32,
+    /// Wheel movement for a full-screen agent not yet worth a wheel tick.
+    ticks: f32,
+    /// Mouse-wheel scrolling still to apply: notches glide over a few frames instead of jumping.
+    glide: f32,
     mods: ModifiersState,
     mouse: (f32, f32),
     /// The click target under the mouse at the last frame, and the cursor shown for it.
@@ -353,6 +358,8 @@ fn run() -> io::Result<()> {
         changes: Default::default(),
         history: None,
         wheel: 0.0,
+        ticks: 0.0,
+        glide: 0.0,
         mods: ModifiersState::empty(),
         mouse: (0.0, 0.0),
         hot: None,
@@ -463,14 +470,19 @@ impl ApplicationHandler<Msg> for App {
                 self.caret_on = !self.caret_on;
                 self.blink_at = Instant::now() + BLINK;
             }
+            if self.glide != 0.0 {
+                self.glide_step();
+            }
             self.redraw();
         }
     }
 
-    /// Wakes only to blink the caret while a text field has focus, or to animate the Review button.
+    /// Wakes only to blink the caret while a text field has focus, to animate the Review button, or to
+    /// glide a wheel notch.
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let blink = (!matches!(self.focus, Focus::Term | Focus::Normal)).then_some(self.blink_at);
-        let frame = self.review.as_ref().filter(|rv| rv.animating()).map(|_| Instant::now() + Duration::from_millis(33));
+        let moving = self.glide != 0.0 || self.review.as_ref().is_some_and(|rv| rv.animating());
+        let frame = moving.then(|| Instant::now() + Duration::from_millis(if self.glide != 0.0 { 16 } else { 33 }));
         match blink.into_iter().chain(frame).min() {
             Some(at) => el.set_control_flow(ControlFlow::WaitUntil(at)),
             None => el.set_control_flow(ControlFlow::Wait),
@@ -593,42 +605,14 @@ impl ApplicationHandler<Msg> for App {
                 self.redraw();
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => self.dragging = None,
-            WindowEvent::MouseWheel { delta, .. } => {
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y * ROW_H,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32,
-                };
-                if let Some(rv) = self.review.as_mut().filter(|_| self.mouse.1 > TITLE_H + 56.0) {
-                    rv.scroll = (rv.scroll - dy).max(0.0);
+            WindowEvent::MouseWheel { delta, .. } => match delta {
+                // A wheel notch glides; a trackpad already sends fine steps.
+                MouseScrollDelta::LineDelta(_, y) => {
+                    self.glide += y * ROW_H * 1.5;
                     self.redraw();
-                } else if self.overview {
-                    self.ov_scroll = (self.ov_scroll - dy).max(0.0);
-                    self.redraw();
-                } else if self.mouse.0 < self.sidebar_w {
-                    self.scroll = (self.scroll - dy).max(0.0);
-                    self.redraw();
-                } else if self.review.is_none() {
-                    self.wheel += dy / LINE_H;
-                    let lines = self.wheel.trunc();
-                    self.wheel -= lines;
-                    let id = self.selected;
-                    if let Some(s) = self.session.as_ref().filter(|s| Some(s.task) == id && lines != 0.0) {
-                        if let Some(bytes) = self.wheel_bytes(&s.screen, lines as i32) {
-                            self.send_input(bytes);
-                            return;
-                        }
-                    }
-                    let screen = match (&mut self.session, &mut self.history) {
-                        (Some(s), _) if Some(s.task) == id => Some(&mut s.screen),
-                        (_, Some((h, screen))) if Some(*h) == id => Some(screen),
-                        _ => None,
-                    };
-                    if let Some(screen) = screen.filter(|_| lines != 0.0) {
-                        screen.scroll(lines as i32);
-                        self.redraw();
-                    }
                 }
-            }
+                MouseScrollDelta::PixelDelta(p) => self.scroll_by(p.y as f32),
+            },
             WindowEvent::DroppedFile(path) if self.welcome => {
                 self.actions.push(Action::OpenProject(Some(path)));
                 self.apply();
@@ -1185,6 +1169,52 @@ impl App {
         }
     }
 
+    /// Scrolls whatever is under the mouse by `dy` pixels (positive = towards the top).
+    fn scroll_by(&mut self, dy: f32) {
+        if let Some(rv) = self.review.as_mut().filter(|_| self.mouse.1 > TITLE_H + 56.0) {
+            rv.scroll = (rv.scroll - dy).max(0.0);
+        } else if self.overview {
+            self.ov_scroll = (self.ov_scroll - dy).max(0.0);
+        } else if self.mouse.0 < self.sidebar_w {
+            self.scroll = (self.scroll - dy).max(0.0);
+        } else if self.review.is_none() && !self.welcome {
+            let id = self.selected;
+            if let Some(s) = self.session.as_ref().filter(|s| Some(s.task) == id && s.screen.mode().contains(TermMode::ALT_SCREEN)) {
+                // A full-screen agent scrolls itself, a few lines per tick: one tick per three lines
+                // moved, as a wheel notch would, or it races.
+                self.ticks += dy / (3.0 * LINE_H);
+                let n = self.ticks.trunc();
+                self.ticks -= n;
+                if let Some(bytes) = self.wheel_bytes(&s.screen, n as i32).filter(|_| n != 0.0) {
+                    self.send_input(bytes);
+                }
+                return;
+            }
+            let screen = match (&mut self.session, &mut self.history) {
+                (Some(s), _) if Some(s.task) == id => &mut s.screen,
+                (_, Some((h, screen))) if Some(*h) == id => screen,
+                _ => return,
+            };
+            // Whole lines go to the terminal's scrollback; the rest is a pixel offset.
+            self.wheel += dy / LINE_H;
+            let lines = self.wheel.floor();
+            self.wheel -= lines;
+            screen.scroll(lines as i32);
+            let g = screen.grid();
+            if g.display_offset() == 0 && lines < 0.0 || g.display_offset() == g.history_size() {
+                self.wheel = 0.0; // at the bottom, or the oldest line
+            }
+        }
+        self.redraw();
+    }
+
+    /// One frame of a gliding wheel notch.
+    fn glide_step(&mut self) {
+        let step = if self.glide.abs() < 2.0 { self.glide } else { self.glide * 0.3 };
+        self.glide -= step;
+        self.scroll_by(step);
+    }
+
     /// A full-screen agent (alternate screen, no scrollback here) scrolls its own chat: the
     /// wheel goes to it as mouse-wheel reports, or as arrow keys when it doesn't take the mouse.
     fn wheel_bytes(&self, screen: &Screen, lines: i32) -> Option<Vec<u8>> {
@@ -1283,6 +1313,7 @@ impl App {
     }
 
     fn send_input(&mut self, bytes: Vec<u8>) {
+        self.wheel = 0.0; // typing jumps the chat back to the bottom
         if let Some(s) = &mut self.session {
             let _ = s.writer.write_all(&proto::frame(&Request::Input(bytes)));
         }
@@ -1671,6 +1702,7 @@ impl App {
             match action {
                 Action::Select(id) => {
                     self.selected = Some(id);
+                    (self.wheel, self.ticks, self.glide) = (0.0, 0.0, 0.0);
                     self.focus = self.rest();
                     self.sync_session();
                 }
@@ -2168,6 +2200,15 @@ impl App {
             let mw = r.measure(UI, 13.0, 400, &msg);
             logo(r, area.x + (area.w - 64.0) / 2.0, area.y + area.h / 2.0 - 84.0, 64.0, t.faint, t.needs);
             r.text(area.x + (area.w - mw) / 2.0, area.y + area.h / 2.0 - 8.0, &msg, UI, 13.0, 400, t.text3, area.w);
+            // A button too, for anyone who doesn't know the shortcut.
+            let label = "New task";
+            let bw = r.measure(UI, 13.0, 500, label) + 32.0;
+            let b = Rect::new(area.x + (area.w - bw) / 2.0, area.y + area.h / 2.0 + 22.0, bw, 34.0);
+            r.rect(b, 4.0, t.primary_bg);
+            r.text(b.x + 16.0, r.center(b, UI, 13.0), label, UI, 13.0, 500, t.primary_fg, bw);
+            if self.hit(r, b) {
+                self.actions.push(Action::NewTask);
+            }
             return;
         };
         let color = state_color(t, &task.state);
@@ -2279,6 +2320,7 @@ impl App {
         self.pane = size;
         let term_focus = self.focus == Focus::Term && self.dialog.is_none();
         let mut box_rows = None;
+        let extra = self.session.as_ref().filter(|s| s.task == (task.machine, task.id)).map_or(0, |s| s.extra as usize);
         let screen = match (&mut self.session, &mut self.history) {
             (Some(s), _) if s.task == (task.machine, task.id) => {
                 let size = (size.0, size.1 + s.extra);
@@ -2297,7 +2339,10 @@ impl App {
                 // Stop above the agent's own input box: ours below replaces it.
                 let found = agent_box(screen, kind).map(|(row, _)| row);
                 box_rows = found.map(|row| (screen.grid().screen_lines() - row) as u16);
-                let rows = found.unwrap_or(screen.grid().screen_lines()) as f32;
+                // Scrolled back, the box can't be found, but it's still the bottom `extra` rows:
+                // keep them out, or the chat jumps by the box's height as scrolling starts.
+                let scrolled = screen.grid().display_offset() > 0;
+                let rows = found.or((scrolled && extra > 0).then(|| screen.grid().screen_lines() - extra)).unwrap_or(screen.grid().screen_lines()) as f32;
                 // The last text sits on the pane's bottom, just above our input box, with scrollback
                 // filling the space above it. When everything fits, the first text sits at the top instead.
                 let g = screen.grid();
@@ -2310,8 +2355,9 @@ impl App {
                     let first = (-above..=last.unwrap_or(-1)).find(|&v| !blank(v)).unwrap_or(0);
                     shift = shift.min(-first as f32 * LINE_H);
                 }
-                r.set_clip(Some(Rect::new(sec.x, sec.y, sec.w, (sec.h - bar_h).min(grid.y + shift - sec.y + rows * LINE_H))));
-                draw_term(r, t, screen, Rect { y: grid.y + shift, ..grid }, sec.y, cell_w, term_focus);
+                let frac = self.wheel * LINE_H; // scrolled partway into the line above
+                r.set_clip(Some(Rect::new(sec.x, sec.y, sec.w, (sec.h - bar_h).min(grid.y + shift + frac - sec.y + rows * LINE_H))));
+                draw_term(r, t, screen, Rect { y: grid.y + shift + frac, ..grid }, sec.y, cell_w, term_focus);
                 r.set_clip(None);
             }
             None => {
@@ -2460,7 +2506,7 @@ impl App {
         r.frame(b, 4.0, t.bg, if focused { t.work } else { t.border2 });
         let y = r.center(b, font, 12.5);
         if value.is_empty() && !focused {
-            r.text(b.x + 10.0, y, placeholder, font, 12.5, 400, t.text3, b.w - 20.0);
+            r.text(b.x + 10.0, y, placeholder, font, 12.5, 400, t.faint, b.w - 20.0);
         } else {
             self.field_text(r, t, b.x + 10.0, y, value, font, 12.5, b.w - 20.0, focused, self.caret_for(focus, value), t.work);
         }
@@ -2522,8 +2568,10 @@ impl App {
         let add_label = "Add machine ↵";
         let aw = r.measure(UI, 13.0, 500, add_label) + 32.0;
         let add = Rect::new(foot.x + foot.w - 14.0 - aw, foot.y + 12.0, aw, 34.0);
-        r.rect(add, 4.0, if ssh.trim().is_empty() { alpha(t.work, 110) } else { t.work });
-        r.text(add.x + 16.0, r.center(add, UI, 13.0), add_label, UI, 13.0, 500, t.on_accent, aw);
+        // Disabled until there's somewhere to connect to, drawn like other disabled buttons.
+        let off = ssh.trim().is_empty();
+        r.rect(add, 4.0, if off { t.raised } else { t.work });
+        r.text(add.x + 16.0, r.center(add, UI, 13.0), add_label, UI, 13.0, 500, if off { t.text3 } else { t.on_accent }, aw);
         let tw = r.measure(UI, 13.0, 400, "Test connection") + 28.0;
         let test_b = Rect::new(add.x - 8.0 - tw, add.y, tw, 34.0);
         r.frame(test_b, 4.0, t.panel, t.border2);
