@@ -78,7 +78,7 @@ impl Screen {
         self.term.resize(Size { cols: cols.into(), rows: rows.into() });
     }
 
-    /// Escape sequences that reproduce the visible screen, cursor and input modes.
+    /// Escape sequences that reproduce the scrollback, visible screen, cursor and input modes.
     pub fn snapshot(&self) -> Vec<u8> {
         let mode = *self.term.mode();
         let grid = self.term.grid();
@@ -86,26 +86,27 @@ impl Screen {
         if mode.contains(TermMode::ALT_SCREEN) {
             s.push_str("\x1b[?1049h");
         }
+        // The scrollback first, so a new viewer can scroll back past the moment it attached: each
+        // line printed, then enough blank lines to push them all off the top of the screen.
+        // Soft-wrapped lines run on so they wrap (and reflow) as they did here. Clearing only after
+        // that, on a blank screen, keeps alacritty from pushing a stray blank line into history.
+        // ponytail: a history line wrapping onto the screen's first row loses its wrap mark.
+        let history = grid.history_size();
+        if history > 0 {
+            s.push_str("\x1b[0m\x1b[H");
+            for row in (1..=history).rev() {
+                let line = &grid[Line(-(row as i32))];
+                write_row(&mut s, line, grid.columns());
+                if !line[Column(grid.columns() - 1)].flags.contains(Flags::WRAPLINE) {
+                    s.push_str("\r\n");
+                }
+            }
+            s.push_str(&"\r\n".repeat(grid.screen_lines() - 1));
+        }
         s.push_str("\x1b[0m\x1b[H\x1b[2J");
         for row in 0..grid.screen_lines() {
-            let line = &grid[Line(row as i32)];
-            let end = (0..grid.columns()).rposition(|c| !blank(&line[Column(c)])).map_or(0, |i| i + 1);
             let _ = write!(s, "\x1b[{};1H", row + 1);
-            let mut pen = String::new();
-            for col in 0..end {
-                let cell = &line[Column(col)];
-                if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
-                    continue;
-                }
-                let sgr = sgr(cell);
-                if sgr != pen {
-                    s.push_str(&sgr);
-                    pen = sgr;
-                }
-                s.push(cell.c);
-                s.extend(cell.zerowidth().into_iter().flatten());
-            }
-            s.push_str("\x1b[0m");
+            write_row(&mut s, &grid[Line(row as i32)], grid.columns());
         }
         let at = grid.cursor.point;
         let _ = write!(s, "\x1b[{};{}H", at.line.0 + 1, at.column.0 + 1);
@@ -132,6 +133,26 @@ impl Screen {
         s.push_str(if mode.contains(TermMode::SHOW_CURSOR) { "\x1b[?25h" } else { "\x1b[?25l" });
         s.into_bytes()
     }
+}
+
+/// One row's text and colours, up to its last non-blank cell.
+fn write_row(s: &mut String, line: &alacritty_terminal::grid::Row<Cell>, columns: usize) {
+    let end = (0..columns).rposition(|c| !blank(&line[Column(c)])).map_or(0, |i| i + 1);
+    let mut pen = String::new();
+    for col in 0..end {
+        let cell = &line[Column(col)];
+        if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+            continue;
+        }
+        let sgr = sgr(cell);
+        if sgr != pen {
+            s.push_str(&sgr);
+            pen = sgr;
+        }
+        s.push(cell.c);
+        s.extend(cell.zerowidth().into_iter().flatten());
+    }
+    s.push_str("\x1b[0m");
 }
 
 fn blank(c: &Cell) -> bool {
@@ -200,5 +221,27 @@ mod tests {
         assert_eq!(ga[Line(1)][Column(0)].fg, gb[Line(1)][Column(0)].fg);
         assert_eq!(ga[Line(1)][Column(4)].bg, gb[Line(1)][Column(4)].bg);
         assert!(b.term.mode().contains(TermMode::BRACKETED_PASTE));
+    }
+
+    #[test]
+    fn snapshot_carries_scrollback() {
+        let mut a = Screen::new(10, 4);
+        for i in 0..20 {
+            a.feed(format!("line {i}\r\n").as_bytes());
+        }
+        a.feed(b"a long line that wraps\r\nmore\r\nand more\r\nyet more\r\nlast");
+        let mut b = Screen::new(10, 4);
+        b.feed(&a.snapshot());
+        let all = |s: &Screen| {
+            let g = s.term.grid();
+            (-(g.history_size() as i32)..g.screen_lines() as i32)
+                .map(|r| (0..g.columns()).map(|c| g[Line(r)][Column(c)].c).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(all(&a), all(&b));
+        assert_eq!(a.term.grid().cursor.point, b.term.grid().cursor.point);
+        let wraps = |s: &Screen| (1..=s.term.grid().history_size()).filter(|&r| s.term.grid()[Line(-(r as i32))][Column(9)].flags.contains(Flags::WRAPLINE)).count();
+        assert_eq!(wraps(&a), 2);
+        assert_eq!(wraps(&a), wraps(&b));
     }
 }
