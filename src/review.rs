@@ -347,7 +347,7 @@ mod tests {
         assert_eq!(conflicts(&dir).unwrap(), (vec![], false));
         assert_eq!(diff_base(&dir, &fork, "main"), fork); // main moved, but isn't merged in yet
 
-        assert!(!Command::new("git").arg("-C").arg(&dir).args(["merge", "-q", "main"]).output().unwrap().status.success());
+        assert!(!Command::new("git").arg("-C").arg(&dir).args(["-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "main"]).output().unwrap().status.success());
         assert_eq!(conflicts(&dir).unwrap(), (vec!["f.txt".to_string()], true));
         assert_eq!(diff_base(&dir, &fork, "main"), main); // mid-merge, review against what's coming in
         std::fs::write(dir.join("f.txt"), "one\nboth\n").unwrap();
