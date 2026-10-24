@@ -925,10 +925,16 @@ impl App {
         self.selected.and_then(|k| self.task(k))
     }
 
-    /// Seconds on the running icons' clock, while one is on screen and the window has focus; None
-    /// draws them still.
+    /// Seconds on the status icons' clock, while one that moves is on screen (running, needs you,
+    /// or done in the last two seconds) and the window has focus; None draws them still.
     fn sweep(&self) -> Option<f32> {
-        let shown = !self.welcome && self.review.is_none() && self.all_tasks().any(|t| group(&t.state) == 1);
+        let now = unix_secs();
+        let moving = |t: &TaskInfo| match group(&t.state) {
+            0 | 1 => true,
+            3 => now - (t.since as f64) < 2.0,
+            _ => false,
+        };
+        let shown = !self.welcome && self.review.is_none() && self.all_tasks().any(moving);
         (shown && self.focused).then(|| self.epoch.elapsed().as_secs_f32())
     }
 
@@ -2187,7 +2193,7 @@ impl App {
         if on {
             r.frame(row, 3.0, bg, t.sel_ring);
         }
-        state_icon(r, t, &task.state, row.x + 8.0, top.y + top.h / 2.0, bg, self.sweep());
+        state_icon(r, t, &task.state, row.x + 8.0, top.y + top.h / 2.0, task.since, self.sweep());
         let text_x = row.x + 28.0;
         let right_w = if let Some(name) = machine {
             let cw = r.measure(MONO, 10.0, 400, name) + 10.0;
@@ -2914,42 +2920,79 @@ fn ship_badge(r: &mut Renderer, t: &Theme, shipped: &str, x: f32, cy: f32) -> f3
     w
 }
 
-/// `sweep` is the running icon's clock in seconds (see `ensemble`); None draws it still.
-fn state_icon(r: &mut Renderer, t: &Theme, state: &str, x: f32, cy: f32, bg: Rgba, sweep: Option<f32>) {
+/// The status icons, all drawn from the logo's mark: eight players on two arcs around a centre,
+/// 18 px wide, centred on `x + 6` and `cy`. Shape and colour carry the state so each reads still:
+/// - needs you: grey players, the amber centre breathing (the logo's conductor, waiting on you)
+/// - running: the players light up left to right
+/// - queued: the same seats, outlined
+/// - done: the players joined into two solid arcs (the logo's small form); ended: the same in grey
+///
+/// `sweep` is the icons' clock in seconds, None to draw them still; `since` is when the task last
+/// changed state (unix seconds), from which a finished task's dots join into arcs, once.
+fn state_icon(r: &mut Renderer, t: &Theme, state: &str, x: f32, cy: f32, since: u64, sweep: Option<f32>) {
     let c = state_color(t, state);
+    let (x, y) = (x - 3.0, cy - 5.3);
     match group(state) {
-        0 => r.rect(Rect::new(x + 2.0, cy - 4.0, 8.0, 8.0), 1.0, c),
-        1 => ensemble(r, x - 3.0, cy - 5.3, c, sweep),
-        2 => {
-            let (rad, stroke) = (4.0, 1.1);
-            r.rect(Rect::new(x + 6.0 - rad, cy - rad, rad * 2.0, rad * 2.0), rad, c);
-            let inner = rad - stroke;
-            r.rect(Rect::new(x + 6.0 - inner, cy - inner, inner * 2.0, inner * 2.0), inner, bg);
+        0 => {
+            for (i, &(px, py)) in PLAYERS.iter().enumerate() {
+                r.path(20 + i as u16, &dot(px, py, 4.7), None, x, y, MARK, t.faint);
+            }
+            let k = sweep.map_or(1.0, |s| 0.725 + 0.275 * (s / 1.4 * std::f32::consts::TAU).cos());
+            r.path(39, &dot(31.8, 32.0, 8.5), None, x, y, MARK, alpha(c, (255.0 * k) as u8));
         }
-        _ => {
-            let (a, _) = r.vmetrics(UI, 12.0);
-            let color = if matches!(state, "dead" | "failed") { t.faint } else { c };
-            r.glyph_char(UI, '✓', x, cy - 6.0 + a * 0.85, 12.0, 600, color);
+        1 => {
+            for (i, &(px, py)) in PLAYERS.iter().enumerate() {
+                // Each dot's pulse starts 0.15 s after the one before: up over 0.48 s, down over 0.48 s, then rests.
+                let lit = sweep.map_or(1.0, |s| {
+                    let k = (s - i as f32 * 0.15).rem_euclid(1.6) / 1.6;
+                    if k < 0.3 { ease(k / 0.3) } else if k < 0.6 { 1.0 - ease((k - 0.3) / 0.3) } else { 0.0 }
+                });
+                r.path(20 + i as u16, &dot(px, py, 4.7), None, x, y, MARK, alpha(c, (64.0 + 191.0 * lit) as u8));
+            }
+            r.path(28, &dot(31.8, 32.0, 5.2), None, x, y, MARK, c);
+        }
+        2 => {
+            for (i, &(px, py)) in PLAYERS.iter().enumerate() {
+                r.path(30 + i as u16, &dot(px, py, 3.8), Some(2.6), x, y, MARK, t.text3);
+            }
+            r.path(38, &dot(31.8, 32.0, 4.2), Some(2.6), x, y, MARK, t.text3);
+        }
+        g => {
+            let c = if g == 4 { t.faint } else { c };
+            // Just finished: the dots fade as the arcs come in, over 0.8 s.
+            let k = match sweep.filter(|_| g == 3) {
+                Some(_) => ease(((unix_secs() - since as f64) as f32 - 0.2).clamp(0.0, 0.8) / 0.8),
+                None => 1.0,
+            };
+            if k < 1.0 {
+                for (i, &(px, py)) in PLAYERS.iter().enumerate() {
+                    r.path(20 + i as u16, &dot(px, py, 4.7), None, x, y, MARK, alpha(c, (255.0 * (1.0 - k)) as u8));
+                }
+            }
+            r.path(29, "M5.45 32A26.35 26.35 0 0 1 58.15 32M17.7 32A14.1 14.1 0 0 1 45.9 32", Some(5.6), x, y, MARK, alpha(c, (255.0 * k) as u8));
+            r.path(28, &dot(31.8, 32.0, 5.2), None, x, y, MARK, c);
         }
     }
 }
 
-/// The running icon: the logo's players as eight dots on two arcs around a lit centre, 18 px wide
-/// with its top at `y`. With a clock (`sweep`, seconds) the players light up left to right on a 1.6 s
-/// loop; without one they're all lit.
-fn ensemble(r: &mut Renderer, x: f32, y: f32, color: Rgba, sweep: Option<f32>) {
-    const PLAYERS: [(f32, f32); 8] = [(5.6, 32.0), (13.4, 13.4), (17.9, 32.0), (31.8, 5.6), (31.8, 17.9), (46.1, 32.0), (50.6, 13.4), (58.4, 32.0)];
-    let dot = |cx: f32, cy: f32, rad: f32| format!("M{} {cy}a{rad} {rad} 0 1 0 {} 0a{rad} {rad} 0 1 0 -{} 0", cx - rad, rad * 2.0, rad * 2.0);
-    for (i, &(cx, cy)) in PLAYERS.iter().enumerate() {
-        // Each dot's pulse starts 0.15 s after the one before: up over 0.48 s, down over 0.48 s, then rests.
-        let lit = sweep.map_or(1.0, |s| {
-            let k = (s - i as f32 * 0.15).rem_euclid(1.6) / 1.6;
-            let ease = |v: f32| v * v * (3.0 - 2.0 * v);
-            if k < 0.3 { ease(k / 0.3) } else if k < 0.6 { 1.0 - ease((k - 0.3) / 0.3) } else { 0.0 }
-        });
-        r.path(20 + i as u16, &dot(cx, cy, 4.7), None, x, y, 18.0, alpha(color, (64.0 + 191.0 * lit) as u8));
-    }
-    r.path(28, &dot(31.8, 32.0, 5.2), None, x, y, 18.0, color);
+/// The status icons' width, and the box their 64-unit paths are laid out in.
+const MARK: f32 = 18.0;
+
+/// The logo's players in a status icon's 64-unit box: two arcs around the centre at (31.8, 32).
+const PLAYERS: [(f32, f32); 8] = [(5.6, 32.0), (13.4, 13.4), (17.9, 32.0), (31.8, 5.6), (31.8, 17.9), (46.1, 32.0), (50.6, 13.4), (58.4, 32.0)];
+
+/// A circle as SVG path data.
+fn dot(cx: f32, cy: f32, rad: f32) -> String {
+    format!("M{} {cy}a{rad} {rad} 0 1 0 {} 0a{rad} {rad} 0 1 0 -{} 0", cx - rad, rad * 2.0, rad * 2.0)
+}
+
+/// Smoothstep: 0..1 eased in and out.
+fn ease(v: f32) -> f32 {
+    v * v * (3.0 - 2.0 * v)
+}
+
+fn unix_secs() -> f64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }
 
 /// The last terminal size recorded in a task log (the daemon writes `ESC [8;rows;cols t` on resize).
