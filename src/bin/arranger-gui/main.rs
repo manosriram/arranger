@@ -203,6 +203,8 @@ enum Action {
     Overview(bool),
     OvGroup(Option<usize>),
     OvHost(Option<usize>),
+    /// Start an ended task's agent again (resuming its session), sending it this prompt if any.
+    Revive(TaskKey, String),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -235,6 +237,8 @@ struct App {
     last_esc: Option<Instant>,
     /// New-task prompts, oldest first (saved in gui.json), for ↑ in the dialog.
     prompts: Vec<String>,
+    /// Why the last Revive of a task failed, shown in its Revive bar.
+    revive_error: Option<(TaskKey, String)>,
     /// The Overview table is showing, filtered to one state group (None: all).
     overview: bool,
     ov_group: Option<usize>,
@@ -315,6 +319,7 @@ fn run() -> io::Result<()> {
         pending_g: false,
         last_esc: None,
         prompts: Vec::new(),
+        revive_error: None,
         overview: false,
         ov_group: None,
         ov_host: None,
@@ -1637,6 +1642,19 @@ impl App {
                     self.ov_group = g;
                     self.ov_scroll = 0.0;
                 }
+                Action::Revive(key @ (m, id), prompt) => {
+                    let sock = self.sock(m);
+                    match request_at(sock.as_deref(), &Request::Revive { id, prompt }) {
+                        Ok(Reply::Ok) => {
+                            // Its chat attaches by itself once the task shows as running.
+                            self.revive_error = None;
+                            (self.review, self.overview, self.selected) = (None, false, Some(key));
+                            self.focus = if self.vim { Focus::Normal } else { Focus::Message };
+                        }
+                        Ok(r) => self.revive_error = Some((key, format!("unexpected reply: {r:?}"))),
+                        Err(e) => self.revive_error = Some((key, e.to_string())),
+                    }
+                }
                 Action::OvHost(m) => {
                     self.ov_host = m;
                     self.ov_scroll = 0.0;
@@ -2099,9 +2117,26 @@ impl App {
         let kw = r.text(mx, r.center(head, MONO, 11.0), kind, MONO, 11.0, 400, accent(kind), 100.0);
         r.text(mx + kw + 4.0, r.center(head, MONO, 11.0), &meta, MONO, 11.0, 400, t.text3, meta_w);
 
-        // Message box at the bottom; none once the agent has ended, as nothing can read it.
+        // Message box at the bottom; once the agent has ended, a bar to bring it back instead.
         let ended = group(&task.state) == 4;
-        let input_area = Rect::new(area.x, area.y + area.h - if ended { 0.0 } else { 49.0 }, area.w, if ended { 0.0 } else { 49.0 });
+        let input_area = Rect::new(area.x, area.y + area.h - 49.0, area.w, 49.0);
+        if ended {
+            r.rect(Rect::new(area.x, input_area.y, area.w, 1.0), 0.0, t.border);
+            let label = format!("Revive {}", adapter::kind(&task.agent));
+            let bw = r.measure(UI, 12.5, 500, &label) + 28.0;
+            let b = Rect::new(area.x + area.w - 10.0 - bw, input_area.y + 9.0, bw, 32.0);
+            let key = (task.machine, task.id);
+            let note = match self.revive_error.as_ref().filter(|e| e.0 == key) {
+                Some((_, e)) => (format!("Couldn't revive: {e}"), t.del),
+                None => (format!("{} has ended · revive it to pick up where it left off", adapter::kind(&task.agent)), t.text3),
+            };
+            r.text(area.x + 16.0, r.center(b, UI, 12.5), &note.0, UI, 12.5, 400, note.1, b.x - area.x - 32.0);
+            r.rect(b, 4.0, t.primary_bg);
+            r.text(b.x + 14.0, r.center(b, UI, 12.5), &label, UI, 12.5, 500, t.primary_fg, bw);
+            if self.hit(r, b) {
+                self.actions.push(Action::Revive(key, String::new()));
+            }
+        }
         if !ended {
             r.rect(Rect::new(area.x, input_area.y, area.w, 1.0), 0.0, t.border);
             let ib = Rect::new(area.x + 10.0, input_area.y + 9.0, area.w - 20.0, 32.0);

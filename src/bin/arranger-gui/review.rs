@@ -392,6 +392,10 @@ impl App {
                     "Merging `{}` into this branch conflicts in {files}. Resolve the conflicts, keeping the intent of both sides, then `git add` the files and finish the merge with `git commit --no-edit`. Don't change anything else.",
                     d.base
                 );
+                if self.task((host, id)).is_some_and(|t| group(&t.state) == 4) {
+                    self.actions.push(Action::Revive((host, id), text)); // it reads the prompt as it comes back
+                    return;
+                }
                 self.review = None;
                 self.focus = rest;
                 self.spawn_request(host, Tag::Note, Request::Prompt { id, text });
@@ -878,7 +882,7 @@ impl App {
         let conflicted = rv.data.as_ref().is_some_and(|d| !d.conflicts.is_empty());
         let merge_label = match (conflicted, ended) {
             (true, false) => format!("Ask {agent} to resolve"),
-            (true, true) => "Agent ended · resolve with ▾".to_string(),
+            (true, true) => format!("Revive {agent} to resolve"),
             _ if base.is_empty() => "Merge".to_string(),
             _ => format!("Merge into {base}"),
         };
@@ -940,11 +944,8 @@ impl App {
             if self.hit(r, discard) {
                 acts.push(ReviewAction::Discard);
             } else if self.hit(r, merge) {
-                match (conflicted, ended) {
-                    (false, _) => acts.push(ReviewAction::Commit(Ship::Merge)),
-                    (true, false) => acts.push(ReviewAction::AskResolve),
-                    (true, true) => acts.push(ReviewAction::ShipMenu(!open)),
-                }
+                // An ended agent is revived first, with the resolve prompt.
+                acts.push(if conflicted { ReviewAction::AskResolve } else { ReviewAction::Commit(Ship::Merge) });
             } else if self.hit(r, chev) {
                 acts.push(ReviewAction::ShipMenu(!open));
             }

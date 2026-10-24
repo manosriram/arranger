@@ -30,9 +30,20 @@ pub const PARENT_SESSION_ENV: &[&str] = &[
 
 /// Program, args and extra env that start `agent` with arranger's hooks installed, on `model`
 /// ("" leaves the agent's default; claude, codex, gemini and pi all take `--model`).
-pub fn launch(agent: &str, prompt: &str, model: &str, exe: &Path, data: &Path) -> io::Result<(Vec<String>, Vec<(String, String)>)> {
+/// `resume` picks up the agent's last session in this directory (a revived task) instead of a new one.
+pub fn launch(agent: &str, prompt: &str, model: &str, resume: bool, exe: &Path, data: &Path) -> io::Result<(Vec<String>, Vec<(String, String)>)> {
     let hook = |name: &str| format!("'{}' hook {name}", exe.display());
     let mut argv = vec![agent.to_string()];
+    if resume {
+        // ponytail: gemini's and pi's flags are from their docs, untested here
+        let args: &[&str] = match kind(agent) {
+            "claude" | "pi" => &["--continue"],
+            "codex" => &["resume", "--last"],
+            "gemini" => &["--resume", "latest"],
+            _ => &[],
+        };
+        argv.extend(args.iter().map(|a| a.to_string()));
+    }
     let mut env = vec![("ARRANGER_BIN".to_string(), exe.display().to_string())];
     match kind(agent) {
         "claude" => {
@@ -340,6 +351,16 @@ mod tests {
     }
 
     #[test]
+    fn resume_args() {
+        let (exe, data) = (Path::new("/bin/arranger"), Path::new("/tmp"));
+        let (argv, _) = launch("claude", "fix it", "", true, exe, data).unwrap();
+        assert_eq!((argv[1].as_str(), argv.last().unwrap().as_str()), ("--continue", "fix it"));
+        let (argv, _) = launch("codex", "", "", true, exe, data).unwrap();
+        assert_eq!(&argv[1..3], ["resume", "--last"]);
+        assert!(!launch("claude", "", "", false, exe, data).unwrap().0.contains(&"--continue".to_string()));
+    }
+
+    #[test]
     fn claude_hooks() {
         let mut t = Totals::default();
         let v = json!({"hook_event_name": "PreToolUse", "cwd": "/w", "tool_name": "Edit", "tool_input": {"file_path": "/w/src/a.rs"}});
@@ -356,9 +377,9 @@ mod tests {
     #[test]
     fn launch_model() {
         let (exe, data) = (Path::new("/bin/arranger"), Path::new("/tmp"));
-        let (argv, _) = launch("claude", "hi", "claude-sonnet-5-5", exe, data).unwrap();
+        let (argv, _) = launch("claude", "hi", "claude-sonnet-5-5", false, exe, data).unwrap();
         assert_eq!(argv[argv.len() - 3..], ["--model", "claude-sonnet-5-5", "hi"]);
-        let (argv, _) = launch("claude", "", "", exe, data).unwrap();
+        let (argv, _) = launch("claude", "", "", false, exe, data).unwrap();
         assert!(!argv.contains(&"--model".to_string()));
     }
 }

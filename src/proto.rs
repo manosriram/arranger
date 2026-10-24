@@ -9,7 +9,7 @@ use std::path::PathBuf;
 const MAX_FRAME: usize = 64 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 10;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -43,6 +43,9 @@ pub enum Request {
     Commit { id: u64, message: String, ship: Ship },
     /// The task's recorded PTY output (zstd), for replaying a finished task's chat.
     Log { id: u64 },
+    /// Start an ended task's agent again in its worktree, resuming its last session, and send it
+    /// `prompt` if not empty.
+    Revive { id: u64, prompt: String },
     /// Undo the merge under way in the task's worktree.
     AbortMerge { id: u64 },
     /// Settle every conflict with one side: the task's branch (`ours`) or its base.

@@ -382,6 +382,10 @@ impl Daemon {
                 Ok(r) => Reply::Review(r),
                 Err(e) => Reply::Error(e),
             },
+            Request::Revive { id, prompt } => match self.revive(id, &prompt) {
+                Ok(()) => Reply::Ok,
+                Err(e) => Reply::Error(e),
+            },
             Request::AbortMerge { id } => match self.task_paths(id).and_then(|(wt, _)| git(git_in(Path::new(&wt)).args(["merge", "--abort"]))) {
                 Ok(_) => Reply::Ok,
                 Err(e) => Reply::Error(e),
@@ -756,13 +760,32 @@ impl Daemon {
     }
 
     fn start(&mut self, id: u64) -> Result<(), String> {
+        self.spawn(id, None)
+    }
+
+    /// Brings an ended task's agent back in its worktree, resuming its last session.
+    fn revive(&mut self, id: u64, prompt: &str) -> Result<(), String> {
+        if self.tasks.contains_key(&id) {
+            return Err(format!("task {id} is still running"));
+        }
+        let state: String = self.db.query_row("SELECT state FROM tasks WHERE id = ?1", [id], |r| r.get(0)).map_err(e2s)?;
+        if !matches!(state.as_str(), "exited" | "dead" | "failed") {
+            return Err(format!("task {id} is {state}, not ended"));
+        }
+        self.task_paths(id)?; // its worktree must still be there
+        self.spawn(id, Some(prompt))
+    }
+
+    /// Launches task `id`'s agent: its first prompt, or with `resume` its last session plus that prompt.
+    fn spawn(&mut self, id: u64, resume: Option<&str>) -> Result<(), String> {
         let (agent, repo, wt, prompt, model): (String, String, String, String, String) = self
             .db
             .query_row("SELECT agent, repo, worktree, prompt, model FROM tasks WHERE id = ?1", [id], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })
             .map_err(e2s)?;
-        let (argv, env) = adapter::launch(&agent, &prompt, &model, &self.exe, &self.data).map_err(e2s)?;
+        let prompt = resume.unwrap_or(&prompt);
+        let (argv, env) = adapter::launch(&agent, prompt, &model, resume.is_some(), &self.exe, &self.data).map_err(e2s)?;
         let mut cmd = if Path::new(&wt).join(".arranger/setup").exists() {
             let mut sh = Command::new("sh");
             sh.args(["-c", "./.arranger/setup && exec \"$0\" \"$@\""]).args(&argv);

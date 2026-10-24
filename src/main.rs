@@ -15,7 +15,7 @@ use std::{env, thread};
 const USAGE: &str = "usage: arranger            open the workspace window
        arranger [ls [--files] | new <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
                  | approve <id> | deny <id> [reason] | events <id> | diff <id> | revert <id> <path> <hunk#>
-                 | send <id> <text> | commit <id> [--merge|--pr] [message] | ping | stop | serve | hook <adapter>
+                 | send <id> <text> | revive <id> [prompt] | commit <id> [--merge|--pr] [message] | ping | stop | serve | hook <adapter>
                  | machine [ls | add <name> <user@host> [repo] | rm <name>] | endpoint]";
 /// Ctrl-\, raw and in kitty keyboard encoding.
 const DETACH: &[&[u8]] = &[b"\x1c", b"\x1b[92;5u"];
@@ -55,6 +55,9 @@ fn main() {
         ["revert", id, path, hunk] => parse_id(id).and_then(|id| revert(id, path, hunk)),
         ["send", id, ref text @ ..] => {
             parse_id(id).and_then(|id| request(&Request::Prompt { id, text: text.join(" ") }).map(drop))
+        }
+        ["revive", id, ref text @ ..] => {
+            parse_id(id).and_then(|id| request(&Request::Revive { id, prompt: text.join(" ") }).map(drop))
         }
         ["commit", id, "--merge", ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, Ship::Merge)),
         ["commit", id, "--pr", ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, Ship::Pr)),
