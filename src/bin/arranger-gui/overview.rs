@@ -168,12 +168,15 @@ impl App {
             r.text(b.x + 8.0, r.center(b, UI, 11.5), label, UI, 11.5, 500, fg, bw);
             if self.hit(r, b) && clicked(self.click) {
                 acts.retain(|a| !matches!(a, Action::Select(_)));
+                if label == "Approve" {
+                    acts.push(Action::Answer(key, true)); // before Select attaches its terminal
+                }
                 acts.push(Action::Select(key));
                 acts.extend(match label {
-                    "Approve" => vec![Action::Answer(true)],
+                    "Approve" => vec![],
+                    "Answer" => vec![Action::Answering],
                     "Review" => vec![Action::OpenReview],
-                    "Answer" => vec![Action::Overview(false), Action::Focus(Focus::Message)],
-                    _ => vec![Action::Overview(false), Action::Focus(Focus::Message)], // insert, unless ended
+                    _ => vec![Action::Overview(false), Action::Focus(Focus::Term)], // its terminal, to type into
                 });
             }
         }
@@ -244,8 +247,8 @@ impl App {
     pub fn draw_help(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
         const SECTIONS: [(&str, &[(&str, &str)]); 3] = [
             ("MOVE", &[("j / k", "next / prev agent"), ("gg  G", "first / last"), ("J / K", "next / prev needing you"), ("h / l", "prev / next view"), ("/", "filter agents")]),
-            ("ACT", &[("o  ↵", "attach to agent"), ("a", "allow command"), ("x", "deny command"), ("r", "review diff"), ("d", "delete task"), ("n", "new task"), ("m", "add machine")]),
-            ("MODE", &[("i", "message agent"), ("esc", "normal mode"), ("esc esc", "stop the agent"), ("?", "this sheet")]),
+            ("ACT", &[("o  ↵", "type into agent"), ("j / k", "its menu, when it asks"), ("↵", "pick from the menu"), ("r", "review diff"), ("d", "delete task"), ("n", "new task"), ("m", "add machine")]),
+            ("MODE", &[("i", "type into agent"), ("esc", "normal mode"), ("esc esc", "stop the agent"), ("?", "this sheet")]),
         ];
         let sw = 720.0_f32.min(w - 24.0);
         let sheet = Rect::new(w - 12.0 - sw, h - STATUS_H - 8.0 - 234.0, sw, 234.0);

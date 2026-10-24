@@ -259,7 +259,6 @@ impl App {
             }
             return;
         }
-        if let (Tag::Message, Err(error)) = (&tag, &reply) { self.chat_error = Some(error.clone()); }
         let Some(rv) = &mut self.review else {
             if let (Tag::Message | Tag::Delete, Err(e)) = (tag, reply) {
                 eprintln!("arranger: {e}");

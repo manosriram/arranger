@@ -1,7 +1,6 @@
 //! `arranger serve`: one thread, one mio loop owning every PTY, client and task.
 
 use crate::adapter::{self, Osc};
-use crate::background;
 use crate::proto::{self, Event, Reply, Request, Ship, TaskInfo};
 use crate::pty::{self, Pty};
 use crate::review;
@@ -36,7 +35,6 @@ const MAX_OUTBUF: usize = 16 << 20;
 
 struct Task {
     pty: Pty,
-    background: Option<background::Agent>,
     screen: Screen,
     /// Raw output not yet compressed into the on-disk log.
     log: Vec<u8>,
@@ -59,7 +57,6 @@ struct Task {
 #[derive(Clone, Copy, PartialEq)]
 enum Activity {
     Running,
-    Retrying,
     NeedsYou,
     Done,
 }
@@ -68,7 +65,6 @@ impl Activity {
     fn name(self) -> &'static str {
         match self {
             Activity::Running => "running",
-            Activity::Retrying => "retrying",
             Activity::NeedsYou => "needs-you",
             Activity::Done => "done",
         }
@@ -83,7 +79,6 @@ struct Conn {
     /// Attached from a terminal: asks are answered in the agent's own UI.
     native: bool,
     watching: bool,
-    conversation: Option<u64>,
     writable: bool,
 }
 
@@ -137,8 +132,6 @@ pub fn run() -> io::Result<()> {
     std::env::set_current_dir(&data)?;
 
     let db = Connection::open(data.join("arranger.db")).map_err(io::Error::other)?;
-    // Chat streams record an event per token; WAL keeps each insert from forcing a journal sync.
-    db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;").map_err(io::Error::other)?;
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -147,7 +140,6 @@ pub fn run() -> io::Result<()> {
          CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY, task INTEGER NOT NULL, ts INTEGER NOT NULL, event TEXT NOT NULL);
          CREATE INDEX IF NOT EXISTS events_task ON events (task);
-         CREATE INDEX IF NOT EXISTS events_task_ts ON events (task, ts);
          UPDATE tasks SET state = 'dead' WHERE state = 'running';
          DELETE FROM tasks WHERE state = 'new';",
     )
@@ -207,11 +199,7 @@ pub fn run() -> io::Result<()> {
                     d.shutdown(&sock);
                     return Ok(());
                 }
-                Token(t) if t >= TASK => {
-                    let id = (t - TASK) as u64;
-                    if ev.is_writable() { d.flush_agent(id); }
-                    if ev.is_readable() { d.read_task(id); }
-                },
+                Token(t) if t >= TASK => d.read_task((t - TASK) as u64),
                 Token(t) if t >= JOB => d.read_job(t - JOB),
                 t => d.conn_event(t, ev.is_readable(), ev.is_writable()),
             }
@@ -333,7 +321,6 @@ impl Daemon {
                     attached: None,
                     native: false,
                     watching: false,
-                    conversation: None,
                     writable: false,
                 };
                 self.conns.insert(t, conn);
@@ -430,27 +417,26 @@ impl Daemon {
                     Err(e) => Reply::Error(e),
                 }
             }
-            Request::Conversation { id } => {
-                match self.events(id) {
-                    Ok(events) => {
-                        if let Some(c) = self.conns.get_mut(&t) { c.conversation = Some(id); }
-                        Reply::Events(events)
+            Request::Prompt { id, text } => match self.tasks.get_mut(&id) {
+                Some(task) => {
+                    let mut bytes = if task.screen.mode().contains(TermMode::BRACKETED_PASTE) {
+                        format!("\x1b[200~{text}\x1b[201~").into_bytes()
+                    } else {
+                        text.replace('\n', "\r").into_bytes()
+                    };
+                    bytes.push(b'\r');
+                    write_pty(&task.pty.master, &bytes);
+                    // Busy agents hold the prompt until their turn ends.
+                    if task.activity == Activity::Running {
+                        task.queued += 1;
+                        task.action = queued_label(task.queued);
+                        task.since = now();
+                        self.dirty = true;
                     }
-                    Err(e) => Reply::Error(e),
-                }
-            }
-            Request::Cancel { id } => {
-                if let Some(task) = self.tasks.get_mut(&id) {
-                    if let Some(agent) = &mut task.background { agent.cancel(); }
-                    else { write_pty(&task.pty.master, b"\x03"); }
-                    self.flush_agent(id);
-                    self.interrupt(id);
+                    self.resume(id);
                     Reply::Ok
-                } else { Reply::Error(format!("task {id} isn't running")) }
-            }
-            Request::Prompt { id, text } => match self.prompt(id, &text) {
-                Ok(()) => Reply::Ok,
-                Err(e) => Reply::Error(e),
+                }
+                None => Reply::Error(format!("task {id} isn't running")),
             },
             Request::Commit { id, message, ship } => match self.commit(t, id, &message, ship) {
                 Ok(()) => return, // JobDone comes when the script finishes
@@ -485,12 +471,6 @@ impl Daemon {
                     Err(e) => Reply::Error(e),
                 }
             }
-            Request::Answer { id, allow, message } if self.tasks.get(&id).and_then(|t| t.background.as_ref()).is_some_and(|a| a.asking()) => {
-                let result = self.tasks.get_mut(&id).unwrap().background.as_mut().unwrap().answer(allow, &message);
-                self.flush_agent(id);
-                self.refresh_agent_need(id);
-                match result { Ok(()) => Reply::Ok, Err(e) => Reply::Error(e) }
-            }
             Request::Answer { id, allow, message } => match self.asks.iter().position(|a| a.0 == id) {
                 Some(i) => {
                     let (_, hook) = self.asks.remove(i);
@@ -507,7 +487,6 @@ impl Daemon {
                     self.release_asks(id);
                 }
                 match self.tasks.get_mut(&id) {
-                    Some(task) if task.background.is_some() => Reply::Error("This agent runs in the background; open its conversation in arranger-gui or use arranger events".into()),
                     Some(task) => {
                         task.viewers.push(t);
                         self.resize(id, cols, rows);
@@ -527,7 +506,7 @@ impl Daemon {
                     }
                     if is_interrupt(&bytes) {
                         self.interrupt(id);
-                    } else {
+                    } else if !is_menu_move(&bytes) {
                         self.resume(id);
                     }
                 }
@@ -541,51 +520,6 @@ impl Daemon {
             }
         };
         self.send(t, &proto::frame(&reply));
-    }
-
-    fn prompt(&mut self, id: u64, text: &str) -> Result<(), String> {
-        if !self.tasks.contains_key(&id) { return self.revive(id, text); }
-        let task = self.tasks.get_mut(&id).unwrap();
-        if let Some(agent) = &mut task.background {
-            agent.prompt(text.into())?;
-            self.record(id, Event::Prompt { text: text.into() });
-            self.flush_agent(id);
-            self.refresh_agent_need(id);
-        } else {
-            let mut bytes = if task.screen.mode().contains(TermMode::BRACKETED_PASTE) {
-                format!("\x1b[200~{text}\x1b[201~").into_bytes()
-            } else { text.replace('\n', "\r").into_bytes() };
-            bytes.push(b'\r');
-            write_pty(&task.pty.master, &bytes);
-            if task.activity == Activity::Running {
-                task.queued += 1; task.action = queued_label(task.queued); task.since = now(); self.dirty = true;
-            }
-            self.resume(id);
-        }
-        Ok(())
-    }
-
-    fn refresh_agent_need(&mut self, id: u64) {
-        if let Some(need) = self.tasks.get(&id).and_then(|t| t.background.as_ref()).and_then(|a| a.pending_need()) {
-            self.record(id, need);
-        } else { self.resume(id); }
-        self.dirty = true;
-    }
-
-    fn flush_agent(&mut self, id: u64) {
-        let Some(task) = self.tasks.get_mut(&id) else { return };
-        let Some(agent) = &mut task.background else { return };
-        while !agent.output.is_empty() {
-            match rustix::io::write(&task.pty.master, &agent.output) {
-                Ok(0) => break,
-                Ok(n) => { agent.output.drain(..n); }
-                Err(Errno::INTR) => continue,
-                Err(Errno::AGAIN) => break,
-                Err(_) => { agent.output.clear(); break; }
-            }
-        }
-        let interest = if agent.output.is_empty() { Interest::READABLE } else { Interest::READABLE | Interest::WRITABLE };
-        let _ = self.poll.registry().reregister(&mut SourceFd(&task.pty.master.as_raw_fd()), Token(TASK + id as usize), interest);
     }
 
     fn send(&mut self, t: Token, frame: &[u8]) {
@@ -642,7 +576,6 @@ impl Daemon {
         // alacritty panics below its minimum size (e.g. a 0x0 pty from `script`)
         let (cols, rows) = (cols.max(2), rows.max(1));
         if let Some(task) = self.tasks.get_mut(&id) {
-            if task.background.is_some() { return; }
             let _ = pty::resize(&task.pty.master, cols, rows);
             task.screen.resize(cols, rows);
             task.log.extend(size_mark(cols, rows));
@@ -663,21 +596,6 @@ impl Daemon {
     }
 
     fn output(&mut self, id: u64, bytes: &[u8]) {
-        if let Some(agent) = self.tasks.get_mut(&id).and_then(|t| t.background.as_mut()) {
-            let before = agent.session.clone();
-            let events = agent.feed(bytes);
-            if agent.session != before && !agent.session.is_empty() {
-                let _ = fs::write(self.data.join(format!("adapters/session-{id}")), &agent.session);
-                // Older terminal sessions use this path too.
-                let _ = fs::write(adapter::codex_session(&self.data, id), &agent.session);
-            }
-            for event in events { self.record(id, event); }
-            if let Some(need) = self.tasks.get(&id).and_then(|t| t.background.as_ref()).and_then(|a| a.pending_need()) {
-                if self.tasks[&id].need.as_ref() != Some(&need) { self.record(id, need); }
-            }
-            self.flush_agent(id);
-            return;
-        }
         let task = self.tasks.get_mut(&id).unwrap();
         task.log.extend_from_slice(bytes);
         if task.log.len() >= LOG_CHUNK {
@@ -704,17 +622,13 @@ impl Daemon {
 
     /// Stores an event and updates the task's derived state and action line.
     fn record(&mut self, id: u64, event: Event) {
-        // Streamed text leaves the task list unchanged; pushing it per token floods every viewer.
-        self.dirty |= !matches!(event, Event::Message { .. } | Event::Usage { .. } | Event::ToolOutput { .. });
+        let Some(task) = self.tasks.get_mut(&id) else { return };
+        self.dirty = true;
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let json = serde_json::to_string(&event).unwrap();
         if let Err(e) = self.db.execute("INSERT INTO events (task, ts, event) VALUES (?1, ?2, ?3)", params![id, ts, json]) {
             eprintln!("task {id}: {e}");
         }
-        let frame = proto::frame(&Reply::ChatEvent(ts, event.clone()));
-        let viewers: Vec<_> = self.conns.iter().filter(|(_, c)| c.conversation == Some(id)).map(|(&t, _)| t).collect();
-        for viewer in viewers { self.send(viewer, &frame); }
-        let Some(task) = self.tasks.get_mut(&id) else { return };
         if !accept_after_interrupt(&mut task.interrupted, &event) {
             return;
         }
@@ -725,22 +639,14 @@ impl Daemon {
                 let _ = self.db.execute("UPDATE tasks SET summary = ?1 WHERE id = ?2", params![line, id]);
                 return;
             }
-            Event::Message { text, append: true, .. } if task.activity == Activity::Retrying && !text.is_empty() => {
-                self.dirty = true;
-                (Activity::Running, "working".into())
-            }
-            Event::Usage { .. } | Event::Message { .. } | Event::ToolOutput { .. } => return,
-            // Completion/cleanup events do not erase a provider failure. Only real work or a new
-            // prompt can recover it; the process may stay alive while the model is unavailable.
-            Event::TurnDone | Event::ToolEnd { .. } if matches!(task.need, Some(Event::Error { .. })) => return,
-            Event::Retrying { .. } => (Activity::Retrying, event.describe()),
+            Event::Usage { .. } => return,
             // Agents with hooks also ping the terminal when idle; that's not a new ask.
             Event::Attention { .. } if task.activity == Activity::Done => return,
             Event::PermissionRequest { .. } | Event::Question { .. } | Event::Attention { .. } | Event::Error { .. } => {
                 (Activity::NeedsYou, event.describe())
             }
             Event::TurnDone => (Activity::Done, event.describe()),
-            Event::ToolStart { .. } | Event::TurnStarted => (Activity::Running, event.describe()),
+            Event::ToolStart { .. } => (Activity::Running, event.describe()),
             Event::Prompt { .. } | Event::ToolEnd { .. } => (Activity::Running, "working".into()),
         };
         match &event {
@@ -779,7 +685,7 @@ impl Daemon {
 
     /// A human answered (approve/deny or typing): back to running unless more asks wait.
     fn resume(&mut self, id: u64) {
-        let waiting = self.asks.iter().any(|a| a.0 == id) || self.tasks.get(&id).and_then(|t| t.background.as_ref()).is_some_and(|a| a.asking());
+        let waiting = self.asks.iter().any(|a| a.0 == id);
         if let Some(task) = self.tasks.get_mut(&id) {
             if task.activity == Activity::NeedsYou && !waiting {
                 task.activity = Activity::Running;
@@ -827,19 +733,7 @@ impl Daemon {
             .collect();
         for id in exited {
             self.read_task(id);
-            let failed = self.tasks.get_mut(&id).and_then(|t| t.pty.child.try_wait().ok().flatten()).is_some_and(|s| !s.success());
-            if failed {
-                let path = self.data.join(format!("logs/{id}.stderr"));
-                let diagnostic = fs::File::open(path).ok().and_then(|mut f| {
-                    use std::io::{Seek, SeekFrom};
-                    let len = f.metadata().ok()?.len();
-                    let _ = f.seek(SeekFrom::Start(len.saturating_sub(4096)));
-                    let mut bytes = Vec::new(); f.take(4096).read_to_end(&mut bytes).ok()?;
-                    Some(String::from_utf8_lossy(&bytes).trim().to_string())
-                }).unwrap_or_default();
-                self.record(id, Event::Error { message: if diagnostic.is_empty() { "Agent exited unsuccessfully".into() } else { diagnostic } });
-            }
-            self.finish(id, if failed { "failed" } else { "exited" });
+            self.finish(id, "exited");
         }
         self.start_queued();
     }
@@ -901,7 +795,6 @@ impl Daemon {
             let Ok(Some(id)) = next else { break };
             if let Err(e) = self.start(id) {
                 eprintln!("task {id}: {e}");
-                self.record(id, Event::Error { message: e });
                 self.set_state(id, "failed");
             }
         }
@@ -934,18 +827,10 @@ impl Daemon {
             .map_err(e2s)?;
         let prompt = resume.unwrap_or(&prompt);
         let session = resume.map(|_| fs::read_to_string(adapter::codex_session(&self.data, id)).unwrap_or_default());
-        let headless = background::supported(&agent);
-        let (argv, env) = if headless {
-            (background::argv(&agent, &model, resume.is_some()), vec![("ARRANGER_BIN".into(), self.exe.display().to_string())])
-        } else { adapter::launch(&agent, prompt, &model, session.as_deref(), &self.exe, &self.data).map_err(e2s)? };
-        let saved = if resume.is_some() {
-            fs::read_to_string(self.data.join(format!("adapters/session-{id}"))).unwrap_or_else(|_| session.clone().unwrap_or_default())
-        } else { String::new() };
-        let mut background = headless.then(|| background::Agent::new(&agent, Path::new(&wt), &model, saved));
-        if let Some(a) = &mut background { if !prompt.is_empty() { a.prompt(prompt.into())?; } }
+        let (argv, env) = adapter::launch(&agent, prompt, &model, session.as_deref(), &self.exe, &self.data).map_err(e2s)?;
         let mut cmd = if Path::new(&wt).join(".arranger/setup").exists() {
             let mut sh = Command::new("sh");
-            sh.args(["-c", "./.arranger/setup >&2 && exec \"$0\" \"$@\""]).args(&argv);
+            sh.args(["-c", "./.arranger/setup && exec \"$0\" \"$@\""]).args(&argv);
             sh
         } else {
             let mut cmd = Command::new(&argv[0]);
@@ -963,10 +848,7 @@ impl Daemon {
             .env("ARRANGER_REPO", &repo)
             .env("PORT", (20000 + id % 1000 * 10).to_string()); // PORT..PORT+9 is this task's
         let (cols, rows) = (80, 24);
-        let pty = if headless {
-            let stderr = fs::File::options().create(true).append(true).open(self.data.join(format!("logs/{id}.stderr"))).map_err(e2s)?;
-            pty::spawn_background(cmd, stderr)
-        } else { pty::spawn(cmd, cols, rows) }.map_err(|e| format!("{agent}: {e}"))?;
+        let pty = pty::spawn(cmd, cols, rows).map_err(|e| format!("{agent}: {e}"))?;
         let token = Token(TASK + id as usize);
         self.poll
             .registry()
@@ -974,12 +856,11 @@ impl Daemon {
             .map_err(e2s)?;
         let task = Task {
             pty,
-            background,
             screen: Screen::new(cols, rows),
             log: size_mark(cols, rows),
             viewers: Vec::new(),
             osc: Osc::named(agent == "claude"), // ponytail: claude only; other agents' titles are status, not names
-            activity: if headless && prompt.is_empty() { Activity::Done } else { Activity::Running },
+            activity: Activity::Running,
             need: None,
             action: String::new(),
             since: now(),
@@ -987,8 +868,6 @@ impl Daemon {
             interrupted: false,
         };
         self.tasks.insert(id, task);
-        if headless && !prompt.is_empty() { self.record(id, Event::Prompt { text: prompt.into() }); }
-        self.flush_agent(id);
         self.set_state(id, "running");
         Ok(())
     }
@@ -1049,7 +928,7 @@ impl Daemon {
                 info.state = task.activity.name().into();
                 info.action = task.action.clone();
                 info.need = task.need.clone();
-                info.asking = self.asks.iter().any(|a| a.0 == info.id) || task.background.as_ref().is_some_and(|a| a.asking());
+                info.asking = self.asks.iter().any(|a| a.0 == info.id);
                 info.since = task.since;
             }
             if with_files {
@@ -1206,9 +1085,6 @@ impl Daemon {
     /// Agents get SIGHUP when their PTY masters close as the process exits.
     fn shutdown(&mut self, sock: &Path) {
         for (&id, task) in &mut self.tasks {
-            if task.background.is_some() {
-                let _ = rustix::process::kill_process_group(Pid::from_child(&task.pty.child), Signal::HUP);
-            }
             flush_log(&self.data, id, &mut task.log, &mut self.zstd);
         }
         let _ = fs::remove_file(sock);
@@ -1219,6 +1095,11 @@ impl Daemon {
 /// Esc, Vim's double Esc, or Ctrl-C (not the start of a terminal escape sequence).
 fn is_interrupt(bytes: &[u8]) -> bool {
     matches!(bytes, b"\x1b" | b"\x1b\x1b" | b"\x03")
+}
+
+/// ↑/↓ (either cursor mode): moving through an agent's menu isn't answering it yet.
+fn is_menu_move(bytes: &[u8]) -> bool {
+    matches!(bytes, b"\x1b[A" | b"\x1b[B" | b"\x1bOA" | b"\x1bOB")
 }
 
 /// Keep recording cancelled-turn hooks, but only a new prompt can restart its status.
@@ -1275,5 +1156,7 @@ mod tests {
         assert!(!is_interrupt(b"\x1b[A"));
         assert!(!is_interrupt(b"\x1b\x1b[A"));
         assert!(!is_interrupt(b"a"));
+        assert!(is_menu_move(b"\x1bOB"));
+        assert!(!is_menu_move(b"\r"));
     }
 }

@@ -2,7 +2,6 @@
 //! Only `arranger-gui` links winit/OpenGL, so the daemon stays lean.
 
 pub mod adapter;
-pub mod background;
 pub mod client;
 pub mod daemon;
 pub mod machine;

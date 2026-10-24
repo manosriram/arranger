@@ -369,3 +369,29 @@ pub fn accent_deep(agent: &str) -> Rgba {
         _ => hex(0x565C66),
     }
 }
+
+impl Theme {
+    /// ANSI 0-15, derived from the theme's own tokens (the mockups define no terminal palette).
+    pub fn ansi(&self, i: u8) -> Rgba {
+        let (black, white) = if self.dark { (self.raised, self.text2) } else { (self.text2, self.raised) };
+        let base = [black, self.del, self.add, self.needs, self.work, accent("pi"), accent("codex"), white];
+        let bright = [self.faint, self.del, self.add, self.needs, self.work, accent("pi"), accent("codex"), self.text];
+        if i < 8 { base[i as usize] } else { bright[(i - 8) as usize % 8] }
+    }
+
+    /// xterm 256-colour palette above the first 16.
+    pub fn indexed(&self, i: u8) -> Rgba {
+        match i {
+            0..16 => self.ansi(i),
+            16..232 => {
+                let i = i - 16;
+                let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+                [level(i / 36), level(i / 6 % 6), level(i % 6), 255]
+            }
+            _ => {
+                let v = 8 + (i - 232) * 10;
+                [v, v, v, 255]
+            }
+        }
+    }
+}

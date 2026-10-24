@@ -176,7 +176,7 @@ fn parse_pi(v: &Value, totals: &mut Totals) -> Vec<Event> {
 }
 
 /// Tool names across claude, codex, gemini and pi.
-pub(crate) fn tool_start(tool: &str, input: &Value, cwd: &str) -> Vec<Event> {
+fn tool_start(tool: &str, input: &Value, cwd: &str) -> Vec<Event> {
     let path = || {
         let p = ["file_path", "notebook_path", "path"].iter().map(|k| str(&input[*k])).find(|s| !s.is_empty());
         relative(&p.unwrap_or_default(), cwd)

@@ -1,36 +1,10 @@
 #!/usr/bin/env python3
-# Demo agent for README screenshots: speaks background JSONL, edits a file, and reports
-# tool activity through Arranger hooks. Installed as claude/codex/gemini.
+# Demo agent for README screenshots: looks like a coding agent, edits a file, reports through
+# arranger's hooks, then waits. Installed as `claude`/`codex`/`gemini`; the prompt picks the act.
 import json, os, subprocess, sys, time
 
 kind = os.path.basename(sys.argv[0])
-def emit(value):
-    print(json.dumps(value), flush=True)
-
-def read():
-    return json.loads(sys.stdin.readline())
-
-if kind == "claude":
-    init = read()
-    emit({"type": "control_response", "response": {"subtype": "success", "request_id": init["request_id"]}})
-    prompt = read()["message"]["content"]
-elif kind == "codex":
-    init = read()
-    emit({"id": init["id"], "result": {}})
-    read()  # initialized
-    session = read()
-    emit({"id": session["id"], "result": {"thread": {"id": "demo-session"}}})
-    turn = read()
-    prompt = turn["params"]["input"][0]["text"]
-    emit({"method": "turn/started", "params": {"turn": {"id": "demo-turn"}}})
-else:
-    init = read()
-    emit({"jsonrpc": "2.0", "id": init["id"], "result": {"protocolVersion": 1}})
-    session = read()
-    emit({"jsonrpc": "2.0", "id": session["id"], "result": {"sessionId": "demo-session"}})
-    prompt = read()["params"]["prompt"][0]["text"]
-
-message_number = 0
+prompt = sys.argv[-1] if len(sys.argv) > 1 and not sys.argv[-1].startswith("-") else ""
 hook_bin, cwd = os.environ.get("ARRANGER_BIN", "arranger"), os.getcwd()
 
 def hook(payload):
@@ -42,16 +16,12 @@ def tool(name, **inp):
     time.sleep(0.2)
 
 def say(*lines):
-    global message_number
-    message_number += 1
-    text = "\n".join(lines)
-    if kind == "claude":
-        emit({"type": "assistant", "message": {"id": f"demo-{message_number}", "content": [{"type": "text", "text": text}]}})
-    elif kind == "codex":
-        emit({"method": "item/agentMessage/delta", "params": {"itemId": f"demo-{message_number}", "delta": text}})
-    else:
-        emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "demo-session", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text + "\n"}}}})
-    time.sleep(0.05)
+    for l in lines:
+        print(l, flush=True)
+        time.sleep(0.05)
+
+say(f"\x1b[1m{kind}\x1b[0m  ·  {cwd.replace(os.environ['HOME'], '~')}", "", f"\x1b[2m> {prompt}\x1b[0m", "")
+hook({"hook_event_name": "UserPromptSubmit", "prompt": prompt})
 
 if "retry" in prompt:
     tool("Read", file_path=f"{cwd}/src/http.rs")
