@@ -501,7 +501,11 @@ impl Daemon {
                     if let Some(task) = self.tasks.get(&id) {
                         write_pty(&task.pty.master, &bytes);
                     }
-                    self.resume(id);
+                    if is_interrupt(&bytes) {
+                        self.interrupt(id);
+                    } else {
+                        self.resume(id);
+                    }
                 }
                 return;
             }
@@ -681,6 +685,20 @@ impl Daemon {
                 task.activity = Activity::Running;
                 task.action = "working".into();
                 task.need = None;
+                task.since = now();
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// The viewer hit Esc or Ctrl-C mid-turn; agents skip their stop hook when interrupted.
+    fn interrupt(&mut self, id: u64) {
+        if let Some(task) = self.tasks.get_mut(&id) {
+            if task.activity != Activity::Done {
+                task.activity = Activity::Done;
+                task.action = "interrupted".into();
+                task.need = None;
+                task.queued = 0;
                 task.since = now();
                 self.dirty = true;
             }
@@ -1060,6 +1078,11 @@ impl Daemon {
     }
 }
 
+/// A lone Esc keypress (not the start of an escape sequence) or Ctrl-C.
+fn is_interrupt(bytes: &[u8]) -> bool {
+    bytes == b"\x1b" || bytes == b"\x03"
+}
+
 fn queued_label(n: usize) -> String {
     if n == 1 { "prompt queued".into() } else { format!("{n} prompts queued") }
 }
@@ -1076,5 +1099,13 @@ mod tests {
         let events = [bash("cargo test"), end(false), bash("ls"), end(true), bash("cargo build"), end(true), bash("cargo test"), end(true), bash("npm run lint")];
         let want: Vec<(String, Option<bool>)> = vec![("cargo build".into(), Some(true)), ("cargo test".into(), Some(true)), ("npm run lint".into(), None)];
         assert_eq!(checks(&events), want);
+    }
+
+    #[test]
+    fn interrupt_keys() {
+        assert!(is_interrupt(b"\x1b"));
+        assert!(is_interrupt(b"\x03"));
+        assert!(!is_interrupt(b"\x1b[A"));
+        assert!(!is_interrupt(b"a"));
     }
 }
