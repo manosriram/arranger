@@ -820,7 +820,8 @@ impl Daemon {
             })
             .map_err(e2s)?;
         let prompt = resume.unwrap_or(&prompt);
-        let (argv, env) = adapter::launch(&agent, prompt, &model, resume.is_some(), &self.exe, &self.data).map_err(e2s)?;
+        let session = resume.map(|_| fs::read_to_string(adapter::codex_session(&self.data, id)).unwrap_or_default());
+        let (argv, env) = adapter::launch(&agent, prompt, &model, session.as_deref(), &self.exe, &self.data).map_err(e2s)?;
         let mut cmd = if Path::new(&wt).join(".arranger/setup").exists() {
             let mut sh = Command::new("sh");
             sh.args(["-c", "./.arranger/setup && exec \"$0\" \"$@\""]).args(&argv);

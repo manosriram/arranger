@@ -206,7 +206,13 @@ fn hook(adapter: &str) -> io::Result<()> {
     let mut sock = UnixStream::connect(proto::socket_path())?; // no auto-start: no daemon, no tracking
     let mut totals = adapter::Totals::default();
     for value in serde_json::Deserializer::from_reader(io::stdin().lock()).into_iter() {
-        let (events, ask) = adapter::parse(adapter, &value?, &mut totals);
+        let value: serde_json::Value = value?;
+        // rollout-<time>-<uuid>.jsonl names the session too
+        let rollout = value["transcript_path"].as_str().and_then(|p| p.strip_suffix(".jsonl")).and_then(|p| p.get(p.len().saturating_sub(36)..));
+        if let Some(session) = value["session_id"].as_str().or(rollout).filter(|_| adapter == "codex") {
+            let _ = fs::write(adapter::codex_session(&proto::data_dir(), task), session);
+        }
+        let (events, ask) = adapter::parse(adapter, &value, &mut totals);
         for event in events {
             if ask && matches!(event, proto::Event::PermissionRequest { .. }) {
                 sock.write_all(&proto::frame(&Request::Ask { task, event }))?;

@@ -30,15 +30,17 @@ pub const PARENT_SESSION_ENV: &[&str] = &[
 
 /// Program, args and extra env that start `agent` with arranger's hooks installed, on `model`
 /// ("" leaves the agent's default; claude, codex, gemini and pi all take `--model`).
-/// `resume` picks up the agent's last session in this directory (a revived task) instead of a new one.
-pub fn launch(agent: &str, prompt: &str, model: &str, resume: bool, exe: &Path, data: &Path) -> io::Result<(Vec<String>, Vec<(String, String)>)> {
+/// `resume` picks up the agent's last session in this directory (a revived task) instead of a new one;
+/// for codex it carries the task's session id ("" starts a new one), since its `--last` also
+/// matches sessions from the main checkout and sibling worktrees.
+pub fn launch(agent: &str, prompt: &str, model: &str, resume: Option<&str>, exe: &Path, data: &Path) -> io::Result<(Vec<String>, Vec<(String, String)>)> {
     let hook = |name: &str| format!("'{}' hook {name}", exe.display());
     let mut argv = vec![agent.to_string()];
-    if resume {
+    if let Some(session) = resume {
         // ponytail: gemini's and pi's flags are from their docs, untested here
         let args: &[&str] = match kind(agent) {
             "claude" | "pi" => &["--continue"],
-            "codex" => &["resume", "--last"],
+            "codex" if !session.is_empty() => &["resume", session],
             "gemini" => &["--resume", "latest"],
             _ => &[],
         };
@@ -94,6 +96,11 @@ pub fn launch(agent: &str, prompt: &str, model: &str, resume: bool, exe: &Path, 
         }
     }
     Ok((argv, env))
+}
+
+/// Where the hook keeps task `task`'s codex session id, for `launch` to resume it.
+pub fn codex_session(data: &Path, task: u64) -> std::path::PathBuf {
+    data.join(format!("adapters/codex-session-{task}"))
 }
 
 /// Adapter name from the agent command, e.g. `/usr/local/bin/claude` -> "claude".
@@ -355,11 +362,13 @@ mod tests {
     #[test]
     fn resume_args() {
         let (exe, data) = (Path::new("/bin/arranger"), Path::new("/tmp"));
-        let (argv, _) = launch("claude", "fix it", "", true, exe, data).unwrap();
+        let (argv, _) = launch("claude", "fix it", "", Some(""), exe, data).unwrap();
         assert_eq!((argv[1].as_str(), argv.last().unwrap().as_str()), ("--continue", "fix it"));
-        let (argv, _) = launch("codex", "", "", true, exe, data).unwrap();
-        assert_eq!(&argv[1..3], ["resume", "--last"]);
-        assert!(!launch("claude", "", "", false, exe, data).unwrap().0.contains(&"--continue".to_string()));
+        let (argv, _) = launch("codex", "", "", Some("01a1"), exe, data).unwrap();
+        assert_eq!(&argv[1..3], ["resume", "01a1"]);
+        let (argv, _) = launch("codex", "", "", Some(""), exe, data).unwrap();
+        assert_ne!(argv[1], "resume"); // no session of its own: a new one, never another worktree's
+        assert!(!launch("claude", "", "", None, exe, data).unwrap().0.contains(&"--continue".to_string()));
     }
 
     #[test]
@@ -379,18 +388,18 @@ mod tests {
     #[test]
     fn launch_model() {
         let (exe, data) = (Path::new("/bin/arranger"), Path::new("/tmp"));
-        let (argv, _) = launch("claude", "hi", "claude-sonnet-5-5", false, exe, data).unwrap();
+        let (argv, _) = launch("claude", "hi", "claude-sonnet-5-5", None, exe, data).unwrap();
         assert_eq!(argv[argv.len() - 4..], ["--model", "claude-sonnet-5-5", "--", "hi"]);
-        let (argv, _) = launch("claude", "", "", false, exe, data).unwrap();
+        let (argv, _) = launch("claude", "", "", None, exe, data).unwrap();
         assert!(!argv.contains(&"--model".to_string()));
     }
 
     #[test]
     fn dash_prompt_is_not_a_flag() {
         let (exe, data) = (Path::new("/bin/arranger"), Path::new("/tmp"));
-        let (argv, _) = launch("codex", "- fix it", "", false, exe, data).unwrap();
+        let (argv, _) = launch("codex", "- fix it", "", None, exe, data).unwrap();
         assert_eq!(argv[argv.len() - 2..], ["--", "- fix it"]);
-        let (argv, _) = launch("claude", "-x", "", true, exe, data).unwrap();
+        let (argv, _) = launch("claude", "-x", "", Some(""), exe, data).unwrap();
         assert_eq!(argv[argv.len() - 2..], ["--", "-x"]);
     }
 
