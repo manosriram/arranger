@@ -57,6 +57,9 @@ const ROW2_H: f32 = 42.0;
 const GROUP_H: f32 = 24.0;
 const TERM_SIZE: f32 = 12.0;
 const LINE_H: f32 = 18.0;
+/// The chat message box shows up to this many lines, this far apart.
+const MSG_LINES: usize = 8;
+const MSG_LINE_H: f32 = 18.0;
 
 /// A task across machines: (machine index, task id). Ids repeat between machines.
 pub type TaskKey = (usize, u64);
@@ -244,6 +247,10 @@ struct App {
     last_esc: Option<Instant>,
     /// New-task prompts, oldest first (saved in gui.json), for ↑ in the dialog.
     prompts: Vec<String>,
+    /// Messages sent from the chat box, oldest first (saved in gui.json), for ↑ there; and which
+    /// one ↑/↓ put in the box.
+    sent: Vec<String>,
+    sent_hist: Option<usize>,
     /// No project yet (opened outside one, or asked to switch): the welcome screen shows.
     welcome: bool,
     /// Project folders opened here, most recent first (saved in gui.json).
@@ -277,8 +284,10 @@ struct App {
     wheel: f32,
     /// Wheel movement for a full-screen agent not yet worth a wheel tick.
     ticks: f32,
-    /// Mouse-wheel scrolling still to apply: notches glide over a few frames instead of jumping.
+    /// Mouse-wheel scrolling still to apply: notches glide over a few frames instead of jumping;
+    /// and when the last frame of it ran.
     glide: f32,
+    glide_at: Instant,
     mods: ModifiersState,
     mouse: (f32, f32),
     /// The click target under the mouse at the last frame, and the cursor shown for it.
@@ -289,8 +298,13 @@ struct App {
     scroll: f32,
     /// Sidebar sections folded to their header.
     collapsed: std::collections::HashSet<String>,
-    /// ⌘A in a text field: the next edit replaces the whole field.
-    select_all: bool,
+    /// The selection's fixed end in the focused field (the caret is the moving end), from ⇧-moves,
+    /// a mouse drag or ⌘A. The next edit replaces the text between them.
+    anchor: Option<(Focus, usize)>,
+    /// The text field a mouse press landed in, while the button is held: moving drags a selection.
+    text_drag: Option<Focus>,
+    /// The field and byte offset under a press or drag, found while drawing that field.
+    text_hit: std::cell::Cell<Option<(Focus, usize)>>,
     /// Caret in the focused field, as a byte offset; None (or another field) is its end.
     caret: Option<(Focus, usize)>,
     /// Sidebar and review-rail widths, which their dividers drag.
@@ -345,6 +359,8 @@ fn run() -> io::Result<()> {
         pending_g: false,
         last_esc: None,
         prompts: Vec::new(),
+        sent: Vec::new(),
+        sent_hist: None,
         revive_error: None,
         welcome: false,
         recent: Vec::new(),
@@ -366,6 +382,7 @@ fn run() -> io::Result<()> {
         wheel: 0.0,
         ticks: 0.0,
         glide: 0.0,
+        glide_at: Instant::now(),
         mods: ModifiersState::empty(),
         mouse: (0.0, 0.0),
         hot: None,
@@ -374,7 +391,9 @@ fn run() -> io::Result<()> {
         actions: Vec::new(),
         scroll: 0.0,
         collapsed: Default::default(),
-        select_all: false,
+        anchor: None,
+        text_drag: None,
+        text_hit: Default::default(),
         caret: None,
         sidebar_w: SIDEBAR_W,
         rail_w: 280.0,
@@ -389,6 +408,7 @@ fn run() -> io::Result<()> {
     app.theme = THEMES.iter().position(|t| t.name == settings.theme).unwrap_or(0);
     app.vim = settings.vim;
     app.prompts = settings.prompts;
+    app.sent = settings.sent;
     app.recent = settings.recent;
     // Started inside a project (from a terminal): that's the one. Else (Finder, the Dock) ask.
     match welcome::project_root(&app.repo) {
@@ -414,6 +434,8 @@ struct Settings {
     vim: bool,
     /// New-task prompts, oldest first, for ↑ in the dialog.
     prompts: Vec<String>,
+    /// Chat messages, oldest first, for ↑ in the message box.
+    sent: Vec<String>,
     /// Project folders, most recent first, for the welcome screen.
     recent: Vec<String>,
 }
@@ -491,7 +513,8 @@ impl ApplicationHandler<Msg> for App {
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let blink = (!matches!(self.focus, Focus::Term | Focus::Normal)).then_some(self.blink_at);
         let moving = self.glide != 0.0 || self.review.as_ref().is_some_and(|rv| rv.animating());
-        let ms = if self.glide != 0.0 { 16 } else if moving { 33 } else { 80 };
+        // A glide asks for frames at 120Hz; vsync holds that to a 60Hz display's own rate.
+        let ms = if self.glide != 0.0 { 8 } else if moving { 33 } else { 80 };
         let frame = (moving || self.sweep().is_some()).then(|| Instant::now() + Duration::from_millis(ms));
         match blink.into_iter().chain(frame).min() {
             Some(at) => el.set_control_flow(ControlFlow::WaitUntil(at)),
@@ -605,6 +628,9 @@ impl ApplicationHandler<Msg> for App {
                     *if d == Divider::Sidebar { &mut self.sidebar_w } else { &mut self.rail_w } = w;
                     self.redraw();
                 }
+                if self.text_drag.is_some() {
+                    self.redraw();
+                }
                 self.hover_changed();
             }
             WindowEvent::CursorLeft { .. } => {
@@ -618,10 +644,13 @@ impl ApplicationHandler<Msg> for App {
                 }
                 self.redraw();
             }
-            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => self.dragging = None,
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => (self.dragging, self.text_drag) = (None, None),
             WindowEvent::MouseWheel { delta, .. } => match delta {
                 // A wheel notch glides; a trackpad already sends fine steps.
                 MouseScrollDelta::LineDelta(_, y) => {
+                    if self.glide == 0.0 {
+                        self.glide_at = Instant::now();
+                    }
                     self.glide += y * ROW_H * 1.5;
                     self.redraw();
                 }
@@ -820,6 +849,40 @@ fn clipboard() -> String {
         .find_map(|c| Command::new(c[0]).args(&c[1..]).output().ok().filter(|o| o.status.success()))
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default()
+}
+
+fn set_clipboard(text: &str) {
+    let cmds: &[&[&str]] = if cfg!(target_os = "macos") {
+        &[&["pbcopy"]]
+    } else {
+        &[&["wl-copy"], &["xclip", "-i", "-selection", "clipboard"]]
+    };
+    for c in cmds {
+        if let Ok(mut child) = Command::new(c[0]).args(&c[1..]).stdin(std::process::Stdio::piped()).spawn() {
+            let _ = child.stdin.take().map(|mut i| i.write_all(text.as_bytes()));
+            if child.wait().is_ok_and(|s| s.success()) {
+                return;
+            }
+        }
+    }
+}
+
+/// Steps `text` (a prompt or message box) through `list`, oldest first, for ↑ (`up`) or ↓, while
+/// the box is empty or still shows what the last step put there (`hist`). False if it isn't.
+fn recall(list: &[String], hist: &mut Option<usize>, text: &mut String, up: bool) -> bool {
+    let browsing = hist.filter(|&i| list.get(i) == Some(text));
+    if !text.is_empty() && browsing.is_none() {
+        return false;
+    }
+    let next = match (browsing, up) {
+        (None, true) => list.len().checked_sub(1),
+        (Some(i), true) => Some(i.saturating_sub(1)),
+        (Some(i), false) => Some(i + 1).filter(|&j| j < list.len()),
+        (None, false) => None,
+    };
+    *hist = next;
+    *text = next.map_or_else(String::new, |i| list[i].clone());
+    true
 }
 
 /// Bytes a terminal sends for a key press.
@@ -1087,7 +1150,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        let s = Settings { theme: THEMES[self.theme].name.into(), vim: self.vim, prompts: self.prompts.clone(), recent: self.recent.clone() };
+        let s = Settings { theme: THEMES[self.theme].name.into(), vim: self.vim, prompts: self.prompts.clone(), sent: self.sent.clone(), recent: self.recent.clone() };
         let _ = std::fs::write(Settings::path(), serde_json::to_vec_pretty(&s).unwrap_or_default());
     }
 
@@ -1229,9 +1292,13 @@ impl App {
         self.redraw();
     }
 
-    /// One frame of a gliding wheel notch.
+    /// One frame of a gliding wheel notch: 30% of what's left per 60Hz frame, eased the same at
+    /// any frame rate.
     fn glide_step(&mut self) {
-        let step = if self.glide.abs() < 2.0 { self.glide } else { self.glide * 0.3 };
+        let dt = self.glide_at.elapsed().as_secs_f32().min(0.05);
+        self.glide_at = Instant::now();
+        let share = 1.0 - 0.7f32.powf(dt * 60.0);
+        let step = if self.glide.abs() < 1.0 { self.glide } else { self.glide * share };
         self.glide -= step;
         self.scroll_by(step);
     }
@@ -1357,7 +1424,7 @@ impl App {
         self.dialog = Some(Dialog { prompt: String::new(), agent: 0, model: 0, host: 0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new() });
         self.pick_host(host);
         self.focus = Focus::Prompt;
-        self.select_all = false;
+        self.anchor = None;
     }
 
     /// Points the new-task dialog at machine `m`: its default repo, and here the current branch.
@@ -1473,20 +1540,28 @@ impl App {
                     "f" => self.actions.push(Action::Focus(Focus::Filter)),
                     "i" => self.actions.push(Action::Focus(Focus::Message)),
                     "v" => self.paste(),
-                    "a" if self.focus != Focus::Term => self.select_all = true,
+                    "a" if self.focus != Focus::Term => self.select_all(),
+                    "c" | "x" if self.focus != Focus::Term => {
+                        if let Some((from, to)) = self.selection() {
+                            let focus = self.focus;
+                            set_clipboard(&self.field(focus)[from..to]);
+                            if c.to_lowercase() == "x" {
+                                self.insert("");
+                            }
+                        }
+                    }
                     _ => {}
                 },
                 Key::Named(NamedKey::Backspace) if self.focus != Focus::Term => {
                     let focus = self.focus;
                     self.field(focus).clear();
-                    self.select_all = false;
+                    self.anchor = None;
                 }
-                // ⌘← / ⌘→: start or end of the field.
+                // ⌘← / ⌘→: start or end of the field (⇧ selects to there, on macOS).
                 Key::Named(k @ (NamedKey::ArrowLeft | NamedKey::ArrowRight)) if self.focus != Focus::Term => {
                     let focus = self.focus;
                     let end = if *k == NamedKey::ArrowLeft { 0 } else { self.field(focus).len() };
-                    self.caret = Some((focus, end));
-                    self.select_all = false;
+                    self.move_caret(end, m.shift_key() && cfg!(target_os = "macos"));
                 }
                 Key::Named(NamedKey::ArrowDown) => self.move_selection(1),
                 Key::Named(NamedKey::ArrowUp) => self.move_selection(-1),
@@ -1568,50 +1643,45 @@ impl App {
         let focus = self.focus;
         let linux_ctrl = !cfg!(target_os = "macos") && m.control_key();
         if linux_ctrl && ev.logical_key == Key::Character("a".into()) {
-            self.select_all = true;
+            self.select_all();
             return;
         }
-        // ↑/↓ in an empty prompt box (or one showing a recalled prompt) step through earlier ones.
-        if let (Focus::Prompt, Key::Named(k @ (NamedKey::ArrowUp | NamedKey::ArrowDown)), Some(d)) = (focus, &ev.logical_key, &mut self.dialog) {
-            let browsing = d.hist.filter(|&i| self.prompts.get(i) == Some(&d.prompt));
-            if d.prompt.is_empty() || browsing.is_some() {
-                let n = self.prompts.len();
-                let next = match (browsing, *k == NamedKey::ArrowUp) {
-                    (None, true) => n.checked_sub(1),
-                    (Some(i), true) => Some(i.saturating_sub(1)),
-                    (Some(i), false) => Some(i + 1).filter(|&j| j < n),
-                    (None, false) => None,
-                };
-                d.hist = next;
-                d.prompt = next.map_or_else(String::new, |i| self.prompts[i].clone());
-                self.caret = Some((focus, d.prompt.len()));
-                self.select_all = false;
+        // ↑/↓ in an empty prompt or message box (or one showing a recalled entry) step through
+        // earlier ones.
+        if let Key::Named(k @ (NamedKey::ArrowUp | NamedKey::ArrowDown)) = &ev.logical_key {
+            let up = *k == NamedKey::ArrowUp;
+            let recalled = match (focus, &mut self.dialog) {
+                (Focus::Prompt, Some(d)) => recall(&self.prompts, &mut d.hist, &mut d.prompt, up),
+                (Focus::Message, _) => recall(&self.sent, &mut self.sent_hist, &mut self.message, up),
+                _ => false,
+            };
+            if recalled {
+                let len = self.field(focus).len();
+                self.move_caret(len, false);
                 return;
             }
         }
-        let replace = std::mem::take(&mut self.select_all);
+        let shift = m.shift_key();
         let word = m.alt_key() || linux_ctrl;
         let caret = self.caret;
+        let sel = self.selection();
         let field = self.field(focus);
-        let at = if replace { 0 } else { caret_at(caret, focus, field) };
-        // Caret keys: ←/→ by character (⌥ by word), ↑/Home to the start, ↓/End to the end.
-        let moved = match &ev.logical_key {
-            Key::Named(NamedKey::ArrowLeft) if word => Some(word_left(field, at)),
-            Key::Named(NamedKey::ArrowLeft) => Some(field[..at].char_indices().next_back().map_or(0, |(i, _)| i)),
-            Key::Named(NamedKey::ArrowRight) if word => Some(word_right(field, at)),
-            Key::Named(NamedKey::ArrowRight) => Some(field[at..].chars().next().map_or(at, |c| at + c.len_utf8())),
-            Key::Named(NamedKey::ArrowUp | NamedKey::Home) => Some(0),
-            Key::Named(NamedKey::ArrowDown | NamedKey::End) => Some(field.len()),
-            Key::Named(NamedKey::Delete) => {
-                if at < field.len() {
-                    field.remove(at);
-                }
-                Some(at)
-            }
+        let at = caret_at(caret, focus, field);
+        // Caret keys: ←/→ by character (⌥ by word), ↑/Home to the start, ↓/End to the end; with ⇧
+        // they select. Without, ←/→ drop a selection at its edge.
+        let moved = match (&ev.logical_key, sel.filter(|_| !shift)) {
+            (Key::Named(NamedKey::ArrowLeft), Some((from, _))) => Some(from),
+            (Key::Named(NamedKey::ArrowRight), Some((_, to))) => Some(to),
+            (Key::Named(NamedKey::ArrowLeft), _) if word => Some(word_left(field, at)),
+            (Key::Named(NamedKey::ArrowLeft), _) => Some(field[..at].char_indices().next_back().map_or(0, |(i, _)| i)),
+            (Key::Named(NamedKey::ArrowRight), _) if word => Some(word_right(field, at)),
+            (Key::Named(NamedKey::ArrowRight), _) => Some(field[at..].chars().next().map_or(at, |c| at + c.len_utf8())),
+            (Key::Named(NamedKey::ArrowUp | NamedKey::Home), _) => Some(0),
+            (Key::Named(NamedKey::ArrowDown | NamedKey::End), _) => Some(field.len()),
             _ => None,
         };
         if let Some(to) = moved {
-            self.caret = Some((focus, to));
+            self.move_caret(to, shift);
             return;
         }
         match &ev.logical_key {
@@ -1628,14 +1698,20 @@ impl App {
                 }
             }
             Key::Named(NamedKey::Tab) if focus == Focus::Message && m.shift_key() => self.send_input(b"\x1b[Z".to_vec()), // cycles the agent's mode
-            Key::Named(NamedKey::Enter) if matches!(focus, Focus::Prompt | Focus::Note) && m.shift_key() => {
-                self.field(focus).insert(at, '\n');
-                self.caret = Some((focus, at + 1));
-            }
+            Key::Named(NamedKey::Enter) if matches!(focus, Focus::Prompt | Focus::Note | Focus::Message) && shift => self.insert("\n"),
             Key::Named(NamedKey::Enter) => match focus {
                 Focus::Message => {
                     let text = std::mem::take(&mut self.message);
+                    self.anchor = None;
                     if let Some((m, id)) = self.selected.filter(|_| !text.trim().is_empty()) {
+                        let kept = text.trim_end().to_string();
+                        if self.sent.last() != Some(&kept) {
+                            self.sent.push(kept);
+                            let over = self.sent.len().saturating_sub(100);
+                            self.sent.drain(..over);
+                            self.save_settings();
+                        }
+                        self.sent_hist = None;
                         self.spawn_request(m, Tag::Message, Request::Prompt { id, text });
                     }
                 }
@@ -1645,30 +1721,24 @@ impl App {
                 Focus::HostSsh | Focus::HostName | Focus::HostRepo => self.actions.push(Action::AddHost),
                 _ => self.focus = self.rest(),
             },
-            Key::Named(NamedKey::Backspace) => {
-                let field = self.field(focus);
-                let from = if replace {
-                    field.len()
-                } else if word {
-                    word_left(field, at) // Option/Alt/Ctrl+Backspace: the word before the caret
-                } else {
-                    field[..at].char_indices().next_back().map_or(0, |(i, _)| i)
-                };
-                field.drain(from.min(at)..from.max(at));
-                self.caret = Some((focus, from.min(at)));
+            Key::Named(k @ (NamedKey::Backspace | NamedKey::Delete)) => {
+                // The selection, or else the character (⌥: word) before the caret, or after it for Delete.
+                if sel.is_none() {
+                    let field = self.field(focus);
+                    let to = match *k {
+                        NamedKey::Delete => field[at..].chars().next().map_or(at, |c| at + c.len_utf8()),
+                        _ if word => word_left(field, at),
+                        _ => field[..at].char_indices().next_back().map_or(0, |(i, _)| i),
+                    };
+                    self.anchor = Some((focus, to));
+                }
+                self.insert("");
                 self.scroll = 0.0;
             }
             _ => {
                 if let Some(text) = ev.text.as_ref().filter(|t| t.chars().any(|c| !c.is_control())) {
-                    let field = self.field(focus);
-                    if replace {
-                        field.clear();
-                    }
                     let text: String = text.chars().filter(|c| !c.is_control()).collect();
-                    field.insert_str(at, &text);
-                    self.caret = Some((focus, at + text.len()));
-                } else {
-                    self.select_all = replace; // modifiers and other keys keep the selection
+                    self.insert(&text);
                 }
                 self.scroll = 0.0;
             }
@@ -1706,16 +1776,49 @@ impl App {
             let bytes = if bracketed { format!("\x1b[200~{text}\x1b[201~") } else { text.replace('\n', "\r") };
             self.send_input(bytes.into_bytes());
         } else {
-            let focus = self.focus;
-            if std::mem::take(&mut self.select_all) {
-                self.field(focus).clear();
-            }
-            let caret = self.caret;
-            let field = self.field(focus);
-            let at = caret_at(caret, focus, field);
-            field.insert_str(at, &text);
-            self.caret = Some((focus, at + text.len()));
+            self.insert(&text);
         }
+    }
+
+    /// The selected byte range in the focused field, if any.
+    fn selection(&mut self) -> Option<(usize, usize)> {
+        let (focus, a) = self.anchor.filter(|a| a.0 == self.focus)?;
+        let caret = self.caret;
+        let s = self.field(focus);
+        let (a, at) = (caret_at(Some((focus, a)), focus, s), caret_at(caret, focus, s));
+        (a != at).then(|| (a.min(at), a.max(at)))
+    }
+
+    fn select_all(&mut self) {
+        let focus = self.focus;
+        let len = self.field(focus).len();
+        self.caret = Some((focus, len));
+        self.anchor = Some((focus, 0));
+    }
+
+    /// Moves the focused field's caret to byte `to`, extending the selection if `extend`, else dropping it.
+    fn move_caret(&mut self, to: usize, extend: bool) {
+        let focus = self.focus;
+        let caret = self.caret;
+        let at = caret_at(caret, focus, self.field(focus));
+        self.anchor = extend.then(|| self.anchor.filter(|a| a.0 == focus).unwrap_or((focus, at)));
+        self.caret = Some((focus, to));
+    }
+
+    /// Types `text` into the focused field at the caret, replacing the selection.
+    fn insert(&mut self, text: &str) {
+        let focus = self.focus;
+        let caret = self.caret;
+        let (from, to) = match self.selection() {
+            Some(sel) => sel,
+            None => {
+                let at = caret_at(caret, focus, self.field(focus));
+                (at, at)
+            }
+        };
+        self.field(focus).replace_range(from..to, text);
+        self.caret = Some((focus, from + text.len()));
+        self.anchor = None;
     }
 
     fn apply(&mut self) {
@@ -1730,7 +1833,9 @@ impl App {
                 // An ended agent has no message box to type into.
                 Action::Focus(Focus::Message) if self.current().is_none_or(|t| group(&t.state) == 4) => {}
                 Action::Focus(f) => {
-                    self.select_all &= self.focus == f;
+                    if self.focus != f {
+                        self.anchor = None;
+                    }
                     self.focus = f;
                 }
                 Action::NewTask => self.open_dialog(),
@@ -1823,7 +1928,7 @@ impl App {
                 Action::OpenAddHost => {
                     self.add_host = Some(AddHost { ssh: String::new(), name: String::new(), repo: String::new(), test: None, testing: false });
                     self.focus = Focus::HostSsh;
-                    self.select_all = false;
+                    self.anchor = None;
                 }
                 Action::TestHost => {
                     if let Some(a) = self.add_host.as_mut().filter(|a| !a.testing && !a.ssh.trim().is_empty()) {
@@ -1854,13 +1959,35 @@ impl App {
         }
     }
 
-    /// Text field contents with the ⌘A highlight and, at byte `caret` of `s`, a blinking caret.
-    /// Returns the width.
-    fn field_text(&self, r: &mut Renderer, t: &Theme, x: f32, y: f32, s: &str, font: usize, size: f32, max_w: f32, focused: bool, caret: Option<usize>, color: Rgba) -> f32 {
+    /// Text field contents with the selection highlighted and, at byte `caret` of `s`, a blinking
+    /// caret. `s` is field `src.0` from byte `src.1` on (all of it, or one wrapped line): a mouse
+    /// press or drag over it puts the caret there. Returns the width.
+    fn field_text(&self, r: &mut Renderer, t: &Theme, x: f32, y: f32, s: &str, font: usize, size: f32, max_w: f32, src: (Focus, usize), focused: bool, caret: Option<usize>, color: Rgba) -> f32 {
         let w = r.text(x, y, s, font, size, 400, t.text, max_w);
         let (top, h) = (y - size * 0.15, size * 1.35);
-        if focused && self.select_all && !s.is_empty() {
-            r.rect(Rect::new(x - 1.0, top, w + 2.0, h), 2.0, alpha(t.work, 0x50));
+        let (field, base) = src;
+        let band = (y - size * 0.35, y + size * 1.4);
+        let over = |p: (f32, f32)| p.1 >= band.0 && p.1 < band.1;
+        let press = self.click.filter(|p| over(*p) && p.0 >= x - 10.0 && p.0 < x + max_w + 10.0);
+        if let Some(p) = press.or(Some(self.mouse).filter(|p| self.text_drag == Some(field) && over(*p))) {
+            // The character boundary nearest the mouse.
+            let mut cx = x;
+            let at = s.char_indices().find(|&(_, ch)| {
+                let a = r.advance(font, size, 400, ch);
+                cx += a;
+                p.0 < cx - a / 2.0
+            });
+            self.text_hit.set(Some((field, base + at.map_or(s.len(), |(i, _)| i))));
+        }
+        let sel = self.anchor.zip(self.caret).filter(|(a, c)| focused && a.0 == field && c.0 == field && a.1 != c.1);
+        if let Some((from, to)) = sel.map(|(a, c)| (a.1.min(c.1), a.1.max(c.1))).filter(|&(from, to)| to > base && from <= base + s.len()) {
+            let edge = |i: usize| {
+                let i = i.clamp(base, base + s.len()) - base;
+                if s.is_char_boundary(i) { r.measure(font, size, 400, &s[..i]).min(w) } else { 0.0 }
+            };
+            // Past the line's end it runs on to the next line: a sliver shows that.
+            let end = if to > base + s.len() { edge(to) + size * 0.3 } else { edge(to) };
+            r.rect(Rect::new(x + edge(from), top, end - edge(from), h), 2.0, alpha(t.work, 0x50));
         } else if let Some(at) = caret.filter(|_| focused && self.caret_on) {
             let cx = x + 1.0 + if at >= s.len() { w } else { r.measure(font, size, 400, &s[..at]).min(w) };
             r.rect(Rect::new(cx, top, 1.5, h), 0.0, color);
@@ -1945,6 +2072,22 @@ impl App {
         let clicked = self.click.take().is_some();
         let had_actions = !self.actions.is_empty();
         self.apply();
+        // After the click's own actions (which focus the field): a press puts the caret there,
+        // ⇧ extending the selection, and starts a drag; dragging moves the caret, selecting. A field
+        // the click didn't focus was under something else (the dialog's scrim).
+        if let Some((field, at)) = self.text_hit.take().filter(|h| h.0 == self.focus) {
+            if clicked {
+                let end = self.field(field).len();
+                let from = self.caret.filter(|c| c.0 == field).map_or(end, |c| c.1.min(end));
+                let keep = self.mods.shift_key() && self.focus == field;
+                self.anchor = Some(self.anchor.filter(|a| keep && a.0 == field).unwrap_or((field, if keep { from } else { at })));
+                self.text_drag = Some(field);
+            }
+            if self.caret != Some((field, at)) {
+                self.caret = Some((field, at));
+                self.redraw();
+            }
+        }
         if clicked && had_actions {
             self.redraw();
         }
@@ -2025,7 +2168,7 @@ impl App {
             r.text(f.x + 25.0, r.center(f, UI, 12.0), &placeholder, UI, 12.0, 400, t.text3, f.w - 50.0);
         } else {
             let filter = self.filter.clone();
-            self.field_text(r, t, f.x + 25.0, r.center(f, UI, 12.0), &filter, UI, 12.0, f.w - 50.0, focused, self.caret_for(Focus::Filter, &filter), t.work);
+            self.field_text(r, t, f.x + 25.0, r.center(f, UI, 12.0), &filter, UI, 12.0, f.w - 50.0, (Focus::Filter, 0), focused, self.caret_for(Focus::Filter, &filter), t.work);
         }
         r.text(f.x + f.w - 8.0 - r.measure(MONO, 10.0, 400, &mod_label("F")), r.center(f, MONO, 10.0), &mod_label("F"), MONO, 10.0, 400, t.text3, 60.0);
         if self.hit_as(r, f, Cursor::Text) {
@@ -2321,50 +2464,24 @@ impl App {
                 self.actions.push(Action::Revive(key, String::new()));
             }
         }
-        if !ended {
-            r.rect(Rect::new(area.x, input_area.y, area.w, 1.0), 0.0, t.border);
-            let ib = Rect::new(area.x + 10.0, input_area.y + 9.0, area.w - 20.0, 32.0);
-            let focused = self.focus == Focus::Message;
-            r.frame(ib, 4.0, t.panel, if focused { t.work } else { t.border2 });
-            let ib_hit = self.hit_as(r, ib, Cursor::Text); // before the chip, so the chip is on top
-            r.text(ib.x + 10.0, r.center(ib, MONO, 12.5), "›", MONO, 12.5, 400, t.text3, 20.0);
-            // The agent's mode (read from its hidden footer); click or ⇧Tab cycles it.
-            let mut text_w = ib.w - 60.0;
-            if let Some((_, mode)) = self.session.as_ref().filter(|s| s.task == (task.machine, task.id)).and_then(|s| agent_box(&s.screen, kind)) {
-                let label = if mode.is_empty() { "default mode".to_string() } else { mode };
-                let cw = r.measure(MONO, 10.5, 400, &label) + r.measure(UI, 10.0, 400, "⇧Tab") + 26.0;
-                let chip = Rect::new(ib.x + ib.w - 34.0 - cw, ib.y + 6.0, cw, 20.0);
-                r.rect(chip, 3.0, t.raised);
-                let lw = r.text(chip.x + 8.0, r.center(chip, MONO, 10.5), &label, MONO, 10.5, 400, t.text2, cw);
-                r.text(chip.x + 16.0 + lw, r.center(chip, UI, 10.0), "⇧Tab", UI, 10.0, 400, t.text3, 40.0);
-                if self.hit(r, chip) {
-                    self.actions.push(Action::Input(b"\x1b[Z".to_vec()));
-                }
-                text_w -= cw + 8.0;
-            }
-            if self.message.is_empty() && !focused {
-                let on = host.cfg.as_ref().map(|_| format!(" on {}", host.name())).unwrap_or_default();
-                if self.focus == Focus::Normal {
-                    r.text(ib.x + 26.0, r.center(ib, UI, 12.5), &format!("i to message {kind}{on}"), UI, 12.5, 400, t.text3, text_w);
-                } else {
-                    // The shortcut in mono, whose I has serifs; the UI font's is a bare stroke.
-                    let hw = r.text(ib.x + 26.0, r.center(ib, UI, 12.5), &format!("Message {kind}{on}  ·  "), UI, 12.5, 400, t.text3, text_w);
-                    r.text(ib.x + 26.0 + hw, r.center(ib, MONO, 11.5), &mod_label("I"), MONO, 11.5, 400, t.text3, (text_w - hw).max(0.0));
-                }
-            } else {
-                let message = self.message.clone();
-                self.field_text(r, t, ib.x + 26.0, r.center(ib, UI, 12.5), &message, UI, 12.5, text_w, focused, self.caret_for(Focus::Message, &message), t.work);
-            }
-            r.text(ib.x + ib.w - 22.0, r.center(ib, MONO, 10.5), "↵", MONO, 10.5, 400, t.text3, 20.0);
-            if ib_hit && self.actions.is_empty() {
-                self.actions.push(Action::Focus(Focus::Message));
-            }
-        }
+        // The message box grows upwards over the chat as lines are added (the agent's pane keeps
+        // its size: resizing would make it redraw), up to MSG_LINES, then shows the caret's part.
+        let mode = self.session.as_ref().filter(|s| s.task == (task.machine, task.id)).and_then(|s| agent_box(&s.screen, kind)).map(|(_, mode)| mode);
+        let chip_label = mode.map(|m| if m.is_empty() { "default mode".to_string() } else { m });
+        let chip_w = chip_label.as_ref().map(|l| r.measure(MONO, 10.5, 400, l) + r.measure(UI, 10.0, 400, "⇧Tab") + 26.0);
+        let text_w = area.w - 80.0 - chip_w.map_or(0.0, |w| w + 8.0);
+        let message = self.message.clone();
+        let lines = wrap(r, &message, UI, 12.5, text_w);
+        let caret = self.caret_for(Focus::Message, &message).map(|at| caret_line(&message, &lines, at));
+        let shown = lines.len().min(MSG_LINES);
+        let first = caret.map_or(0, |c| (c.0 + 1).saturating_sub(shown)).min(lines.len() - shown);
+        let grow = (shown - 1) as f32 * MSG_LINE_H;
+        let ib = Rect::new(area.x + 10.0, input_area.y + 9.0 - grow, area.w - 20.0, 32.0 + grow);
 
         // Terminal section.
         let sec = Rect::new(area.x, area.y + HEADER_H, area.w, input_area.y - area.y - HEADER_H);
         r.rect(sec, 0.0, t.term);
-        if self.hit_as(r, sec, Cursor::Text) {
+        if self.hit_as(r, sec, Cursor::Text) && !self.click.is_some_and(|p| !ended && ib.contains(p)) {
             self.actions.push(Action::Focus(Focus::Term));
         }
         let bar_h = if task.need.is_some() { 48.0 } else { 0.0 };
@@ -2433,8 +2550,50 @@ impl App {
             s.extra = b;
         }
         if let Some(need) = &task.need {
-            let bar = Rect::new(sec.x + 16.0, sec.y + sec.h - 16.0 - 38.0, sec.w - 32.0, 38.0);
+            let bar = Rect::new(sec.x + 16.0, sec.y + sec.h - 16.0 - 38.0 - if ended { 0.0 } else { grow }, sec.w - 32.0, 38.0);
             self.draw_need(r, t, bar, &task, need, color, tint);
+        }
+        if !ended {
+            r.rect(Rect::new(area.x, ib.y - 9.0, area.w, input_area.y + input_area.h - ib.y + 9.0), 0.0, t.bg);
+            r.rect(Rect::new(area.x, ib.y - 9.0, area.w, 1.0), 0.0, t.border);
+            let focused = self.focus == Focus::Message;
+            r.frame(ib, 4.0, t.panel, if focused { t.work } else { t.border2 });
+            let ib_hit = self.hit_as(r, ib, Cursor::Text); // before the chip, so the chip is on top
+            let row = |i: usize| Rect::new(ib.x, ib.y + i as f32 * MSG_LINE_H, ib.w, 32.0);
+            r.text(ib.x + 10.0, r.center(row(0), MONO, 12.5), "›", MONO, 12.5, 400, t.text3, 20.0);
+            // The agent's mode (read from its hidden footer); click or ⇧Tab cycles it.
+            if let (Some(label), Some(cw)) = (&chip_label, chip_w) {
+                let last = row(shown - 1);
+                let chip = Rect::new(ib.x + ib.w - 34.0 - cw, last.y + 6.0, cw, 20.0);
+                r.rect(chip, 3.0, t.raised);
+                let lw = r.text(chip.x + 8.0, r.center(chip, MONO, 10.5), label, MONO, 10.5, 400, t.text2, cw);
+                r.text(chip.x + 16.0 + lw, r.center(chip, UI, 10.0), "⇧Tab", UI, 10.0, 400, t.text3, 40.0);
+                if self.hit(r, chip) {
+                    self.actions.push(Action::Input(b"\x1b[Z".to_vec()));
+                }
+            }
+            if self.message.is_empty() && !focused {
+                let host = &self.hosts[task.machine];
+                let on = host.cfg.as_ref().map(|_| format!(" on {}", host.name())).unwrap_or_default();
+                if self.focus == Focus::Normal {
+                    r.text(ib.x + 26.0, r.center(ib, UI, 12.5), &format!("i to message {kind}{on}"), UI, 12.5, 400, t.text3, text_w);
+                } else {
+                    // The shortcut in mono, whose I has serifs; the UI font's is a bare stroke.
+                    let hw = r.text(ib.x + 26.0, r.center(ib, UI, 12.5), &format!("Message {kind}{on}  ·  "), UI, 12.5, 400, t.text3, text_w);
+                    r.text(ib.x + 26.0 + hw, r.center(ib, MONO, 11.5), &mod_label("I"), MONO, 11.5, 400, t.text3, (text_w - hw).max(0.0));
+                }
+            } else {
+                let starts = line_starts(&message, &lines);
+                for i in first..first + shown {
+                    let at = caret.filter(|c| c.0 == i).map(|c| c.1);
+                    let y = r.center(row(i - first), UI, 12.5);
+                    self.field_text(r, t, ib.x + 26.0, y, &lines[i], UI, 12.5, text_w, (Focus::Message, starts[i]), focused, at, t.work);
+                }
+            }
+            r.text(ib.x + ib.w - 22.0, r.center(row(shown - 1), MONO, 10.5), "↵", MONO, 10.5, 400, t.text3, 20.0);
+            if ib_hit && self.actions.is_empty() {
+                self.actions.push(Action::Focus(Focus::Message));
+            }
         }
     }
 
@@ -2562,7 +2721,7 @@ impl App {
         if value.is_empty() && !focused {
             r.text(b.x + 10.0, y, placeholder, font, 12.5, 400, t.faint, b.w - 20.0);
         } else {
-            self.field_text(r, t, b.x + 10.0, y, value, font, 12.5, b.w - 20.0, focused, self.caret_for(focus, value), t.work);
+            self.field_text(r, t, b.x + 10.0, y, value, font, 12.5, b.w - 20.0, (focus, 0), focused, self.caret_for(focus, value), t.work);
         }
         self.hit_as(r, b, Cursor::Text)
     }
@@ -2695,10 +2854,10 @@ impl App {
             r.text(dlg.x + 18.0, ty + 4.0, "Describe the task", UI, 18.0, 400, t.faint, dlg.w - 36.0);
         }
         let caret = self.caret_for(Focus::Prompt, &prompt).map(|at| caret_line(&prompt, &prompt_lines, at));
-        for (i, line) in prompt_lines.iter().enumerate() {
+        for (i, (line, start)) in prompt_lines.iter().zip(line_starts(&prompt, &prompt_lines)).enumerate() {
             let y = ty + 4.0 + i as f32 * 27.0;
             let at = caret.filter(|c| c.0 == i).map(|c| c.1);
-            self.field_text(r, t, dlg.x + 18.0, y, line, UI, 18.0, dlg.w - 36.0, prompt_focus, at, a);
+            self.field_text(r, t, dlg.x + 18.0, y, line, UI, 18.0, dlg.w - 36.0, (Focus::Prompt, start), prompt_focus, at, a);
         }
         let prompt_area = Rect::new(dlg.x, ty, dlg.w, text_h + 16.0);
         if self.hit_as(r, prompt_area, Cursor::Text) {
@@ -2738,7 +2897,7 @@ impl App {
         r.frame(bfield, 4.0, t.dialog, if base_focus || list.is_some() { a } else { t.border2 });
         let fy = r.center(bfield, MONO, 12.0);
         if base_focus {
-            self.field_text(r, t, bfield.x + 10.0, fy, &base, MONO, 12.0, bfw - 20.0, true, self.caret_for(Focus::Base, &base), a);
+            self.field_text(r, t, bfield.x + 10.0, fy, &base, MONO, 12.0, bfw - 20.0, (Focus::Base, 0), true, self.caret_for(Focus::Base, &base), a);
         } else {
             r.text(bfield.x + 10.0, fy, shown, MONO, 12.0, 400, t.text, bfw - if pick { 38.0 } else { 20.0 });
         }
@@ -2886,18 +3045,28 @@ fn word_right(s: &str, at: usize) -> usize {
     at + rest.len() - word.len() + word.find(char::is_whitespace).unwrap_or(word.len())
 }
 
-/// Which of `text`'s wrapped `lines` holds byte `at`, and where in it. Lines are pieces of
-/// `text` in order, so each is found after the last.
+/// Which of `text`'s wrapped `lines` holds byte `at`, and where in it.
 fn caret_line(text: &str, lines: &[String], at: usize) -> (usize, usize) {
-    let mut pos = 0;
-    for (i, line) in lines.iter().enumerate() {
-        let start = text[pos..].find(line.as_str()).map_or(pos, |o| pos + o);
+    for (i, (line, start)) in lines.iter().zip(line_starts(text, lines)).enumerate() {
         if at <= start + line.len() {
             return (i, at.saturating_sub(start));
         }
-        pos = start + line.len();
     }
     (lines.len().saturating_sub(1), lines.last().map_or(0, |l| l.len()))
+}
+
+/// Where in `text` each of its wrapped `lines` starts. Lines are pieces of `text` in order, so
+/// each is found after the last.
+fn line_starts(text: &str, lines: &[String]) -> Vec<usize> {
+    let mut pos = 0;
+    lines
+        .iter()
+        .map(|line| {
+            let start = text[pos..].find(line.as_str()).map_or(pos, |o| pos + o);
+            pos = start + line.len();
+            start
+        })
+        .collect()
 }
 
 /// State icon in a 12px box at (x, cy): square, ring, faint ring, check.
@@ -3100,6 +3269,29 @@ mod tests {
         assert_eq!(caret_line("fix the bug", &lines, 5), (0, 5));
         assert_eq!(caret_line("fix the bug", &lines, 9), (1, 1));
         assert_eq!(caret_line("fix the bug", &lines, 11), (1, 3));
+    }
+
+    #[test]
+    fn wrapped_lines_know_where_they_start() {
+        let text = "fix the bug\nand the test";
+        let lines = vec!["fix the".to_string(), "bug".to_string(), "and the".to_string(), "test".to_string()];
+        assert_eq!(line_starts(text, &lines), vec![0, 8, 12, 20]);
+    }
+
+    #[test]
+    fn up_and_down_recall_earlier_messages() {
+        let list = vec!["one".to_string(), "two".to_string()];
+        let (mut hist, mut text) = (None, String::new());
+        assert!(recall(&list, &mut hist, &mut text, true));
+        assert_eq!(text, "two");
+        assert!(recall(&list, &mut hist, &mut text, true));
+        assert!(recall(&list, &mut hist, &mut text, true)); // stays on the oldest
+        assert_eq!(text, "one");
+        assert!(recall(&list, &mut hist, &mut text, false));
+        assert!(recall(&list, &mut hist, &mut text, false)); // past the newest: empty again
+        assert_eq!((text.as_str(), hist), ("", None));
+        text.push_str("typed");
+        assert!(!recall(&list, &mut hist, &mut text, true)); // ↑ in a typed message moves the caret instead
     }
 
     #[test]

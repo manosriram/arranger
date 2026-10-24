@@ -355,7 +355,7 @@ impl App {
                 });
                 rv.editing = Some(i);
                 self.focus = Focus::Note;
-                self.select_all = false;
+                self.anchor = None;
             }
             ReviewAction::SaveNote => {
                 rv.editing = None;
@@ -855,10 +855,10 @@ impl App {
         let lines = wrap(r, &note.text, UI, 13.0, b.w - 28.0);
         let caret = self.caret_for(Focus::Note, &note.text).filter(|_| editing).map(|at| caret_line(&note.text, &lines, at));
         let mut y = b.y + 38.0;
-        for (k, line) in lines.iter().enumerate() {
+        for (k, (line, start)) in lines.iter().zip(line_starts(&note.text, &lines)).enumerate() {
             if editing {
                 let at = caret.filter(|c| c.0 == k).map(|c| c.1);
-                self.field_text(r, t, hx, y, line, UI, 13.0, b.w - 28.0, self.focus == Focus::Note, at, t.work);
+                self.field_text(r, t, hx, y, line, UI, 13.0, b.w - 28.0, (Focus::Note, start), self.focus == Focus::Note, at, t.work);
             } else {
                 r.text(hx, y, line, UI, 13.0, 400, t.text, b.w - 28.0);
             }
@@ -927,7 +927,7 @@ impl App {
         } else if rv.message.is_empty() && !focused {
             r.text(fx, r.center(field, MONO, 12.5), "commit message", MONO, 12.5, 400, t.faint, field.w - lw - 34.0);
         } else {
-            self.field_text(r, t, fx, r.center(field, MONO, 12.5), &rv.message, MONO, 12.5, field.w - lw - 34.0, focused, self.caret_for(Focus::CommitMsg, &rv.message), t.work);
+            self.field_text(r, t, fx, r.center(field, MONO, 12.5), &rv.message, MONO, 12.5, field.w - lw - 34.0, (Focus::CommitMsg, 0), focused, self.caret_for(Focus::CommitMsg, &rv.message), t.work);
         }
         if self.hit_as(r, field, Cursor::Text) {
             acts.push(ReviewAction::FocusMessage);
