@@ -15,7 +15,7 @@ use std::{env, thread};
 const USAGE: &str = "usage: arranger            open the workspace window
        arranger [ls [--files] | new <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
                  | approve <id> | deny <id> [reason] | events <id> | diff <id> | revert <id> <path> <hunk#>
-                 | send <id> <text> | revive <id> [prompt] | commit <id> [--merge|--pr] [message] | ping | stop | serve | hook <adapter>
+                 | run <id> [command ...] | send <id> <text> | revive <id> [prompt] | commit <id> [--merge|--pr] [message] | ping | stop | serve | hook <adapter>
                  | machine [ls | add <name> <user@host> [repo] | rm <name>] | endpoint]";
 /// Ctrl-\, raw and in kitty keyboard encoding.
 const DETACH: &[&[u8]] = &[b"\x1c", b"\x1b[92;5u"];
@@ -64,6 +64,7 @@ fn main() {
         ["commit", id, ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, Ship::Commit)),
         ["new", agent, "--branch", base, ref prompt @ ..] => new(agent, Some(base), prompt),
         ["new", agent, ref prompt @ ..] => new(agent, None, prompt),
+        ["run", id, ref command @ ..] => parse_id(id).and_then(|id| run(id, command)),
         ["attach", id] => parse_id(id).and_then(attach),
         ["kill", id] => parse_id(id).and_then(|id| request(&Request::Kill { id }).map(drop)),
         _ => {
@@ -138,6 +139,26 @@ fn ls(files: bool) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Run with inherited terminal IO, preserving the command's exit status via exec.
+fn run(id: u64, command: &[&str]) -> io::Result<()> {
+    let reply = request(&Request::List { files: false })?;
+    let Reply::Tasks(tasks) = reply else { return Err(unexpected(reply)) };
+    let task = tasks.iter().find(|t| t.id == id).ok_or_else(|| io::Error::other(format!("no task {id}")))?;
+    if task.worktree.is_empty() {
+        return Err(io::Error::other(format!("task {id} has no worktree")));
+    }
+    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let mut child = match command.split_first() {
+        Some((program, args)) => {
+            let mut child = Command::new(program);
+            child.args(args);
+            child
+        }
+        None => Command::new(shell),
+    };
+    Err(child.current_dir(&task.worktree).exec())
 }
 
 fn diff(id: u64) -> io::Result<()> {

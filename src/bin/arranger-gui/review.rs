@@ -61,6 +61,7 @@ pub struct Note {
 
 pub enum ReviewAction {
     Close,
+    Run,
     Refresh,
     File(usize),
     Split(bool),
@@ -320,6 +321,16 @@ impl App {
 
     pub fn review_action(&mut self, action: ReviewAction) {
         let agent = self.review.as_ref().and_then(|rv| self.task((rv.host, rv.task))).map(|t| adapter::kind(&t.agent).to_string());
+        if matches!(action, ReviewAction::Run) {
+            let result = self.review.as_ref().and_then(|rv| self.task((rv.host, rv.task)).map(|task| (rv.host, task.worktree.clone())))
+                .ok_or_else(|| std::io::Error::other("Task is no longer available"))
+                .and_then(|(host, path)| open_worktree_terminal(&path, self.hosts[host].cfg.as_ref().map(|c| c.ssh.as_str())));
+            if let Some(rv) = &mut self.review {
+                rv.error = result.is_err();
+                rv.status = match result { Ok(()) => "Opened a terminal in the worktree".into(), Err(e) => e.to_string() };
+            }
+            return;
+        }
         let rest = self.rest();
         let Some(rv) = &mut self.review else { return };
         let (id, host) = (rv.task, rv.host);
@@ -327,6 +338,7 @@ impl App {
             rv.discard_armed = false;
         }
         match action {
+            ReviewAction::Run => unreachable!(),
             ReviewAction::Close => {
                 self.review = None;
                 self.focus = rest;
@@ -490,7 +502,14 @@ impl App {
             }
             sx += bw;
         }
-        let mut right = seg.x - 14.0;
+        let run_w = r.measure(UI, 12.0, 500, "Run in worktree") + 24.0;
+        let run = Rect::new(seg.x - 12.0 - run_w, seg.y, run_w, seg.h);
+        r.frame(run, 4.0, t.bg, t.border2);
+        r.text(run.x + 12.0, r.center(run, UI, 12.0), "Run in worktree", UI, 12.0, 500, t.text, run_w - 24.0);
+        if self.hit(r, run) {
+            acts.push(ReviewAction::Run);
+        }
+        let mut right = run.x - 14.0;
         if let Some(d) = &rv.data {
             let (add, del) = d.files.iter().fold((0, 0), |(a, b), f| (a + f.added, b + f.removed));
             let parts = [
@@ -1007,4 +1026,36 @@ impl App {
         }
         Some(menu)
     }
+}
+
+/// Quote for the shell, including paths containing spaces or apostrophes.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn open_worktree_terminal(path: &str, remote: Option<&str>) -> std::io::Result<()> {
+    if path.is_empty() {
+        return Err(std::io::Error::other("Task has no worktree"));
+    }
+    let script = format!("cd -- {} && exec \"${{SHELL:-/bin/sh}}\" -l", shell_quote(path));
+    let command = match remote {
+        Some(host) => format!("ssh -t -- {} {}", shell_quote(host), shell_quote(&script)),
+        None => script,
+    };
+    if cfg!(target_os = "macos") {
+        // Pass the shell command as argv, never as AppleScript source.
+        let status = Command::new("osascript")
+            .args(["-e", "on run argv\ntell application \"Terminal\"\nactivate\ndo script (item 1 of argv)\nend tell\nend run", "--", &command])
+            .status()?;
+        if status.success() { return Ok(()); }
+        return Err(std::io::Error::other("Could not open Terminal"));
+    }
+    for terminal in ["x-terminal-emulator", "xterm"] {
+        match Command::new(terminal).args(["-e", "/bin/sh", "-c", &command]).spawn() {
+            Ok(mut child) => { std::thread::spawn(move || { let _ = child.wait(); }); return Ok(()); }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("Install x-terminal-emulator or xterm to open a worktree terminal"))
 }

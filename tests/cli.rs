@@ -80,6 +80,16 @@ fn task_lifecycle() {
     home.wait_state(&repo, &["done", "exited"]);
     let decision = std::fs::read_to_string(home.0.join("decision")).unwrap();
     assert!(decision.contains(r#""behavior":"allow""#), "{decision}");
+    let base_head = git(&repo, &["rev-parse", "HEAD"]);
+    let (ok, out) = home.arranger(&repo, &["run", "1", "sh", "-c", "cat hello.txt; git branch --show-current"]);
+    assert!(ok, "{out}");
+    assert_eq!(out, "hello\narranger/1\n");
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), base_head);
+    assert!(!repo.join("hello.txt").exists());
+    assert!(!home.arranger(&repo, &["run", "999999", "true"]).0);
+    let failed = Command::new(env!("CARGO_BIN_EXE_arranger"))
+        .env("ARRANGER_HOME", &home.0).args(["run", "1", "sh", "-c", "exit 42"]).status().unwrap();
+    assert_eq!(failed.code(), Some(42));
     let (_, events) = home.arranger(&repo, &["events", "1"]);
     assert!(events.contains("make test") && events.contains("Added hello.txt"), "{events}");
 
