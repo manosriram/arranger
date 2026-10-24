@@ -690,12 +690,15 @@ struct Section<'a> {
     ended: usize,
 }
 
+/// Automatic reconnect attempts after a machine's link fails; then it waits for Reconnect.
+const AUTO_RETRIES: u32 = 3;
+
 /// Keeps machine `m`'s daemon reachable: runs `arranger endpoint` over ssh, forwards its socket,
-/// streams its task list, and on any failure reports why and retries with backoff (or at once
-/// when the window asks). Ends when the machine is removed.
+/// streams its task list, and on any failure reports why and retries with backoff, up to
+/// `AUTO_RETRIES` times (or at once when the window asks). Ends when the machine is removed.
 fn keep_linked(m: usize, cfg: Machine, p: EventLoopProxy<Msg>, retry: mpsc::Receiver<()>, stop: Arc<AtomicBool>, tunnel: Arc<Mutex<Option<std::process::Child>>>) {
     let local = machine::local_socket(&cfg.name);
-    let mut wait = 2;
+    let (mut tries, mut wait) = (0, 2);
     while !stop.load(Ordering::Relaxed) {
         let _ = p.send_event(Msg::Link(m, Link::Connecting));
         let err = match machine::endpoint(&cfg.ssh).and_then(|remote| machine::tunnel(&cfg.ssh, &remote, &local)) {
@@ -712,7 +715,7 @@ fn keep_linked(m: usize, cfg: Machine, p: EventLoopProxy<Msg>, retry: mpsc::Rece
                 let err = match watch() {
                     Ok((mut w, ms)) => {
                         let _ = p.send_event(Msg::Link(m, Link::Up(ms.max(1))));
-                        wait = 2;
+                        (tries, wait) = (0, 2);
                         while let Ok(Reply::Tasks(tasks)) = proto::read_msg(&mut w) {
                             if p.send_event(Msg::Tasks(m, tasks)).is_err() {
                                 return;
@@ -733,10 +736,19 @@ fn keep_linked(m: usize, cfg: Machine, p: EventLoopProxy<Msg>, retry: mpsc::Rece
         if stop.load(Ordering::Relaxed) || p.send_event(Msg::Link(m, Link::Down(err))).is_err() {
             return;
         }
-        if let Err(mpsc::RecvTimeoutError::Disconnected) = retry.recv_timeout(Duration::from_secs(wait)) {
-            return;
+        if tries == AUTO_RETRIES {
+            // Out of automatic retries: stay down until the window asks to reconnect.
+            if retry.recv().is_err() {
+                return;
+            }
+            (tries, wait) = (0, 2);
+            continue;
         }
-        wait = (wait * 2).min(60);
+        match retry.recv_timeout(Duration::from_secs(wait)) {
+            Ok(()) => (tries, wait) = (0, 2),
+            Err(mpsc::RecvTimeoutError::Timeout) => (tries, wait) = (tries + 1, wait * 2),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
     }
 }
 
