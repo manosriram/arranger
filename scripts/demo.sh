@@ -63,7 +63,11 @@ EOF
     sleep 6
     kill $gui 2>/dev/null || true
     wait $gui 2>/dev/null || true
-    ffmpeg -loglevel error -y -i "$demo/shot.ppm" "$out/$2"
+    if command -v ffmpeg >/dev/null 2>&1; then
+        ffmpeg -loglevel error -y -i "$demo/shot.ppm" "$out/$2"
+    else
+        sips -s format png "$demo/shot.ppm" --out "$out/$2" >/dev/null
+    fi
     echo "wrote $out/$2"
     cleanup
     trap - EXIT
