@@ -663,6 +663,14 @@ impl ApplicationHandler<Msg> for App {
                     // Dev aid for screenshots (`ARRANGER_SELECT=<task id>`): start on that local task.
                     let pick = std::env::var("ARRANGER_SELECT").ok().and_then(|v| v.parse().ok()).map(|id| (0, id)).filter(|&k| self.task(k).is_some());
                     self.selected = pick.or_else(|| self.order().first().copied());
+                    // Show several checked tasks using the same selection path as V then j/j.
+                    if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_MULTISELECT").is_some() {
+                        self.vim = true;
+                        self.focus = Focus::Normal;
+                        self.multi_select = Some(self.selected.into_iter().collect());
+                        self.move_selection(1);
+                        self.move_selection(1);
+                    }
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_REVIEW").is_some() {
                         self.open_review();
                     }
@@ -2808,12 +2816,12 @@ impl App {
     /// line, with what it's doing on the right in place of the agent. Returns whether it was clicked.
     fn draw_row(&self, r: &mut Renderer, t: &Theme, task: &TaskInfo, row: Rect, dense: bool) -> bool {
         let hit_row = row;
-        let row = self.draw_task_checkbox(r, t, (task.machine, task.id), row);
+        self.register_task_region((task.machine, task.id), row);
         let g = group(&task.state);
         let queue_pos = self.hosts[task.machine].tasks.iter().filter(|x| x.state == "queued" && x.id <= task.id).count();
         let line = status_line(task, queue_pos).replace('\n', " ");
         let top = if dense { row } else { Rect::new(row.x, row.y + 4.0, row.w, 22.0) };
-        let on = self.selected == Some((task.machine, task.id));
+        let on = self.task_is_selected((task.machine, task.id));
         if on {
             r.rect(row, 0.0, t.sel);
         }
@@ -2845,9 +2853,10 @@ impl App {
     fn draw_needs_card(&self, r: &mut Renderer, t: &Theme, task: &TaskInfo, card: Rect, machine: Option<&str>, live: bool) -> Vec<Action> {
         let key = (task.machine, task.id);
         let hit_card = card;
-        let card = self.draw_task_checkbox(r, t, key, card);
+        self.register_task_region(key, card);
         let mut acts = Vec::new();
-        r.frame(card, 0.0, t.needs_bg, if self.selected == Some(key) { t.needs } else { t.needs_line });
+        let on = self.task_is_selected(key);
+        r.frame(card, 0.0, if on { t.sel } else { t.needs_bg }, if on { t.needs } else { t.needs_line });
         if self.hit(r, hit_card) && live {
             acts.push(Action::Select(key));
         }

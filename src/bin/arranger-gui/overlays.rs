@@ -13,13 +13,12 @@ pub const MT_PAGE: usize = 50;
 const GROUPS: [&str; 5] = ["Needs you", "Running", "Queued", "Done", "Ended"];
 
 impl App {
-    pub fn draw_task_checkbox(&self, r: &mut Renderer, t: &Theme, key: TaskKey, row: Rect) -> Rect {
+    pub(super) fn task_is_selected(&self, key: TaskKey) -> bool {
+        self.multi_select.as_ref().map_or(self.selected == Some(key), |tasks| tasks.contains(&key))
+    }
+
+    pub(super) fn register_task_region(&self, key: TaskKey, row: Rect) {
         self.task_regions.borrow_mut().push((key, row));
-        if let Some(tasks) = &self.multi_select {
-            let checked = tasks.contains(&key);
-            r.text(row.x + 4.0, r.center(row, UI, 14.0), if checked { "☑" } else { "☐" }, UI, 14.0, 500, t.text, 22.0);
-            Rect::new(row.x + 24.0, row.y, row.w - 24.0, row.h)
-        } else { row }
     }
 
     pub fn draw_task_selection(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
@@ -185,7 +184,7 @@ impl App {
                 continue;
             }
             let key = (task.machine, task.id);
-            let on = self.selected == Some(key);
+            let on = self.task_is_selected(key);
             let bg = if on { t.sel } else { t.dialog };
             if on {
                 r.rect(row, 0.0, t.sel);
@@ -194,10 +193,8 @@ impl App {
             if self.hit(r, row) && clicked(self.click) {
                 acts.push(Action::Select(key));
             }
-            self.draw_task_checkbox(r, t, key, row);
-            if self.multi_select.is_none() {
-                self.icon(r, t, task, col_x[0], row.y + row.h / 2.0);
-            }
+            self.register_task_region(key, row);
+            self.icon(r, t, task, col_x[0], row.y + row.h / 2.0);
             let (x, w) = col("task");
             let bw = if task.shipped.is_empty() { 0.0 } else { r.measure(UI, 11.0, 500, &format!("✓ {}", task.shipped)) + 16.0 };
             let tc = if g == 4 { t.text2 } else if on { t.tc_on } else { t.text };
