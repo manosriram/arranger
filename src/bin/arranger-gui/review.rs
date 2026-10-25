@@ -774,7 +774,7 @@ impl App {
             r.text(x + 14.0, y + 12.0, "Binary file", UI, 12.5, 400, t.text3, 200.0);
         }
         let visible = |y: f32, h: f32| y + h >= col.y && y <= col.y + col.h;
-        let tint = |c: Rgba| blend(t.text, c, 0.35);
+        let (add, add_bg, del, del_bg) = t.diff();
         for h in &file.hunks {
             let k = key(&file.path, &h.header);
             let accepted = rv.accepted.contains(&k);
@@ -819,8 +819,8 @@ impl App {
                         };
                         let l = &h.lines[*i];
                         let (bg, sign, sc, fg) = match l.kind {
-                            '+' => (Some(alpha(t.add, 0x12)), "+", t.add, tint(t.add)),
-                            '-' => (Some(alpha(t.del, 0x12)), "−", t.del, tint(t.del)),
+                            '+' => (Some(add_bg), "+", add, t.text),
+                            '-' => (Some(del_bg), "−", del, t.text),
                             _ => (None, "", t.faint, t.text2),
                         };
                         if let Some(bg) = bg {

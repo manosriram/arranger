@@ -392,6 +392,15 @@ pub fn accent(agent: &str) -> Rgba {
 }
 
 impl Theme {
+    /// GitHub's diff palette: (add sign, add row, del sign, del row), keyed on light/dark.
+    pub fn diff(&self) -> (Rgba, Rgba, Rgba, Rgba) {
+        if self.dark {
+            (hex(0x3FB950), [46, 160, 67, 0x33], hex(0xF85149), [248, 81, 73, 0x26])
+        } else {
+            (hex(0x1A7F37), hex(0xDAFBE1), hex(0xCF222E), hex(0xFFEBE9))
+        }
+    }
+
     /// ANSI 0-15, derived from the theme's own tokens (the mockups define no terminal palette).
     pub fn ansi(&self, i: u8) -> Rgba {
         let (black, white) = if self.dark { (self.raised, self.text2) } else { (self.text2, self.raised) };
