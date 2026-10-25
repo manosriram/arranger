@@ -443,6 +443,13 @@ struct App {
 }
 
 fn main() {
+    // Opened from Finder or the Dock rather than a terminal: take the shell's PATH, so the daemon
+    // started from here (and the agents it runs) can find claude, codex and the rest.
+    if std::env::var_os("TERM").is_none() {
+        let path = arranger::shell::login_path();
+        // SAFETY: no other threads yet.
+        unsafe { std::env::set_var("PATH", path) };
+    }
     if let Err(e) = run() {
         eprintln!("arranger: {e}");
         std::process::exit(1);

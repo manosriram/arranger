@@ -38,6 +38,52 @@ cd() { builtin cd "$@"; local s=$?; _arranger_jail; return $s; }
 PROMPT_COMMAND="_arranger_jail${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 "#;
 
+/// PATH as the user's terminal has it. Apps opened from Finder, Spotlight or the Dock get launchd's
+/// bare /usr/bin:/bin:/usr/sbin:/sbin, where agents installed in ~/.local/bin, Homebrew and the
+/// like aren't found. Asks an interactive login shell (rc files are where installers add to PATH),
+/// then keeps the current entries and the usual install dirs after it.
+pub fn login_path() -> OsString {
+    const MARK: &str = "__ARRANGER_PATH__";
+    let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/zsh".into());
+    // printenv, not $PATH: fish's "$PATH" joins with spaces. The mark skips whatever rc files print.
+    let from_shell = Command::new(&shell)
+        .args(["-ilc", &format!("echo {MARK}; /usr/bin/printenv PATH")])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+        .and_then(|mut child| {
+            // An rc file that waits on something mustn't hold the app up.
+            for _ in 0..150 {
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        let mut out = String::new();
+                        io::Read::read_to_string(&mut child.stdout.take()?, &mut out).ok()?;
+                        return out.split_once(MARK)?.1.lines().map(str::trim).find(|l| !l.is_empty()).map(String::from);
+                    }
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                    Err(_) => break,
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        })
+        .unwrap_or_default();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let usual = [".local/bin", ".claude/local", ".cargo/bin", ".bun/bin"].map(|d| format!("{home}/{d}"));
+    let current = std::env::var("PATH").unwrap_or_default();
+    let mut dirs: Vec<&str> = Vec::new();
+    let usual = usual.iter().map(String::as_str).chain(["/opt/homebrew/bin", "/usr/local/bin"]).filter(|d| Path::new(d).is_dir());
+    for dir in from_shell.split(':').chain(current.split(':')).chain(usual) {
+        if !dir.is_empty() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs.join(":").into()
+}
+
 /// The user's shell in `wt`, with `rc` (a scratch dir) holding its startup files. zsh and bash
 /// step back into the worktree after a `cd` out of it. On macOS a sandbox also hides `repo`'s
 /// checkout and the other worktrees, and allows writes only in the worktree, the repo's git dir,
