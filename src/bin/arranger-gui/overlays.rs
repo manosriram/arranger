@@ -13,6 +13,36 @@ pub const MT_PAGE: usize = 50;
 const GROUPS: [&str; 5] = ["Needs you", "Running", "Queued", "Done", "Ended"];
 
 impl App {
+    pub fn draw_delete_confirmation(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
+        let Some(task) = self.confirm_delete else { return };
+        let Some(name) = self.task(task).map(title) else {
+            self.confirm_delete = None;
+            return;
+        };
+        let bounds = Rect::new(0.0, 0.0, w, h);
+        r.rect(bounds, 0.0, t.scrim);
+        r.target(bounds, Cursor::Arrow);
+        let pw = (w - 32.0).min(480.0);
+        let pop = Rect::new((w - pw) / 2.0, (h - 202.0) / 2.0, pw, 202.0);
+        r.frame(pop, 8.0, t.dialog, t.border2);
+        r.target(pop, Cursor::Arrow);
+        r.text(pop.x + 24.0, pop.y + 22.0, "Delete thread?", UI, 17.0, 600, t.text, pw - 48.0);
+        r.text(pop.x + 24.0, pop.y + 58.0, &name, UI, 13.0, 500, t.text, pw - 48.0);
+        r.text(pop.x + 24.0, pop.y + 84.0, "The thread and its worktree will be deleted.", UI, 13.0, 400, t.text2, pw - 48.0);
+        let delete = Rect::new(pop.x + pw - 136.0, pop.y + 140.0, 112.0, 38.0);
+        let cancel = Rect::new(delete.x - 122.0, delete.y, 112.0, 38.0);
+        r.frame(cancel, 4.0, t.dialog, t.border2);
+        r.text(cancel.x + 14.0, r.center(cancel, UI, 13.0), "Cancel · n", UI, 13.0, 500, t.text, 90.0);
+        r.rect(delete, 4.0, t.del);
+        r.text(delete.x + 14.0, r.center(delete, UI, 13.0), "Delete · y", UI, 13.0, 600, readable(t.on_accent, t.del), 90.0);
+        if self.hit(r, delete) {
+            self.confirm_delete = None;
+            self.actions.push(Action::Delete(task));
+        } else if self.hit(r, cancel) || self.click.is_some_and(|p| !pop.contains(p)) {
+            self.confirm_delete = None;
+        }
+    }
+
     /// One machine's tasks in every state, in a popup over the Workspace: a filter and state tabs on
     /// top, then rows grouped by state, each with the one thing to do next (Revive for an agent
     /// that has ended). Rows load a page at a time as the list scrolls.

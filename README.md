@@ -6,7 +6,7 @@ Linux and macOS. Rust throughout; no webview.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshot-dark.png">
-  <img alt="arranger with six agents on three machines: two need you, three are working, and the selected one is done" src="assets/screenshot.png">
+  <img alt="arranger workspace with six agents on three machines, permission and question cards in the sidebar, and a completed Codex task selected" src="assets/screenshot.png">
 </picture>
 
 ## Install
@@ -101,3 +101,5 @@ just test        # cargo test
 just bench-mem   # daemon RSS with 20 fake agents
 just screenshot  # re-render the README screenshots (light and dark) with demo agents
 ```
+
+Screenshot generation requires `ffmpeg`, or macOS's built-in `sips`.
