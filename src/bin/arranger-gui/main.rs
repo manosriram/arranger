@@ -51,7 +51,7 @@ use winit::platform::macos::WindowAttributesExtMacOS;
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 const TITLE_H: f32 = 44.0;
-const STATUS_H: f32 = 22.0;
+const STATUS_H: f32 = 26.0;
 const SIDEBAR_W: f32 = 340.0;
 const HEADER_H: f32 = 80.0;
 const ROW_H: f32 = 28.0;
@@ -192,7 +192,7 @@ enum Action {
     Answering,
     PickAgent(usize),
     PickModel(usize),
-    Start(bool),
+    Start,
     CloseDialog,
     OpenReview,
     Review(ReviewAction),
@@ -1647,8 +1647,8 @@ impl App {
         }
     }
 
-    /// Starts the dialog's task and switches to it; `attach` puts keys straight into its terminal.
-    fn start(&mut self, attach: bool) {
+    /// Starts the dialog's task and switches to it, using normal mode when Vim mode is enabled.
+    fn start(&mut self) {
         let sock = self.dialog.as_ref().and_then(|d| self.sock(d.host));
         let Some(d) = &mut self.dialog else { return };
         let m = d.host;
@@ -1673,7 +1673,7 @@ impl App {
                     self.save_settings();
                 }
                 self.dialog = None;
-                self.focus = if self.vim && !attach { Focus::Normal } else { Focus::Term };
+                self.focus = if self.vim { Focus::Normal } else { Focus::Term };
                 // Fetch the list now: the watch push may not have the new task yet, and selection
                 // would fall back to the first row.
                 if let Ok(Reply::Tasks(tasks)) = request_at(sock.as_deref(), &Request::List { files: false }) {
@@ -1754,7 +1754,7 @@ impl App {
                 }
                 Key::Named(NamedKey::ArrowDown) => self.move_selection(1),
                 Key::Named(NamedKey::ArrowUp) => self.move_selection(-1),
-                Key::Named(NamedKey::Enter) if self.dialog.is_some() => self.actions.push(Action::Start(true)),
+                Key::Named(NamedKey::Enter) if self.dialog.is_some() => self.actions.push(Action::Start),
                 Key::Named(NamedKey::Enter) if self.review.is_some() => {
                     let note = self.review.as_ref().and_then(|rv| rv.editing).filter(|_| self.focus == Focus::Note);
                     self.actions.push(Action::Review(note.map_or(ReviewAction::Commit(Ship::Merge), ReviewAction::SendNote)));
@@ -1885,7 +1885,7 @@ impl App {
             Key::Named(NamedKey::Enter) => match focus {
                 Focus::Note => self.actions.push(Action::Review(ReviewAction::SaveNote)),
                 Focus::CommitMsg => self.actions.push(Action::Review(ReviewAction::Commit(Ship::Commit))),
-                Focus::Prompt | Focus::Base | Focus::Repo => self.actions.push(Action::Start(false)),
+                Focus::Prompt | Focus::Base | Focus::Repo => self.actions.push(Action::Start),
                 Focus::HostSsh | Focus::HostName | Focus::HostRepo => self.actions.push(Action::AddHost),
                 _ => self.focus = self.rest(),
             },
@@ -2090,7 +2090,7 @@ impl App {
                         d.model = if i == usize::MAX { (d.model + 1) % models(AGENTS[d.agent]).len() } else { i };
                     }
                 }
-                Action::Start(attach) => self.start(attach),
+                Action::Start => self.start(),
                 Action::OpenReview => {
                     if self.dialog.is_none() && (self.review.is_some() || self.reviewable()) {
                         self.open_review();
@@ -2777,29 +2777,29 @@ impl App {
             counts[group(&task.state).min(3)] += 1;
         }
         let mut x = 12.0;
-        let y = r.center(bar, MONO, 10.5);
+        let y = r.center(bar, MONO, 11.5);
         if self.vim {
             // NORMAL, or INSERT while keys go to a field or the agent.
             let insert = self.focus != Focus::Normal;
             let label = if insert { "INSERT" } else { "NORMAL" };
-            let pw = r.measure(MONO, 10.5, 500, label) + 18.0;
+            let pw = r.measure(MONO, 11.5, 500, label) + 18.0;
             let pill = Rect::new(0.0, bar.y + 1.0, pw, STATUS_H - 1.0);
             r.rect(pill, 0.0, if insert { t.work } else { t.raised });
-            r.text(9.0, y, label, MONO, 10.5, 500, if insert { t.on_accent } else { t.text }, pw);
+            r.text(9.0, y, label, MONO, 11.5, 500, if insert { t.on_accent } else { t.text }, pw);
             x = pw + 12.0;
             if self.answering.is_some() {
-                x += r.text(x, y, "j/k choose · ↵ answer · esc leave", MONO, 10.5, 500, t.needs, 300.0) + 14.0;
+                x += r.text(x, y, "j/k choose · ↵ answer · esc leave", MONO, 11.5, 500, t.needs, 300.0) + 14.0;
             }
         }
         let confirm = self.confirm_delete.filter(|_| self.focus == Focus::Normal).and_then(|k| self.task(k)).map(title);
         if let Some(name) = &confirm {
             // In place of the counts: the question `d` asked.
-            let qw = r.text(x, y, &format!("Delete task “{name}” and its worktree?"), MONO, 10.5, 500, t.del, (w / 2.0 - x).max(80.0));
-            r.text(x + qw + 10.0, y, "y / n", MONO, 10.5, 400, t.text2, 60.0);
+            let qw = r.text(x, y, &format!("Delete task “{name}” and its worktree?"), MONO, 11.5, 500, t.del, (w / 2.0 - x).max(80.0));
+            r.text(x + qw + 10.0, y, "y / n", MONO, 11.5, 400, t.text2, 60.0);
         }
         for (i, (sym, label)) in [("■", "need you"), ("●", "running"), ("○", "queued"), ("✓", "done")].iter().enumerate().filter(|_| confirm.is_none()) {
             let c = [t.needs, t.work, t.text3, t.done][i];
-            x += r.text(x, y, &format!("{sym} {} {label}", counts[i]), MONO, 10.5, 400, c, 200.0) + 14.0;
+            x += r.text(x, y, &format!("{sym} {} {label}", counts[i]), MONO, 11.5, 400, c, 200.0) + 14.0;
         }
         let lost = matches!(self.hosts[0].link, Link::Down(_));
         let remotes: Vec<&Host> = self.hosts.iter().filter(|h| h.cfg.is_some() && !h.removed).collect();
@@ -2813,23 +2813,23 @@ impl App {
         };
         let mut right_x = w - 12.0;
         let version = concat!("v", env!("CARGO_PKG_VERSION"));
-        let version_w = r.measure(MONO, 10.5, 400, version);
-        r.text(right_x - version_w, y, version, MONO, 10.5, 400, t.text3, version_w + 2.0);
+        let version_w = r.measure(MONO, 11.5, 400, version);
+        r.text(right_x - version_w, y, version, MONO, 11.5, 400, t.text3, version_w + 2.0);
         right_x -= version_w + 14.0;
         if self.vim {
-            let keys = Rect::new(right_x - 46.0, bar.y + 3.0, 46.0, 16.0);
+            let keys = Rect::new(right_x - 50.0, bar.y + 4.0, 50.0, 18.0);
             r.frame(keys, 2.0, t.bg, t.border2);
-            r.text(keys.x + 5.0, r.center(keys, MONO, 10.0), "? keys", MONO, 10.0, 400, t.text2, 46.0);
+            r.text(keys.x + 5.0, r.center(keys, MONO, 11.0), "? keys", MONO, 11.0, 400, t.text2, 50.0);
             if self.hit(r, keys) {
                 self.help = !self.help;
             }
             right_x = keys.x - 12.0;
             if self.pending_g {
-                r.text(right_x - 10.0, y, "g", MONO, 10.5, 400, t.text2, 20.0);
+                r.text(right_x - 10.0, y, "g", MONO, 11.5, 400, t.text2, 20.0);
                 right_x -= 22.0;
             }
         }
-        let rw = r.measure(MONO, 10.5, 400, &right);
+        let rw = r.measure(MONO, 11.5, 400, &right);
         r.text(right_x - rw, y, &right, MONO, 10.5, 400, if lost { t.del } else { t.text3 }, rw + 2.0);
     }
 
@@ -3049,7 +3049,7 @@ impl App {
             y += recent_h;
         }
 
-        // Footer: keys on the left, Start & attach and Start on the right.
+        // Footer: keys on the left, Start agent on the right.
         let foot = Rect::new(dlg.x + 1.0, y, dlg.w - 2.0, dlg.y + dlg.h - y - 1.0);
         r.rect(Rect::new(foot.x, foot.y, foot.w, 1.0), 0.0, t.border);
         let sb = Rect::new(foot.x + foot.w - pad + 1.0, foot.y + 12.0, 0.0, 34.0);
@@ -3059,22 +3059,14 @@ impl App {
         let ready = !prompt.trim().is_empty();
         r.rect(start, 0.0, if ready { t.primary_bg } else { alpha(t.primary_bg, 0x80) });
         r.text(start.x + 14.0, r.center(start, UI, 13.0), start_label, UI, 13.0, 600, t.primary_fg, sw);
-        let attach_label = "Start & attach";
-        let aw = r.measure(UI, 13.0, 500, attach_label) + 28.0;
-        let attach = Rect::new(start.x - 8.0 - aw, sb.y, aw, sb.h);
-        r.frame(attach, 0.0, t.dialog, t.border2);
-        r.text(attach.x + 14.0, r.center(attach, UI, 13.0), attach_label, UI, 13.0, 500, t.text, aw);
         if self.hit(r, start) {
-            self.actions.push(Action::Start(false));
+            self.actions.push(Action::Start);
         }
-        if self.hit(r, attach) {
-            self.actions.push(Action::Start(true));
-        }
-        let room = attach.x - foot.x - pad - 12.0;
+        let room = start.x - foot.x - pad - 12.0;
         if error.is_empty() {
             // As many key hints as fit.
             let mut hx = foot.x + pad - 1.0;
-            for (key, what) in [("↵", "start"), (mod_label("↵").as_str(), "start & attach"), ("tab", "agent"), ("esc", "close")] {
+            for (key, what) in [("↵", "start"), ("tab", "agent"), ("esc", "close")] {
                 let kw = r.measure(MONO, 12.0, 500, key);
                 let ww = r.measure(UI, 12.0, 400, what);
                 if hx + kw + 6.0 + ww > foot.x + pad + room {

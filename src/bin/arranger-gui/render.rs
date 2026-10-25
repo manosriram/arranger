@@ -141,8 +141,11 @@ pub struct Renderer {
     layer: Option<(glow::Framebuffer, glow::Texture, (u32, u32))>,
 }
 
+/// Added to every requested weight: Plex Mono reads thin on screen at its nominal weights.
+const WEIGHT_BOOST: f32 = 50.0;
+
 fn coords(font: &FontRef, weight: u16) -> Vec<NormalizedCoord> {
-    font.variations().normalized_coords([("wght", weight as f32)]).collect()
+    font.variations().normalized_coords([("wght", weight as f32 + WEIGHT_BOOST)]).collect()
 }
 
 fn fonts() -> &'static [&'static [u8]] {
