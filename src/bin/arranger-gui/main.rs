@@ -3203,22 +3203,24 @@ impl App {
         // What runs it: [● agent claude] [model opus] [on This Mac] [from main ⌄]
         let cy = ty + text_h + 16.0;
         let mut cx = dlg.x + pad - 4.0;
-        let mut chip = |r: &mut Renderer, key: &str, value: &str, dot: Option<Rgba>, wide: f32| {
+        // A disabled chip is drawn flat and dimmed: there, but not to be picked.
+        let mut chip = |r: &mut Renderer, key: &str, value: &str, dot: Option<Rgba>, wide: f32, disabled: bool| {
             let kw = r.measure(UI, 13.0, 400, key) + 8.0;
             let lead = if dot.is_some() { 16.0 } else { 0.0 };
             let vw = r.measure(MONO, 13.0, 500, value);
             let b = Rect::new(cx, cy, 24.0 + lead + kw + vw + wide, 32.0);
-            r.frame(b, 0.0, t.dialog, t.border2);
+            let (fill, edge, kc, vc) = if disabled { (t.raised, t.border, t.faint, t.text3) } else { (t.dialog, t.border2, t.text3, t.text) };
+            r.frame(b, 0.0, fill, edge);
             if let Some(c) = dot {
-                r.rect(Rect::new(b.x + 12.0, b.y + 13.0, 6.0, 6.0), 0.0, c);
+                r.rect(Rect::new(b.x + 12.0, b.y + 13.0, 6.0, 6.0), 0.0, if disabled { alpha(c, 0x80) } else { c });
             }
-            r.text(b.x + 12.0 + lead, r.center(b, UI, 13.0), key, UI, 13.0, 400, t.text3, kw);
-            r.text(b.x + 12.0 + lead + kw, r.center(b, MONO, 13.0), value, MONO, 13.0, 500, t.text, vw + 2.0);
+            r.text(b.x + 12.0 + lead, r.center(b, UI, 13.0), key, UI, 13.0, 400, kc, kw);
+            r.text(b.x + 12.0 + lead + kw, r.center(b, MONO, 13.0), value, MONO, 13.0, 500, vc, vw + 2.0);
             cx += b.w + 8.0;
             b
         };
         // A clone's agent, machine and branch are its source's: shown, not picked.
-        let b = chip(r, "agent", agent, Some(accent(agent)), 0.0);
+        let b = chip(r, "agent", agent, Some(accent(agent)), 0.0, clone.is_some());
         if clone.is_none() && self.hit(r, b) {
             self.actions.push(Action::PickAgent(usize::MAX));
         }
@@ -3226,12 +3228,12 @@ impl App {
             Some("") | None => models(agent)[model_i].0,
             Some(kept) => models(agent).iter().find(|m| m.1 == kept).map_or(kept, |m| m.0),
         };
-        let b = chip(r, "model", model, None, 0.0);
+        let b = chip(r, "model", model, None, 0.0, false);
         if self.hit(r, b) {
             self.actions.push(Action::PickModel(usize::MAX));
         }
         if hosts.len() > 1 {
-            let b = chip(r, "on", self.hosts[host_i].name(), None, 0.0);
+            let b = chip(r, "on", self.hosts[host_i].name(), None, 0.0, clone.is_some());
             if clone.is_none() && self.hit(r, b) {
                 let at = hosts.iter().position(|h| h.0 == host_i).unwrap_or(0);
                 // The next machine that's up, after this one.
@@ -3249,7 +3251,7 @@ impl App {
             None if base.is_empty() && !base_focus => "current branch".to_string(),
             None => base.clone(),
         };
-        let bfield = chip(r, "from", &shown, None, if pick { 22.0 } else { 10.0 });
+        let bfield = chip(r, "from", &shown, None, if pick { 22.0 } else { 10.0 }, clone.is_some());
         if base_focus {
             // Typed over the chip's value while it has focus.
             let vx = bfield.x + 12.0 + r.measure(UI, 13.0, 400, "from") + 8.0;
