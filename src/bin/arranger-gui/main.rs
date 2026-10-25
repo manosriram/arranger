@@ -2738,6 +2738,10 @@ impl App {
             format!("{} new · {} theme", mod_label("N"), mod_label("T"))
         };
         let mut right_x = w - 12.0;
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
+        let version_w = r.measure(MONO, 10.5, 400, version);
+        r.text(right_x - version_w, y, version, MONO, 10.5, 400, t.text3, version_w + 2.0);
+        right_x -= version_w + 14.0;
         if self.vim {
             let keys = Rect::new(right_x - 46.0, bar.y + 3.0, 46.0, 16.0);
             r.frame(keys, 2.0, t.bg, t.border2);
