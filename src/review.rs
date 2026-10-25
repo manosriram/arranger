@@ -1,7 +1,7 @@
 //! Review: a task's worktree diffed against the commit it branched from.
 //! Reads go through gix, line diffs through imara-diff; writes go through the git CLI.
 
-use crate::proto::{DiffLine, FileDiff, Hunk};
+use crate::proto::{DiffLine, Event, FileDiff, Hunk, ToolKind};
 use imara_diff::{Algorithm, Diff, InternedInput};
 use std::collections::BTreeSet;
 use std::fs;
@@ -13,6 +13,51 @@ const CONTEXT: u32 = 3;
 
 fn e2s(e: impl std::fmt::Display) -> String {
     e.to_string()
+}
+
+/// An extractive overview of the whole conversation, including follow-up requests.
+/// Closing replies are turn outcomes, not summaries of the task as a whole.
+pub fn chat_summary(events: &[(u64, Event)]) -> String {
+    fn excerpt(text: &str) -> String {
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut chars = text.chars();
+        let short: String = chars.by_ref().take(320).collect();
+        if chars.next().is_some() { format!("{short}…") } else { short }
+    }
+
+    let mut turns = Vec::new();
+    let mut files = BTreeSet::new();
+    let mut errors = BTreeSet::new();
+    for (_, event) in events {
+        let (label, text) = match event {
+            Event::Prompt { text } => ("Requested", text),
+            Event::Summary { text } => ("Outcome", text),
+            Event::ToolStart { kind: ToolKind::Edit, target } => {
+                if !target.trim().is_empty() {
+                    files.insert(target.as_str());
+                }
+                continue;
+            }
+            Event::Error { message } => {
+                if !message.trim().is_empty() {
+                    errors.insert(excerpt(message));
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        let text = excerpt(text);
+        if !text.is_empty() {
+            turns.push(format!("- **{label}:** {text}"));
+        }
+    }
+    if !files.is_empty() {
+        turns.push(format!("- **Files touched:** {}", files.into_iter().collect::<Vec<_>>().join(", ")));
+    }
+    if !errors.is_empty() {
+        turns.push(format!("- **Reported errors:** {}", errors.into_iter().collect::<Vec<_>>().join("; ")));
+    }
+    turns.join("\n")
 }
 
 /// The commit `rev` (a ref or sha) points at, read in `repo_dir`.
@@ -250,6 +295,33 @@ fi"#;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_covers_the_conversation_and_deduplicates_files() {
+        let events = vec![
+            Event::Prompt { text: "Add search.".into() },
+            Event::ToolStart { kind: ToolKind::Edit, target: "search.rs".into() },
+            Event::Summary { text: "Implemented search.".into() },
+            Event::Prompt { text: "Also support Unicode.".into() },
+            Event::ToolStart { kind: ToolKind::Edit, target: "search.rs".into() },
+            Event::Summary { text: "Unicode works; tests pass.".into() },
+        ];
+        let events = events.into_iter().enumerate().map(|(i, e)| (i as u64, e)).collect::<Vec<_>>();
+        assert_eq!(chat_summary(&events), "- **Requested:** Add search.\n- **Outcome:** Implemented search.\n- **Requested:** Also support Unicode.\n- **Outcome:** Unicode works; tests pass.\n- **Files touched:** search.rs");
+    }
+
+    #[test]
+    fn summary_handles_empty_and_incomplete_chats_and_unicode() {
+        assert!(chat_summary(&[]).is_empty());
+        let events = vec![
+            (0, Event::Prompt { text: "  Fix\n the bug. ".into() }),
+            (1, Event::Summary { text: " ".into() }),
+            (2, Event::Error { message: "Failed to start".into() }),
+        ];
+        assert_eq!(chat_summary(&events), "- **Requested:** Fix the bug.\n- **Reported errors:** Failed to start");
+        let long = vec![(0, Event::Summary { text: "界".repeat(321) })];
+        assert_eq!(chat_summary(&long), format!("- **Outcome:** {}…", "界".repeat(320)));
+    }
 
     fn render(hunks: &[Hunk]) -> String {
         hunks.iter().map(|h| format!("{}\n{}", h.header, h.lines.iter().map(|l| format!("{}{}", l.kind, l.text)).collect::<String>())).collect()

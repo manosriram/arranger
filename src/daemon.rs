@@ -1501,17 +1501,14 @@ impl Daemon {
             .query_row("SELECT branch, base FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(e2s)?;
         let events = self.events(id)?;
-        let summary = events.iter().rev().find_map(|(_, e)| match e {
-            Event::Summary { text } => Some(text.clone()),
-            _ => None,
-        });
+        let summary = review::chat_summary(&events);
         let (conflicts, merging) = review::conflicts(Path::new(&wt))?;
         Ok(proto::Review {
             conflicts,
             merging,
             branch,
             base: if base.is_empty() { "HEAD".into() } else { base },
-            summary: summary.unwrap_or_default(),
+            summary,
             checks: checks(&events),
             files: review::diff(Path::new(&wt), &base_commit, None)?,
         })
