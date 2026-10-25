@@ -3132,7 +3132,7 @@ impl App {
         if error.is_empty() {
             // As many key hints as fit.
             let mut hx = foot.x + pad - 1.0;
-            for (key, what) in [("↵", "start"), ("tab", "agent"), ("esc", "close")] {
+            for (key, what) in [("↵", "start"), ("tab", "agent"), ("ctrl+tab", "model"), ("esc", "close")] {
                 let kw = r.measure(MONO, 12.0, 500, key);
                 let ww = r.measure(UI, 12.0, 400, what);
                 if hx + kw + 6.0 + ww > foot.x + pad + room {
