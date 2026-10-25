@@ -9,13 +9,15 @@ use std::path::PathBuf;
 const MAX_FRAME: usize = 64 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 15;
+pub const VERSION: u32 = 18;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
     Ping,
     /// `prompt` is passed to the agent as its first message; `model` as `--model` (None: the agent's default).
-    New { agent: String, repo: PathBuf, base: Option<String>, prompt: Option<String>, model: Option<String> },
+    /// `headless` runs it over stdio instead of in a terminal (claude only, see `headless`).
+    /// `effort`: its reasoning effort ("" for the agent's default). `headless`: in a chat, not a terminal.
+    New { agent: String, repo: PathBuf, base: Option<String>, prompt: Option<String>, model: Option<String>, effort: String, headless: bool },
     List { files: bool },
     Kill { id: u64 },
     Events { id: u64 },
@@ -41,6 +43,13 @@ pub enum Request {
     Revert { id: u64, path: String, header: String },
     /// Type `text` into the agent and submit it, as a new prompt.
     Prompt { id: u64, text: String },
+    /// Stop the agent's current turn, like Esc in its terminal.
+    Interrupt { id: u64 },
+    /// A headless task's conversation: its last `limit` items, then `ChatPatch`es on this
+    /// connection as it goes on.
+    Chat { id: u64, limit: usize },
+    /// Up to `limit` items before item `end`, for scrolling back; replied to with `Chat`.
+    ChatPage { id: u64, end: usize, limit: usize },
     /// Commit everything in the worktree, then maybe merge or open a PR. Replied to with JobDone.
     Commit { id: u64, message: String, ship: Ship },
     /// The task's recorded PTY output (zstd), for replaying a finished task's chat.
@@ -88,6 +97,28 @@ pub enum Reply {
     JobDone { ok: bool, output: String },
     Log(Vec<u8>),
     Paths(Vec<String>),
+    /// Items `start..start + items.len()` of a conversation `total` long.
+    Chat { start: usize, total: usize, items: Vec<ChatItem> },
+    /// Item `index` changed, or (at the end) was added.
+    ChatPatch { index: usize, item: ChatItem },
+    /// To a headless task's Prompt that only the agent's terminal can take: open one in the task's
+    /// worktree with `command` typed, for the user to run.
+    Terminal { command: String },
+}
+
+/// One entry in a headless task's conversation.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum ChatItem {
+    /// What the user sent.
+    User { text: String },
+    /// Markdown; it grows while it streams.
+    Assistant { text: String },
+    Thinking { text: String },
+    /// A tool call and, once it's back, its result. `diff` is what an edit changes.
+    Tool { id: String, name: String, kind: ToolKind, target: String, input: String, output: String, ok: Option<bool>, diff: Vec<DiffLine> },
+    /// The agent's plan: (step, "pending" | "in_progress" | "completed").
+    Todos { items: Vec<(String, String)> },
+    Notice { text: String, error: bool },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -122,6 +153,12 @@ pub struct TaskInfo {
     /// The source worktree's task ID, if this task was cloned.
     #[serde(default)]
     pub cloned_from: Option<u64>,
+    /// Runs over stdio, with no terminal to attach to.
+    #[serde(default)]
+    pub headless: bool,
+    /// Its reasoning effort ("" for the agent's default).
+    #[serde(default)]
+    pub effort: String,
     /// Which machine the GUI got this task from (an index into its machine list); not sent.
     #[serde(skip)]
     pub machine: usize,
@@ -161,7 +198,7 @@ pub struct Hunk {
     pub lines: Vec<DiffLine>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct DiffLine {
     /// ' ', '+' or '-'.
     pub kind: char,

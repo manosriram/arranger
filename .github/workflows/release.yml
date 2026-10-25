@@ -1,4 +1,5 @@
 # Pushing a tag like v0.2.0 builds arranger for macOS and Linux and publishes a GitHub release.
+# Before tagging, run `just parity` locally (it needs claude and codex logged in, so CI can't).
 name: release
 
 on:

@@ -105,7 +105,7 @@ fn key(path: &str, header: &str) -> String {
 
 /// Inline markdown runs: (text, bold, code). `**`/`__` toggle bold and backticks code; `*`/`_` emphasis
 /// markers are dropped, links keep their text.
-fn spans(line: &str) -> Vec<(String, bool, bool)> {
+pub(super) fn spans(line: &str) -> Vec<(String, bool, bool)> {
     let mut out = vec![(String::new(), false, false)];
     let (mut bold, mut code) = (false, false);
     let mut rest = line;

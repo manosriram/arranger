@@ -381,6 +381,16 @@ pub fn models(agent: &str) -> &'static [(&'static str, &'static str)] {
     }
 }
 
+/// Reasoning efforts the agent takes, as (shown, passed); 0 is its default.
+pub fn efforts(agent: &str) -> &'static [(&'static str, &'static str)] {
+    match agent {
+        "claude" => &[("default", ""), ("low", "low"), ("medium", "medium"), ("high", "high"), ("xhigh", "xhigh"), ("max", "max")],
+        "codex" => &[("default", ""), ("minimal", "minimal"), ("low", "low"), ("medium", "medium"), ("high", "high"), ("xhigh", "xhigh")],
+        "pi" => &[("default", ""), ("off", "off"), ("minimal", "minimal"), ("low", "low"), ("medium", "medium"), ("high", "high"), ("xhigh", "xhigh")],
+        _ => &[("default", "")],
+    }
+}
+
 pub fn accent(agent: &str) -> Rgba {
     match agent {
         "claude" => hex(0xF0875A),

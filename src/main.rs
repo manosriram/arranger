@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::{env, thread};
 
 const USAGE: &str = "usage: arranger            open the workspace window
-       arranger [ls [--files] | new <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
-                 | approve <id> | deny <id> [reason] | events <id> | diff <id> | revert <id> <path> <hunk#>
-                 | run <id> [command ...] | send <id> <text> | revive <id> [prompt] | clone <id> [--model <m>] [prompt] | commit <id> [--merge|--pr] [message] | ping | stop | serve | hook <adapter>
+       arranger [ls [--files] | new [--headless|--terminal] [--effort <e>] <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
+                 | approve <id> | deny <id> [reason] | events <id> | chat <id> | diff <id> | revert <id> <path> <hunk#>
+                 | run <id> [command ...] | send <id> <text> | interrupt <id> | revive <id> [prompt] | clone <id> [--model <m>] [prompt] | commit <id> [--merge|--pr] [message] | ping | stop | serve | hook <adapter>
                  | machine [ls | add <name> <user@host> [repo] | rm <name>] | endpoint]";
 /// Ctrl-\, raw and in kitty keyboard encoding.
 const DETACH: &[&[u8]] = &[b"\x1c", b"\x1b[92;5u"];
@@ -35,6 +35,7 @@ fn main() {
         ["approve", id] => parse_id(id).and_then(|id| answer(id, true, String::new())),
         ["deny", id, ref reason @ ..] => parse_id(id).and_then(|id| answer(id, false, reason.join(" "))),
         ["events", id] => parse_id(id).and_then(events),
+        ["chat", id] => parse_id(id).and_then(chat),
         ["ping"] => request(&Request::Ping).map(|_| println!("pong")),
         ["stop"] => arranger::client::stop(),
         // Run over ssh by a GUI adding this machine: start the daemon, say where it listens.
@@ -53,17 +54,18 @@ fn main() {
         }
         ["diff", id] => parse_id(id).and_then(diff),
         ["revert", id, path, hunk] => parse_id(id).and_then(|id| revert(id, path, hunk)),
-        ["send", id, ref text @ ..] => {
-            parse_id(id).and_then(|id| request(&Request::Prompt { id, text: text.join(" ") }).map(drop))
-        }
+        ["send", id, ref text @ ..] => parse_id(id).and_then(|id| match request(&Request::Prompt { id, text: text.join(" ") })? {
+            Reply::Terminal { command } => Err(io::Error::other(format!("only the agent's terminal has that; in the task's worktree, run: {command}"))),
+            _ => Ok(()),
+        }),
         ["revive", id, ref text @ ..] => {
             parse_id(id).and_then(|id| request(&Request::Revive { id, prompt: text.join(" ") }).map(drop))
         }
         ["commit", id, "--merge", ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, Ship::Merge)),
         ["commit", id, "--pr", ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, Ship::Pr)),
         ["commit", id, ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, Ship::Commit)),
-        ["new", agent, "--branch", base, ref prompt @ ..] => new(agent, Some(base), prompt),
-        ["new", agent, ref prompt @ ..] => new(agent, None, prompt),
+        ["new", ref rest @ ..] if !rest.is_empty() => new(rest),
+        ["interrupt", id] => parse_id(id).and_then(|id| request(&Request::Interrupt { id }).map(drop)),
         ["run", id, ref command @ ..] => parse_id(id).and_then(|id| run(id, command)),
         ["attach", id] => parse_id(id).and_then(attach),
         ["clone", id, "--model", model, ref text @ ..] => parse_id(id).and_then(|id| clone(id, Some(model), text)),
@@ -222,6 +224,39 @@ fn events(id: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// A headless task's conversation, as plain text.
+fn chat(id: u64) -> io::Result<()> {
+    use proto::ChatItem;
+    let reply = request(&Request::ChatPage { id, end: usize::MAX, limit: usize::MAX })?;
+    let Reply::Chat { items, .. } = reply else { return Err(unexpected(reply)) };
+    let indent = |s: &str| s.lines().map(|l| format!("    {l}\n")).collect::<String>();
+    for item in items {
+        match item {
+            ChatItem::User { text } => print!("\n> {}\n", text.replace('\n', "\n> ")),
+            ChatItem::Assistant { text } => print!("\n{text}\n"),
+            ChatItem::Thinking { text } => print!("\n(thinking)\n{}", indent(&text)),
+            ChatItem::Tool { name, target, output, ok, diff, .. } => {
+                let mark = match ok { Some(true) => "✓", Some(false) => "✗", None => "…" };
+                println!("  {mark} {name} {target}");
+                for l in diff.iter().filter(|l| l.kind != ' ') {
+                    print!("      {}{}", l.kind, l.text);
+                }
+                if ok == Some(false) {
+                    print!("{}", indent(&output));
+                }
+            }
+            ChatItem::Todos { items } => {
+                for (step, state) in items {
+                    let mark = match state.as_str() { "completed" => "[x]", "in_progress" => "[~]", _ => "[ ]" };
+                    println!("  {mark} {step}");
+                }
+            }
+            ChatItem::Notice { text, error } => println!("  {} {text}", if error { "!" } else { "·" }),
+        }
+    }
+    Ok(())
+}
+
 /// `arranger hook <adapter>`: run by agents. Reads hook JSON (one document, or a stream for pi),
 /// forwards events, and for permission asks waits for the human and prints the decision.
 fn hook(adapter: &str) -> io::Result<()> {
@@ -250,9 +285,26 @@ fn hook(adapter: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn new(agent: &str, base: Option<&str>, prompt: &[&str]) -> io::Result<()> {
+/// `new [--headless | --terminal] [--effort <level>] <agent> [--branch <base>] [prompt]`: agents
+/// whose headless mode passes its parity check run headless unless `--terminal` says otherwise.
+fn new(mut args: &[&str]) -> io::Result<()> {
+    let (mut headless, mut effort) = (None, "");
+    loop {
+        match args {
+            ["--headless", rest @ ..] => (headless, args) = (Some(true), rest),
+            ["--terminal", rest @ ..] => (headless, args) = (Some(false), rest),
+            ["--effort", level, rest @ ..] => (effort, args) = (*level, rest),
+            _ => break,
+        }
+    }
+    let Some((agent, mut prompt)) = args.split_first() else { return Err(io::Error::other(USAGE)) };
+    let mut base = None;
+    if let ["--branch", b, rest @ ..] = prompt {
+        (base, prompt) = (Some(*b), rest);
+    }
+    let headless = headless.unwrap_or_else(|| arranger::headless::default_on(agent));
     let prompt = Some(prompt.join(" ")).filter(|p| !p.is_empty());
-    let req = Request::New { agent: agent.into(), repo: env::current_dir()?, base: base.map(Into::into), prompt, model: None };
+    let req = Request::New { agent: agent.to_string(), repo: env::current_dir()?, base: base.map(Into::into), prompt, model: None, effort: effort.into(), headless };
     match request(&req)? {
         Reply::Created { id, state } => Ok(println!("{id} {state}")),
         reply => Err(unexpected(reply)),

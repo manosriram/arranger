@@ -44,11 +44,13 @@ That's it: it starts the daemon if needed and opens the window. Closing the wind
 
 On Linux use Ctrl+Shift in place of ⌘.
 
-In the new-task dialog, Tab cycles agents and Ctrl+Tab cycles models. Click the agent, model, machine or base-branch controls to choose them directly; Enter starts the task.
+In the new-task dialog, Tab cycles agents, Ctrl+Tab cycles models and Alt+Tab cycles reasoning effort. Ctrl+T switches between running the task in a chat or in a terminal (the toggle beside Start). Click the agent, model, effort, machine or base-branch controls to choose them directly; Enter starts the task.
 
 In the new-task prompt, type `@` to find repository files. Use ↑/↓ to choose, Enter or Tab to insert a reference, and Esc to dismiss the picker. Files come from the selected machine’s repository; ignored files are excluded.
 
-Each agent runs in its own terminal, drawn as-is and sized to the pane. When it asks for permission or a choice, answer in its own menu: ↑/↓ and ↵, or with Vim keys on, normal mode switches on by itself and j/k/↵ work the menu.
+Claude Code and Codex tasks run in a chat by default: arranger drives the agent over its own protocol (claude's stream-json, `codex app-server`) and draws the conversation itself, with streaming replies, tool calls and their diffs, the plan, and what the agent asks you pinned above the message box. Enter sends, Shift+Enter starts a new line, Esc stops the turn. A slash command only the agent's terminal has (claude's `/permissions`, `/rewind`…) opens the Terminal tab with it typed instead. pi and Gemini can run in a chat too (turn it on in the dialog); their parity with the interactive agents isn't checked yet.
+
+A task started in a terminal runs the agent there, drawn as-is and sized to the pane. When it asks for permission or a choice, answer in its own menu: ↑/↓ and ↵, or with Vim keys on, normal mode switches on by itself and j/k/↵ work the menu.
 
 A soft ding plays when an agent finishes or needs your help. Toggle **Ding sound** in the scheme menu (top right) to turn it off or on; your preference is saved. On Linux, sound requires `paplay` (PulseAudio/PipeWire) or `aplay` (ALSA).
 
@@ -60,7 +62,7 @@ The **Terminal** tab is a shell in the selected task's worktree, for running the
 
 If merging hits a conflict, `main` is left alone: the conflict lands in the agent's worktree, and Review offers to have the agent resolve it (or take one side) before merging again.
 
-**Clone** in the task's header (⌘D, or `c` with Vim keys on) clones the selected task: a new task on its own worktree and branch, made from the task's current state (uncommitted edits too), whose agent carries on from a fork of the same chat. The new-task box opens showing what the task was asked so far and asks what the clone should do differently; leave it empty to just fork, and pick another model if you like. Cloning works for Claude Code and Codex.
+**Clone** in the task's header (⌘D, or `c` with Vim keys on) clones the selected task: a new task on its own worktree and branch, made from the task's current state (uncommitted edits too), whose agent carries on from a fork of the same chat. The new-task box opens showing what the task was asked so far and asks what the clone should do differently; leave it empty to just fork, and pick another model if you like. Cloning works for Claude Code and Codex, and for pi in a chat.
 
 In the clone dialog, the source agent, machine and branch are fixed and shown as disabled controls. Tab cycles models, ↑ recalls the source task's prompts, and Enter creates the clone.
 
@@ -77,19 +79,22 @@ In normal mode, `h` moves left and `l` moves right through **Workspace → Revie
 Everything also works from the terminal:
 
 ```sh
-arranger new claude "fix the flaky test"   # start an agent on a fresh worktree
+arranger new claude "fix the flaky test"   # start an agent on a fresh worktree (in a chat)
 arranger ls                                # agents and what they're doing
 arranger attach 3                          # its terminal; Ctrl-\ detaches
 arranger approve 3                         # or: deny 3 [reason]
 arranger run 3 cargo test                  # test directly in its worktree
 arranger diff 3                            # changes since its base or your last commit
 arranger send 3 "also update the docs"     # type into it
+arranger interrupt 3                       # stop its current turn
 arranger revive 3 "carry on"               # resume an ended agent
 arranger clone 3 "try it with a cache"     # its chat and edits, on a new worktree
 arranger commit 3 --merge                  # commit, merge into its base branch
 arranger commit 3 --pr                     # or: commit, push, open a PR
 arranger stop                              # stop the daemon and its agents
 ```
+
+`arranger new` runs claude and codex headless, in a chat, unless you pass `--terminal`; `--headless` turns it on for pi and gemini, and `--effort <level>` sets the reasoning effort. Headless agents start with the flags that keep them as close to the interactive agent as possible: `scripts/parity.py` (and `scripts/parity.py --agent codex`) sends one prompt both ways through a logging proxy and checks the API requests match. `arranger chat <id>` prints the conversation; `events`, `send`, `approve`/`deny` and `interrupt` work as for any task, and revive and clone resume its session.
 
 ## Other machines
 

@@ -1,6 +1,8 @@
 //! `arranger serve`: one thread, one mio loop owning every PTY, client and task.
 
 use crate::adapter::{self, Osc};
+use crate::chat::Chat;
+use crate::headless::{self, Agent};
 use crate::proto::{self, Event, Reply, Request, Ship, TaskInfo};
 use crate::pty::{self, Pty};
 use crate::review;
@@ -21,7 +23,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LISTENER: Token = Token(0);
 const CHILD: Token = Token(1);
@@ -34,9 +36,13 @@ const SHELL: usize = 1 << 41;
 const JOB: usize = 1 << 39;
 const LOG_CHUNK: usize = 64 * 1024;
 const MAX_OUTBUF: usize = 16 << 20;
+/// Chat patches go out at most this often: a streaming reply is many small deltas.
+const CHAT_EVERY: Duration = Duration::from_millis(33);
 
 struct Task {
+    /// For a headless task, its stdio socket rather than a terminal.
     pty: Pty,
+    headless: Option<Agent>,
     screen: Screen,
     /// Raw output not yet compressed into the on-disk log.
     log: Vec<u8>,
@@ -90,6 +96,8 @@ struct Conn {
     /// `attached` is the task's shell, not its agent.
     shell: bool,
     watching: bool,
+    /// Subscribed to this task's chat.
+    chat: Option<u64>,
     writable: bool,
 }
 
@@ -124,6 +132,10 @@ struct Daemon {
     dirty: bool,
     jobs: HashMap<usize, Job>,
     next_job: usize,
+    /// Headless tasks' conversations, loaded from their logs when first asked for.
+    chats: HashMap<u64, Chat>,
+    /// When changed chat items next go out to their viewers.
+    chat_due: Option<Instant>,
 }
 
 pub fn run() -> io::Result<()> {
@@ -166,6 +178,8 @@ pub fn run() -> io::Result<()> {
         "model TEXT NOT NULL DEFAULT ''",
         "updated INTEGER NOT NULL DEFAULT 0",
         "cloned_from INTEGER",
+        "headless INTEGER NOT NULL DEFAULT 0",
+        "effort TEXT NOT NULL DEFAULT ''",
     ] {
         let _ = db.execute(&format!("ALTER TABLE tasks ADD COLUMN {col}"), []);
     }
@@ -194,12 +208,15 @@ pub fn run() -> io::Result<()> {
         dirty: false,
         jobs: HashMap::new(),
         next_job: 0,
+        chats: HashMap::new(),
+        chat_due: None,
     };
     d.start_queued();
 
     let mut events = Events::with_capacity(256);
     loop {
-        if let Err(e) = d.poll.poll(&mut events, None) {
+        let timeout = d.chat_due.map(|due| due.saturating_duration_since(Instant::now()));
+        if let Err(e) = d.poll.poll(&mut events, timeout) {
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
@@ -214,7 +231,15 @@ pub fn run() -> io::Result<()> {
                     return Ok(());
                 }
                 Token(t) if t >= SHELL => d.read_shell((t - SHELL) as u64),
-                Token(t) if t >= TASK => d.read_task((t - TASK) as u64),
+                Token(t) if t >= TASK => {
+                    let id = (t - TASK) as u64;
+                    if ev.is_writable() {
+                        d.flush_agent(id);
+                    }
+                    if ev.is_readable() || ev.is_read_closed() {
+                        d.read_task(id);
+                    }
+                }
                 Token(t) if t >= JOB => d.read_job(t - JOB),
                 t => d.conn_event(t, ev.is_readable(), ev.is_writable()),
             }
@@ -222,6 +247,9 @@ pub fn run() -> io::Result<()> {
         if d.dirty {
             d.dirty = false;
             d.push_tasks();
+        }
+        if d.chat_due.is_some_and(|due| due <= Instant::now()) {
+            d.push_chats();
         }
     }
 }
@@ -292,12 +320,16 @@ fn size_mark(cols: u16, rows: u16) -> Vec<u8> {
     format!("\x1b[8;{rows};{cols}t").into_bytes()
 }
 
+/// Task `id`'s output log: what its terminal drew, or a headless task's JSON lines.
+fn log_path(data: &Path, id: u64, headless: bool) -> PathBuf {
+    data.join(format!("logs/{id}.{}", if headless { "jsonl.zst" } else { "zst" }))
+}
+
 /// Concatenated zstd frames are a valid zstd file, so each chunk is compressed on its own.
-fn flush_log(data: &Path, id: u64, log: &mut Vec<u8>, zstd: &mut zstd::bulk::Compressor) {
+fn flush_log(path: &Path, log: &mut Vec<u8>, zstd: &mut zstd::bulk::Compressor) {
     if log.is_empty() {
         return;
     }
-    let path = data.join(format!("logs/{id}.zst"));
     let res = zstd.compress(log).and_then(|frame| {
         fs::OpenOptions::new().create(true).append(true).open(&path)?.write_all(&frame)
     });
@@ -369,6 +401,7 @@ impl Daemon {
                     native: false,
                     shell: false,
                     watching: false,
+                    chat: None,
                     writable: false,
                 };
                 self.conns.insert(t, conn);
@@ -434,12 +467,33 @@ impl Daemon {
                 }
             },
             Request::Ping => Reply::Pong,
+            Request::Chat { id, limit } => match self.chat(id) {
+                Ok(chat) => {
+                    let total = chat.items.len();
+                    let start = total.saturating_sub(limit);
+                    let items = chat.items[start..].to_vec();
+                    if let Some(c) = self.conns.get_mut(&t) {
+                        c.chat = Some(id);
+                    }
+                    Reply::Chat { start, total, items }
+                }
+                Err(e) => Reply::Error(e),
+            },
+            Request::ChatPage { id, end, limit } => match self.chat(id) {
+                Ok(chat) => {
+                    let total = chat.items.len();
+                    let end = end.min(total);
+                    let start = end.saturating_sub(limit);
+                    Reply::Chat { start, total, items: chat.items[start..end].to_vec() }
+                }
+                Err(e) => Reply::Error(e),
+            },
             Request::Version => Reply::Version(proto::VERSION),
             Request::List { files } => match self.list(files) {
                 Ok(tasks) => Reply::Tasks(tasks),
                 Err(e) => Reply::Error(e),
             },
-            Request::New { agent, repo, base, prompt, model } => match self.create(&agent, &repo, base.as_deref(), prompt.as_deref().unwrap_or(""), model.as_deref().unwrap_or("")) {
+            Request::New { agent, repo, base, prompt, model, effort, headless } => match self.create(&agent, &repo, base.as_deref(), prompt.as_deref().unwrap_or(""), model.as_deref().unwrap_or(""), &effort, headless) {
                 Ok(id) => Reply::Created { id, state: self.state(id) },
                 Err(e) => Reply::Error(e),
             },
@@ -486,6 +540,25 @@ impl Daemon {
                 }
             }
             Request::Prompt { id, text } => match self.tasks.get_mut(&id) {
+                Some(task) if task.headless.is_some() => {
+                    let agent = task.headless.as_mut().unwrap();
+                    let (busy, asking) = (agent.busy(), agent.asking());
+                    // Only its terminal has this command: the viewer opens one with it typed.
+                    if let Some(command) = agent.terminal(&text).filter(|_| !asking) {
+                        self.send(t, &proto::frame(&Reply::Terminal { command }));
+                        return;
+                    }
+                    let events = agent.prompt(text);
+                    // Not an answer to a question, and a turn is running: claude gets it next.
+                    if busy && !asking && events.is_empty() {
+                        task.queued += 1;
+                        task.action = queued_label(task.queued);
+                        task.since = now();
+                        self.dirty = true;
+                    }
+                    self.agent_events(id, events);
+                    Reply::Ok
+                }
                 Some(task) => {
                     let mut bytes = if task.screen.mode().contains(TermMode::BRACKETED_PASTE) {
                         format!("\x1b[200~{text}\x1b[201~").into_bytes()
@@ -502,6 +575,17 @@ impl Daemon {
                         self.dirty = true;
                     }
                     self.resume(id);
+                    Reply::Ok
+                }
+                None => Reply::Error(format!("task {id} isn't running")),
+            },
+            Request::Interrupt { id } => match self.tasks.get_mut(&id) {
+                Some(task) => {
+                    match &mut task.headless {
+                        Some(agent) => agent.cancel(),
+                        None => write_pty(&task.pty.master, b"\x1b"),
+                    }
+                    self.stop_turn(id);
                     Reply::Ok
                 }
                 None => Reply::Error(format!("task {id} isn't running")),
@@ -539,6 +623,14 @@ impl Daemon {
                     Err(e) => Reply::Error(e),
                 }
             }
+            Request::Answer { id, allow, message } if self.tasks.get(&id).is_some_and(|t| t.headless.as_ref().is_some_and(Agent::asking)) => {
+                let result = self.tasks.get_mut(&id).unwrap().headless.as_mut().unwrap().answer(allow, &message);
+                self.agent_events(id, Vec::new());
+                match result {
+                    Ok(()) => Reply::Ok,
+                    Err(e) => Reply::Error(e),
+                }
+            }
             Request::Answer { id, allow, message } => match self.asks.iter().position(|a| a.0 == id) {
                 Some(i) => {
                     let (_, hook) = self.asks.remove(i);
@@ -555,6 +647,15 @@ impl Daemon {
                     self.release_asks(id);
                 }
                 match self.tasks.get_mut(&id) {
+                    // Nothing to draw. Stay attached so the viewer hears when it exits; Esc still interrupts.
+                    Some(task) if task.headless.is_some() => {
+                        task.viewers.push(t);
+                        if let Some(c) = self.conns.get_mut(&t) {
+                            (c.attached, c.native) = (Some(id), false);
+                        }
+                        let text = format!("Task {id} runs headless, without a terminal.\r\n\r\n  arranger events {id}    what it's doing\r\n  arranger send {id} …    message it\r\n  arranger approve {id}   allow what it asks (or deny)\r\n");
+                        Reply::Output(text.into_bytes())
+                    }
                     Some(task) => {
                         task.viewers.push(t);
                         self.resize(id, cols, rows);
@@ -590,6 +691,14 @@ impl Daemon {
             Request::Resize { cols, rows } if on_shell => {
                 if let Some(id) = attached {
                     self.resize_shell(id, cols, rows);
+                }
+                return;
+            }
+            Request::Input(bytes) if attached.is_some_and(|id| self.tasks.get(&id).is_some_and(|t| t.headless.is_some())) => {
+                if is_interrupt(&bytes) {
+                    let id = attached.unwrap();
+                    self.tasks.get_mut(&id).unwrap().headless.as_mut().unwrap().cancel();
+                    self.stop_turn(id);
                 }
                 return;
             }
@@ -738,7 +847,7 @@ impl Daemon {
     fn resize(&mut self, id: u64, cols: u16, rows: u16) {
         // alacritty panics below its minimum size (e.g. a 0x0 pty from `script`)
         let (cols, rows) = (cols.max(2), rows.max(1));
-        if let Some(task) = self.tasks.get_mut(&id) {
+        if let Some(task) = self.tasks.get_mut(&id).filter(|t| t.headless.is_none()) {
             let _ = pty::resize(&task.pty.master, cols, rows);
             task.screen.resize(cols, rows);
             task.log.extend(size_mark(cols, rows));
@@ -760,9 +869,26 @@ impl Daemon {
 
     fn output(&mut self, id: u64, bytes: &[u8]) {
         let task = self.tasks.get_mut(&id).unwrap();
+        if let Some(agent) = &mut task.headless {
+            let session = agent.session().to_string();
+            let (events, lines) = agent.feed(bytes);
+            if agent.session() != session {
+                let _ = fs::write(headless::session_file(&self.data, id), agent.session());
+            }
+            task.log.extend_from_slice(&lines);
+            if task.log.len() >= LOG_CHUNK {
+                flush_log(&log_path(&self.data, id, true), &mut task.log, &mut self.zstd);
+            }
+            if let Some(chat) = self.chats.get_mut(&id).filter(|_| !lines.is_empty()) {
+                chat.feed(&lines);
+                self.chat_due.get_or_insert_with(|| Instant::now() + CHAT_EVERY);
+            }
+            self.agent_events(id, events);
+            return;
+        }
         task.log.extend_from_slice(bytes);
         if task.log.len() >= LOG_CHUNK {
-            flush_log(&self.data, id, &mut task.log, &mut self.zstd);
+            flush_log(&log_path(&self.data, id, false), &mut task.log, &mut self.zstd);
         }
         let notices = task.osc.feed(bytes);
         if let Some(name) = task.osc.title.take() {
@@ -830,6 +956,112 @@ impl Daemon {
         }
     }
 
+    /// Task `id`'s conversation, read from its log the first time.
+    fn chat(&mut self, id: u64) -> Result<&mut Chat, String> {
+        if !self.chats.contains_key(&id) {
+            let (agent, wt, headless): (String, String, bool) = self
+                .db
+                .query_row("SELECT agent, worktree, headless FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .optional()
+                .map_err(e2s)?
+                .ok_or(format!("no task {id}"))?;
+            if !headless {
+                return Err(format!("task {id} runs in a terminal; it has no chat"));
+            }
+            let mut chat = Chat::new(&agent, &wt);
+            if let Ok(zst) = fs::read(log_path(&self.data, id, true)) {
+                chat.feed(&zstd::decode_all(&zst[..]).unwrap_or_default());
+            }
+            if let Some(task) = self.tasks.get(&id) {
+                chat.feed(&task.log); // not flushed to the file yet
+            }
+            chat.take_changed();
+            self.chats.insert(id, chat);
+        }
+        Ok(self.chats.get_mut(&id).unwrap())
+    }
+
+    /// Sends each chat's changed items to the connections watching it.
+    fn push_chats(&mut self) {
+        self.chat_due = None;
+        let mut frames: Vec<(u64, Vec<u8>)> = Vec::new();
+        for (&id, chat) in &mut self.chats {
+            for index in chat.take_changed() {
+                frames.push((id, proto::frame(&Reply::ChatPatch { index, item: chat.items[index].clone() })));
+            }
+        }
+        for (id, frame) in frames {
+            let viewers: Vec<Token> = self.conns.iter().filter(|(_, c)| c.chat == Some(id)).map(|(&t, _)| t).collect();
+            for v in viewers {
+                self.send(v, &frame);
+            }
+        }
+    }
+
+    /// A note from arranger itself in a headless task's chat, logged like claude's output so it
+    /// survives a reload.
+    fn chat_notice(&mut self, id: u64, text: &str, error: bool) {
+        self.chat_line(id, serde_json::json!({"type":"arranger_notice","text":text,"error":error}));
+    }
+
+    /// One of arranger's own lines in a headless task's chat log.
+    fn chat_line(&mut self, id: u64, v: serde_json::Value) {
+        let mut line = serde_json::to_vec(&v).unwrap();
+        line.push(b'\n');
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.log.extend_from_slice(&line);
+        }
+        if let Some(chat) = self.chats.get_mut(&id) {
+            chat.feed(&line);
+            self.chat_due.get_or_insert_with(|| Instant::now() + CHAT_EVERY);
+        }
+    }
+
+    /// Records what a headless agent reported, keeps needs-you in step with what it waits on, and
+    /// sends claude whatever it has for it.
+    fn agent_events(&mut self, id: u64, events: Vec<Event>) {
+        let echoes = self.tasks.get(&id).and_then(|t| t.headless.as_ref()).is_none_or(|a| a.echoes());
+        for event in events {
+            if let Event::Prompt { text } = &event {
+                if !echoes {
+                    self.chat_line(id, serde_json::json!({"type":"arranger_user","text":text}));
+                }
+            }
+            self.record(id, event);
+        }
+        let Some(task) = self.tasks.get(&id) else { return };
+        match task.headless.as_ref().and_then(Agent::pending_need) {
+            Some(need) if task.need.as_ref() != Some(&need) => self.record(id, need),
+            Some(_) => {}
+            // Its ask was answered; an error stays until something new happens.
+            None if matches!(task.need, Some(Event::PermissionRequest { .. } | Event::Question { .. })) => self.resume(id),
+            None => {}
+        }
+        self.flush_agent(id);
+    }
+
+    /// Writes what's pending for a headless agent's stdin, watching for room when it's full.
+    fn flush_agent(&mut self, id: u64) {
+        let Some(task) = self.tasks.get_mut(&id) else { return };
+        let Some(agent) = &mut task.headless else { return };
+        let output = agent.output();
+        while !output.is_empty() {
+            match rustix::io::write(&task.pty.master, &*output) {
+                Ok(n) => {
+                    output.drain(..n);
+                }
+                Err(Errno::INTR) => {}
+                Err(Errno::AGAIN) => break,
+                Err(_) => {
+                    output.clear(); // it's gone; SIGCHLD cleans up
+                    break;
+                }
+            }
+        }
+        let interest = if output.is_empty() { Interest::READABLE } else { Interest::READABLE | Interest::WRITABLE };
+        let _ = self.poll.registry().reregister(&mut SourceFd(&task.pty.master.as_raw_fd()), Token(TASK + id as usize), interest);
+    }
+
     fn has_native_viewer(&self, id: u64) -> bool {
         self.tasks.get(&id).is_some_and(|t| t.viewers.iter().any(|v| self.conns.get(v).is_some_and(|c| c.native)))
     }
@@ -848,7 +1080,7 @@ impl Daemon {
 
     /// A human answered (approve/deny or typing): back to running unless more asks wait.
     fn resume(&mut self, id: u64) {
-        let waiting = self.asks.iter().any(|a| a.0 == id);
+        let waiting = self.asks.iter().any(|a| a.0 == id) || self.tasks.get(&id).and_then(|t| t.headless.as_ref()).is_some_and(Agent::asking);
         if let Some(task) = self.tasks.get_mut(&id) {
             if task.activity == Activity::NeedsYou && !waiting {
                 task.activity = Activity::Running;
@@ -858,6 +1090,16 @@ impl Daemon {
                 self.dirty = true;
             }
         }
+    }
+
+    /// After asking an agent to stop its turn: tells a headless one now, and marks it stopped.
+    fn stop_turn(&mut self, id: u64) {
+        let busy = self.tasks.get(&id).is_some_and(|t| t.activity != Activity::Done);
+        if busy && self.tasks.get(&id).is_some_and(|t| t.headless.is_some()) {
+            self.chat_notice(id, "Interrupted", false);
+        }
+        self.flush_agent(id);
+        self.interrupt(id);
     }
 
     /// The viewer hit Esc or Ctrl-C mid-turn; agents skip their stop hook when interrupted.
@@ -896,7 +1138,17 @@ impl Daemon {
             .collect();
         for id in exited {
             self.read_task(id);
-            self.finish(id, "exited");
+            let task = &mut self.tasks.get_mut(&id).unwrap();
+            let failed = task.headless.is_some() && task.pty.child.try_wait().ok().flatten().is_some_and(|s| !s.success());
+            if failed {
+                // No terminal showed what went wrong; its stderr log did.
+                let stderr = fs::read(self.data.join(format!("logs/{id}.stderr"))).unwrap_or_default();
+                let tail = String::from_utf8_lossy(&stderr[stderr.len().saturating_sub(2048)..]).trim().to_string();
+                let message = if tail.is_empty() { "the agent exited with an error".to_string() } else { tail };
+                self.chat_notice(id, &message, true);
+                self.record(id, Event::Error { message });
+            }
+            self.finish(id, if failed { "failed" } else { "exited" });
         }
         let exited: Vec<u64> = self.shells.iter_mut().filter_map(|(&id, s)| matches!(s.pty.child.try_wait(), Ok(Some(_))).then_some(id)).collect();
         for id in exited {
@@ -908,7 +1160,7 @@ impl Daemon {
 
     fn finish(&mut self, id: u64, state: &str) {
         let Some(mut task) = self.tasks.remove(&id) else { return };
-        flush_log(&self.data, id, &mut task.log, &mut self.zstd);
+        flush_log(&log_path(&self.data, id, task.headless.is_some()), &mut task.log, &mut self.zstd);
         let frame = proto::frame(&Reply::Exited);
         for v in task.viewers {
             if let Some(c) = self.conns.get_mut(&v) {
@@ -919,7 +1171,10 @@ impl Daemon {
         self.set_state(id, state);
     }
 
-    fn create(&mut self, agent: &str, dir: &Path, base: Option<&str>, prompt: &str, model: &str) -> Result<u64, String> {
+    fn create(&mut self, agent: &str, dir: &Path, base: Option<&str>, prompt: &str, model: &str, effort: &str, headless: bool) -> Result<u64, String> {
+        if headless && !headless::supported(agent) {
+            return Err(format!("{} can't run headless", adapter::kind(agent)));
+        }
         // A repo typed on another machine (`~/src/api`): the daemon's own home.
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
         let dir = dir.strip_prefix("~").map_or(dir.to_path_buf(), |rest| home.join(rest));
@@ -930,9 +1185,9 @@ impl Daemon {
         let repo_name = top.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         self.db
             .execute(
-                "INSERT INTO tasks (agent, repo, branch, worktree, state, created, title, prompt, model)
-                 VALUES (?1, ?2, '', '', 'new', ?3, ?4, ?4, ?5)",
-                params![agent, top.to_string_lossy(), now_secs(), prompt, model],
+                "INSERT INTO tasks (agent, repo, branch, worktree, state, created, title, prompt, model, effort, headless)
+                 VALUES (?1, ?2, '', '', 'new', ?3, ?4, ?4, ?5, ?6, ?7)",
+                params![agent, top.to_string_lossy(), now_secs(), prompt, model, effort, headless],
             )
             .map_err(e2s)?;
         let id = self.db.last_insert_rowid() as u64;
@@ -989,16 +1244,16 @@ impl Daemon {
     /// uncommitted edits, whose agent carries on from a copy of `src`'s session.
     /// Its first message is `prompt` if not empty, and it's named after it; `model` None keeps `src`'s.
     fn clone_task(&mut self, src: u64, ask: &str, new_model: Option<&str>) -> Result<u64, String> {
-        let row: Option<(String, String, String, String, String, String, String, String, String)> = self
+        let row: Option<(String, String, String, String, String, String, String, String, String, String, bool)> = self
             .db
             .query_row(
-                "SELECT agent, repo, worktree, base, base_commit, reviewed, title, prompt, model FROM tasks WHERE id = ?1",
+                "SELECT agent, repo, worktree, base, base_commit, reviewed, title, prompt, model, effort, headless FROM tasks WHERE id = ?1",
                 [src],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?)),
             )
             .optional()
             .map_err(e2s)?;
-        let (agent, repo, from, base, base_commit, reviewed, title, prompt, model) = row.ok_or(format!("no task {src}"))?;
+        let (agent, repo, from, base, base_commit, reviewed, title, prompt, model, effort, headless) = row.ok_or(format!("no task {src}"))?;
         let ask = ask.trim();
         let title = if ask.is_empty() { title } else { ask.to_string() };
         let model = new_model.map_or(model, str::to_string);
@@ -1009,9 +1264,9 @@ impl Daemon {
         let head = review::resolve(&from, "HEAD")?;
         self.db
             .execute(
-                "INSERT INTO tasks (agent, repo, branch, worktree, state, created, title, prompt, model, cloned_from)
-                 VALUES (?1, ?2, '', '', 'new', ?3, ?4, ?5, ?6, ?7)",
-                params![agent, repo, now_secs(), title, prompt, model, src],
+                "INSERT INTO tasks (agent, repo, branch, worktree, state, created, title, prompt, model, effort, cloned_from, headless)
+                 VALUES (?1, ?2, '', '', 'new', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![agent, repo, now_secs(), title, prompt, model, effort, src, headless],
             )
             .map_err(e2s)?;
         let id = self.db.last_insert_rowid() as u64;
@@ -1020,7 +1275,12 @@ impl Daemon {
         let wt = self.data.join("worktrees").join(repo_name).join(id.to_string());
         let made = git(git_in(Path::new(&repo)).args(["worktree", "add", "-b", &branch]).arg(&wt).arg(&head)).and_then(|_| {
             carry_changes(&from, &wt)?;
-            adapter::copy_session(&agent, &self.data, (src, &from), (id, &wt)).map_err(|e| format!("can't clone task {src}'s session: {e}"))
+            let copied = if headless {
+                headless::copy_session(&agent, &self.data, (src, &from), (id, &wt))
+            } else {
+                adapter::copy_session(&agent, &self.data, (src, &from), (id, &wt))
+            };
+            copied.map_err(|e| format!("can't clone task {src}'s session: {e}"))
         });
         if let Err(e) = made {
             if wt.exists() {
@@ -1045,18 +1305,27 @@ impl Daemon {
     /// Launches task `id`'s agent: its first prompt, or with `resume` its last session plus that prompt.
     /// `fork` carries on in a new session of its own (a cloned task's first start).
     fn spawn(&mut self, id: u64, resume: Option<&str>, fork: bool) -> Result<(), String> {
-        let (agent, repo, wt, prompt, model): (String, String, String, String, String) = self
+        let (agent, repo, wt, prompt, model, effort, headless): (String, String, String, String, String, String, bool) = self
             .db
-            .query_row("SELECT agent, repo, worktree, prompt, model FROM tasks WHERE id = ?1", [id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            .query_row("SELECT agent, repo, worktree, prompt, model, effort, headless FROM tasks WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
             })
             .map_err(e2s)?;
         let prompt = resume.unwrap_or(&prompt);
-        let session = resume.map(|_| fs::read_to_string(adapter::codex_session(&self.data, id)).unwrap_or_default());
-        let (argv, env) = adapter::launch(&agent, prompt, &model, session.as_deref(), fork, &self.exe, &self.data).map_err(e2s)?;
+        let (argv, env, mut stdio) = if headless {
+            // Its session, from the last run; "" (none yet) resumes the latest here.
+            let session = resume.map(|_| fs::read_to_string(headless::session_file(&self.data, id)).unwrap_or_default());
+            let (argv, agent) = headless::start(&agent, Path::new(&wt), &model, &effort, session.as_deref().map(str::trim), fork);
+            (argv, Vec::new(), Some(agent))
+        } else {
+            let session = resume.map(|_| fs::read_to_string(adapter::codex_session(&self.data, id)).unwrap_or_default());
+            let (argv, env) = adapter::launch(&agent, prompt, &model, &effort, session.as_deref(), fork, &self.exe, &self.data).map_err(e2s)?;
+            (argv, env, None)
+        };
         let mut cmd = if Path::new(&wt).join(".arranger/setup").exists() {
             let mut sh = Command::new("sh");
-            sh.args(["-c", "./.arranger/setup && exec \"$0\" \"$@\""]).args(&argv);
+            // On stderr: a headless agent's stdout is its JSON stream.
+            sh.args(["-c", "./.arranger/setup >&2 && exec \"$0\" \"$@\""]).args(&argv);
             sh
         } else {
             let mut cmd = Command::new(&argv[0]);
@@ -1074,9 +1343,19 @@ impl Daemon {
             .env("ARRANGER_REPO", &repo)
             .env("PORT", (20000 + id % 1000 * 10).to_string()); // PORT..PORT+9 is this task's
         let (cols, rows) = (80, 24);
-        let pty = pty::spawn(cmd, cols, rows).map_err(|e| format!("{agent}: {e}"))?;
+        let pty = if headless {
+            let stderr = fs::File::options().create(true).append(true).open(self.data.join(format!("logs/{id}.stderr"))).map_err(e2s)?;
+            pty::spawn_stdio(cmd, stderr)
+        } else {
+            pty::spawn(cmd, cols, rows)
+        }
+        .map_err(|e| format!("{agent}: {e}"))?;
+        // It announces the prompt once the agent has started.
+        if let Some(a) = stdio.as_mut().filter(|_| !prompt.trim().is_empty()) {
+            a.prompt(prompt.to_string());
+        }
         // Resumed with nothing to say (a clone or revive without a prompt), it sits waiting: no hook fires to say so.
-        let idle = resume.is_some_and(|p| p.trim().is_empty());
+        let idle = (resume.is_some() || headless) && prompt.trim().is_empty();
         let token = Token(TASK + id as usize);
         self.poll
             .registry()
@@ -1084,8 +1363,9 @@ impl Daemon {
             .map_err(e2s)?;
         let task = Task {
             pty,
+            headless: stdio,
             screen: Screen::new(cols, rows),
-            log: size_mark(cols, rows),
+            log: if headless { Vec::new() } else { size_mark(cols, rows) }, // a headless log is JSON lines
             viewers: Vec::new(),
             osc: Osc::named(agent == "claude"), // ponytail: claude only; other agents' titles are status, not names
             activity: if idle { Activity::Done } else { Activity::Running },
@@ -1096,6 +1376,10 @@ impl Daemon {
             interrupted: false,
         };
         self.tasks.insert(id, task);
+        if headless {
+            self.chat(id)?;
+        }
+        self.flush_agent(id);
         self.set_state(id, "running");
         Ok(())
     }
@@ -1116,7 +1400,11 @@ impl Daemon {
         if !wt.is_empty() && Path::new(&wt).exists() {
             git(git_in(Path::new(&repo)).args(["worktree", "remove", "--force"]).arg(&wt))?;
         }
-        let _ = fs::remove_file(self.data.join(format!("logs/{id}.zst")));
+        for log in [format!("logs/{id}.zst"), format!("logs/{id}.jsonl.zst"), format!("logs/{id}.stderr")] {
+            let _ = fs::remove_file(self.data.join(log));
+        }
+        let _ = fs::remove_file(headless::session_file(&self.data, id));
+        self.chats.remove(&id);
         self.db.execute("DELETE FROM tasks WHERE id = ?1", [id]).map_err(e2s)?;
         self.db.execute("DELETE FROM events WHERE task = ?1", [id]).map_err(e2s)?;
         self.dirty = true;
@@ -1128,7 +1416,7 @@ impl Daemon {
         let mut stmt =
             self.db.prepare(
                 "SELECT id, agent, branch, worktree, state, title, created, summary, shipped,
-                 MAX(created, updated, COALESCE((SELECT MAX(ts) FROM events WHERE task = tasks.id) / 1000, 0)), model, cloned_from
+                 MAX(created, updated, COALESCE((SELECT MAX(ts) FROM events WHERE task = tasks.id) / 1000, 0)), model, cloned_from, headless, effort
                  FROM tasks ORDER BY id",
             ).map_err(e2s)?;
         let rows = stmt.query_map([], |r| {
@@ -1150,6 +1438,8 @@ impl Daemon {
                 updated: r.get(9)?,
                 model: r.get(10)?,
                 cloned_from: r.get(11)?,
+                headless: r.get(12)?,
+                effort: r.get(13)?,
                 machine: 0,
             })
         });
@@ -1159,7 +1449,7 @@ impl Daemon {
                 info.state = task.activity.name().into();
                 info.action = task.action.clone();
                 info.need = task.need.clone();
-                info.asking = self.asks.iter().any(|a| a.0 == info.id);
+                info.asking = self.asks.iter().any(|a| a.0 == info.id) || task.headless.as_ref().is_some_and(Agent::asking);
                 info.since = task.since;
             }
             if with_files {
@@ -1313,10 +1603,14 @@ impl Daemon {
         }
     }
 
-    /// Agents get SIGHUP when their PTY masters close as the process exits.
+    /// Agents get SIGHUP when their PTY masters close as the process exits; headless ones, which
+    /// have no terminal, get it from us.
     fn shutdown(&mut self, sock: &Path) {
         for (&id, task) in &mut self.tasks {
-            flush_log(&self.data, id, &mut task.log, &mut self.zstd);
+            if task.headless.is_some() {
+                let _ = rustix::process::kill_process_group(Pid::from_child(&task.pty.child), Signal::HUP);
+            }
+            flush_log(&log_path(&self.data, id, task.headless.is_some()), &mut task.log, &mut self.zstd);
         }
         let _ = fs::remove_file(sock);
         let _ = fs::remove_file(self.data.join("daemon.pid"));

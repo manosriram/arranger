@@ -29,12 +29,13 @@ pub const PARENT_SESSION_ENV: &[&str] = &[
 ];
 
 /// Program, args and extra env that start `agent` with arranger's hooks installed, on `model`
-/// ("" leaves the agent's default; claude, codex, gemini and pi all take `--model`).
+/// ("" leaves the agent's default; claude, codex, gemini and pi all take `--model`) at reasoning
+/// `effort` ("" likewise; gemini has none).
 /// `resume` picks up the agent's last session in this directory (a revived task) instead of a new one;
 /// for codex it carries the task's session id ("" starts a new one), since its `--last` also
 /// matches sessions from the main checkout and sibling worktrees. `fork` resumes into a new
 /// session of its own (a cloned task), leaving the one it came from as it was.
-pub fn launch(agent: &str, prompt: &str, model: &str, resume: Option<&str>, fork: bool, exe: &Path, data: &Path) -> io::Result<(Vec<String>, Vec<(String, String)>)> {
+pub fn launch(agent: &str, prompt: &str, model: &str, effort: &str, resume: Option<&str>, fork: bool, exe: &Path, data: &Path) -> io::Result<(Vec<String>, Vec<(String, String)>)> {
     let hook = |name: &str| format!("'{}' hook {name}", exe.display());
     let mut argv = vec![agent.to_string()];
     if let Some(session) = resume {
@@ -94,6 +95,14 @@ pub fn launch(agent: &str, prompt: &str, model: &str, resume: Option<&str>, fork
     if !model.is_empty() {
         argv.extend(["--model".into(), model.into()]);
     }
+    if !effort.is_empty() {
+        match kind(agent) {
+            "claude" => argv.extend(["--effort".into(), effort.into()]),
+            "codex" => argv.extend(["-c".into(), format!("model_reasoning_effort=\"{effort}\"")]),
+            "pi" => argv.extend(["--thinking".into(), effort.into()]),
+            _ => {}
+        }
+    }
     // A prompt starting with `-` must not be read as a flag.
     if !prompt.is_empty() {
         match kind(agent) {
@@ -116,9 +125,7 @@ pub fn codex_session(data: &Path, task: u64) -> PathBuf {
 pub fn copy_session(agent: &str, data: &Path, from: (u64, &Path), to: (u64, &Path)) -> io::Result<()> {
     match kind(agent) {
         "claude" => {
-            // Named after the directory it saw, symlinks resolved.
-            let real = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-            let (src, dst) = (claude_sessions(&real(from.1)), claude_sessions(&real(to.1)));
+            let (src, dst) = (claude_sessions(from.1), claude_sessions(to.1));
             let latest = fs::read_dir(&src)?
                 .filter_map(Result::ok)
                 .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
@@ -136,8 +143,10 @@ pub fn copy_session(agent: &str, data: &Path, from: (u64, &Path), to: (u64, &Pat
 }
 
 /// Where claude keeps sessions started in `cwd`: `projects/` in its config dir, under the path
-/// with everything but ASCII letters and digits made `-`.
-fn claude_sessions(cwd: &Path) -> PathBuf {
+/// with everything but ASCII letters and digits made `-`. Named after the directory it saw,
+/// symlinks resolved.
+pub(crate) fn claude_sessions(cwd: &Path) -> PathBuf {
+    let cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let config = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".claude"));
@@ -218,7 +227,7 @@ fn parse_pi(v: &Value, totals: &mut Totals) -> Vec<Event> {
 }
 
 /// Tool names across claude, codex, gemini and pi.
-fn tool_start(tool: &str, input: &Value, cwd: &str) -> Vec<Event> {
+pub(crate) fn tool_start(tool: &str, input: &Value, cwd: &str) -> Vec<Event> {
     let path = || {
         let p = ["file_path", "notebook_path", "path"].iter().map(|k| str(&input[*k])).find(|s| !s.is_empty());
         relative(&p.unwrap_or_default(), cwd)
@@ -404,17 +413,17 @@ mod tests {
     #[test]
     fn resume_args() {
         let (exe, data) = (Path::new("/bin/arranger"), Path::new("/tmp"));
-        let (argv, _) = launch("claude", "fix it", "", Some(""), false, exe, data).unwrap();
+        let (argv, _) = launch("claude", "fix it", "", "", Some(""), false, exe, data).unwrap();
         assert_eq!((argv[1].as_str(), argv.last().unwrap().as_str()), ("--continue", "fix it"));
-        let (argv, _) = launch("codex", "", "", Some("01a1"), false, exe, data).unwrap();
+        let (argv, _) = launch("codex", "", "", "", Some("01a1"), false, exe, data).unwrap();
         assert_eq!(&argv[1..3], ["resume", "01a1"]);
-        let (argv, _) = launch("codex", "", "", Some(""), false, exe, data).unwrap();
+        let (argv, _) = launch("codex", "", "", "", Some(""), false, exe, data).unwrap();
         assert_ne!(argv[1], "resume"); // no session of its own: a new one, never another worktree's
-        assert!(!launch("claude", "", "", None, false, exe, data).unwrap().0.contains(&"--continue".to_string()));
+        assert!(!launch("claude", "", "", "", None, false, exe, data).unwrap().0.contains(&"--continue".to_string()));
         // A clone carries on in a session of its own.
-        let (argv, _) = launch("claude", "", "", Some(""), true, exe, data).unwrap();
+        let (argv, _) = launch("claude", "", "", "", Some(""), true, exe, data).unwrap();
         assert_eq!(&argv[1..3], ["--continue", "--fork-session"]);
-        let (argv, _) = launch("codex", "", "", Some("01a1"), true, exe, data).unwrap();
+        let (argv, _) = launch("codex", "", "", "", Some("01a1"), true, exe, data).unwrap();
         assert_eq!(&argv[1..3], ["fork", "01a1"]);
     }
 
@@ -435,9 +444,13 @@ mod tests {
     #[test]
     fn launch_model() {
         let (exe, data) = (Path::new("/bin/arranger"), Path::new("/tmp"));
-        let (argv, _) = launch("claude", "hi", "claude-sonnet-5-5", None, false, exe, data).unwrap();
+        let (argv, _) = launch("claude", "hi", "claude-sonnet-5-5", "", None, false, exe, data).unwrap();
         assert_eq!(argv[argv.len() - 4..], ["--model", "claude-sonnet-5-5", "--", "hi"]);
-        let (argv, env) = launch("claude", "", "", None, false, exe, data).unwrap();
+        let (argv, _) = launch("claude", "", "", "max", None, false, exe, data).unwrap();
+        assert!(argv.windows(2).any(|w| w == ["--effort", "max"]));
+        let (argv, _) = launch("codex", "", "", "low", None, false, exe, data).unwrap();
+        assert!(argv.windows(2).any(|w| w == ["-c", "model_reasoning_effort=\"low\""]));
+        let (argv, env) = launch("claude", "", "", "", None, false, exe, data).unwrap();
         assert!(!argv.contains(&"--model".to_string()));
         assert!(env.iter().any(|(k, v)| k == "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN" && v == "1")); // replayable history
     }
@@ -445,9 +458,9 @@ mod tests {
     #[test]
     fn dash_prompt_is_not_a_flag() {
         let (exe, data) = (Path::new("/bin/arranger"), Path::new("/tmp"));
-        let (argv, _) = launch("codex", "- fix it", "", None, false, exe, data).unwrap();
+        let (argv, _) = launch("codex", "- fix it", "", "", None, false, exe, data).unwrap();
         assert_eq!(argv[argv.len() - 2..], ["--", "- fix it"]);
-        let (argv, _) = launch("claude", "-x", "", Some(""), false, exe, data).unwrap();
+        let (argv, _) = launch("claude", "-x", "", "", Some(""), false, exe, data).unwrap();
         assert_eq!(argv[argv.len() - 2..], ["--", "-x"]);
     }
 

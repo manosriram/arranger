@@ -3,6 +3,7 @@
 //! that triggered it. Redraws happen only on input or daemon pushes, so idle CPU is zero.
 
 mod overlays;
+mod chat;
 mod completion;
 mod sound;
 mod render;
@@ -11,6 +12,7 @@ mod theme;
 mod welcome;
 
 use arranger::adapter;
+use arranger::headless;
 use arranger::client::{connect, connect_at, request_at};
 use arranger::machine::{self, Machine};
 use arranger::proto::{self, Event, Reply, Request, Ship, TaskInfo};
@@ -39,7 +41,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use review::{ReviewAction, ReviewView, Tag};
-use theme::{AGENTS, Rgba, THEMES, Theme, accent, alpha, blend, models, readable};
+use theme::{AGENTS, Rgba, THEMES, Theme, accent, alpha, blend, efforts, models, readable};
 #[cfg(test)]
 use theme::{INK, PAPER};
 use winit::application::ApplicationHandler;
@@ -79,6 +81,8 @@ pub enum Msg {
     /// The add-machine dialog's connection test.
     Tested(Result<String, String>),
     Paths(usize, String, Result<Reply, String>),
+    /// A headless task's chat: its items so far, an older page, or a change.
+    Chat(u64, Reply),
 }
 
 /// How a machine's daemon is reachable.
@@ -154,6 +158,8 @@ enum Focus {
     HostSsh,
     HostName,
     HostRepo,
+    /// A headless task's message box, under its chat.
+    Message,
 }
 
 #[derive(Default)]
@@ -181,6 +187,10 @@ struct Dialog {
     agent: usize,
     /// Index into the agent's `models`; 0 is its default.
     model: usize,
+    /// Index into the agent's `efforts`; 0 is its default.
+    effort: usize,
+    /// Runs in a chat (headless) or a terminal; None is the agent's default.
+    chat: Option<bool>,
     host: usize,
     /// Repo on the chosen machine.
     repo: String,
@@ -200,6 +210,14 @@ impl Dialog {
     fn agent(&self) -> &str {
         self.clone.as_ref().map_or(AGENTS[self.agent], |c| c.agent.as_str())
     }
+
+    /// The new task runs headless, in a chat; a clone runs as its source does.
+    fn chat_view(&self) -> bool {
+        match &self.clone {
+            Some(c) => c.headless,
+            None => headless::supported(self.agent()) && self.chat.unwrap_or_else(|| headless::default_on(self.agent())),
+        }
+    }
 }
 
 /// The task the new-task dialog clones, for showing where the clone picks up.
@@ -212,6 +230,8 @@ struct CloneFrom {
     last: String,
     /// Its `--model`, kept until another is picked (it may not be one the dialog lists).
     model: Option<String>,
+    effort: String,
+    headless: bool,
 }
 
 impl CloneFrom {
@@ -243,6 +263,10 @@ enum Action {
     Answering,
     PickAgent(usize),
     PickModel(usize),
+    /// The next of the dialog agent's reasoning efforts.
+    PickEffort,
+    /// The new task in a chat (true) or a terminal.
+    PickView(bool),
     Start,
     CloseDialog,
     OpenReview,
@@ -279,6 +303,8 @@ enum Action {
     Delete(TaskKey),
     /// Open the new-task dialog to clone this task: its chat and edits, on a new worktree.
     Clone(TaskKey),
+    /// Send the message box to the selected headless task.
+    SendChat,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -294,6 +320,13 @@ struct App {
     hosts: Vec<Host>,
     selected: Option<TaskKey>,
     session: Option<Session>,
+    /// The selected headless task's conversation, in place of its terminal.
+    chat: Option<chat::ChatView>,
+    /// What's typed in each headless task's message box.
+    drafts: std::collections::HashMap<TaskKey, String>,
+    /// A command to type into the task's shell once its Terminal tab attaches (a headless
+    /// agent's command only its own terminal has).
+    typed: Option<(TaskKey, String)>,
     seq: u64,
     pane: (u16, u16),
     /// Index into THEMES.
@@ -437,6 +470,9 @@ fn run() -> io::Result<()> {
         hosts: Vec::new(),
         selected: None,
         session: None,
+        chat: None,
+        drafts: std::collections::HashMap::new(),
+        typed: None,
         seq: 0,
         pane: (80, 24),
         theme: 0,
@@ -745,6 +781,7 @@ impl ApplicationHandler<Msg> for App {
                 }
             }
             Msg::Reply(tag, reply) => self.on_reply(tag, reply),
+            Msg::Chat(seq, reply) => self.on_chat(seq, reply),
         }
         self.redraw();
     }
@@ -1428,7 +1465,13 @@ impl App {
 
     /// Where focus rests when no field has it: the agent's terminal, or vim's normal mode.
     fn rest(&self) -> Focus {
-        if self.vim { Focus::Normal } else { Focus::Term }
+        if self.vim {
+            Focus::Normal
+        } else if self.chat_wanted().is_some() {
+            Focus::Message
+        } else {
+            Focus::Term
+        }
     }
 
     fn set_theme(&mut self, i: usize) {
@@ -1594,6 +1637,8 @@ impl App {
             *s = (*s - dy).max(0.0);
         } else if self.mouse.0 < self.sidebar_w {
             self.scroll = (self.scroll - dy).max(0.0);
+        } else if let Some(c) = self.chat.as_mut().filter(|_| self.review.is_none() && !self.welcome) {
+            c.scroll(dy);
         } else if self.review.is_none() && !self.welcome {
             let dy = dy * 2.0;
             let id = self.selected;
@@ -1695,8 +1740,9 @@ impl App {
     }
 
     fn sync_session(&mut self) {
+        self.sync_chat();
         let shell = self.shell;
-        let want = self.current().filter(|t| if shell { self.shellable() } else { is_live(&t.state) }).map(|t| (t.machine, t.id));
+        let want = self.current().filter(|t| if shell { self.shellable() } else { is_live(&t.state) && !t.headless }).map(|t| (t.machine, t.id));
         self.load_history();
         if self.session.as_ref().map(|s| (s.task, s.shell)) == want.map(|k| (k, shell)) {
             return;
@@ -1708,6 +1754,9 @@ impl App {
         let req = if shell { Request::Shell { id, cols, rows } } else { Request::Attach { id, cols, rows, native: true } };
         if sock.write_all(&proto::frame(&req)).is_err() {
             return;
+        }
+        if let Some((_, command)) = self.typed.take_if(|(k, _)| shell && *k == key) {
+            let _ = sock.write_all(&proto::frame(&Request::Input(command.into_bytes())));
         }
         let Ok(mut reader) = sock.try_clone() else { return };
         self.seq += 1;
@@ -1725,7 +1774,7 @@ impl App {
 
     /// For a task that is no longer running, replays its PTY log so its chat stays readable.
     fn load_history(&mut self) {
-        let Some(task) = self.current().filter(|t| !is_live(&t.state) && t.state != "queued") else {
+        let Some(task) = self.current().filter(|t| !is_live(&t.state) && t.state != "queued" && !t.headless) else {
             self.history = None;
             return;
         };
@@ -1769,7 +1818,7 @@ impl App {
     fn open_dialog(&mut self) {
         // Starts on the selected task's machine.
         let host = self.current().map_or(0, |t| t.machine);
-        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_layout: Default::default(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model: 0, host: 0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: None });
+        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_layout: Default::default(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model: 0, effort: 0, chat: None, host: 0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: None });
         self.pick_host(host);
         self.focus = Focus::Prompt;
         self.anchor = None;
@@ -1781,8 +1830,8 @@ impl App {
         let Some(t) = self.task(key).filter(|t| t.state != "queued" && !t.worktree.is_empty()) else { return };
         let agent = adapter::kind(&t.agent).to_string();
         let model = models(&agent).iter().position(|m| m.1 == t.model).unwrap_or(0);
-        let clone = CloneFrom { key, agent, branch: t.branch.clone(), first: t.title.clone(), last: String::new(), model: Some(t.model.clone()) };
-        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_layout: Default::default(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model, host: key.0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: Some(clone) });
+        let clone = CloneFrom { key, agent, branch: t.branch.clone(), first: t.title.clone(), last: String::new(), model: Some(t.model.clone()), effort: t.effort.clone(), headless: t.headless };
+        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_layout: Default::default(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model, effort: 0, chat: None, host: key.0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: Some(clone) });
         self.focus = Focus::Prompt;
         self.anchor = None;
         self.spawn_request(key.0, Tag::LastPrompt(key), Request::Events { id: key.1 });
@@ -1840,6 +1889,8 @@ impl App {
                 base: Some(d.base.trim().to_string()).filter(|b| !b.is_empty()),
                 prompt: Some(d.prompt.trim().to_string()).filter(|p| !p.is_empty()),
                 model: Some(models(AGENTS[d.agent])[d.model].1.to_string()).filter(|m| !m.is_empty()),
+                effort: efforts(AGENTS[d.agent])[d.effort].1.to_string(),
+                headless: d.chat_view(),
             },
         };
         match request_at(sock.as_deref(), &req) {
@@ -1927,8 +1978,21 @@ impl App {
         if let Some(d) = self.dialog.as_ref().filter(|_| ev.logical_key == Key::Named(NamedKey::Tab)) {
             // A clone's agent is its source's, so Tab picks the model there.
             let model = m.control_key() || m.shift_key() || d.clone.is_some();
-            self.actions.push(if model { Action::PickModel(usize::MAX) } else { Action::PickAgent(usize::MAX) });
+            self.actions.push(if m.alt_key() && d.clone.is_none() {
+                Action::PickEffort
+            } else if model {
+                Action::PickModel(usize::MAX)
+            } else {
+                Action::PickAgent(usize::MAX)
+            });
             return;
+        }
+        // Ctrl+T: the new task in a chat or a terminal.
+        if let (Some(d), true, Key::Character(c)) = (self.dialog.as_ref(), m.control_key() && !app_mod(m), &ev.logical_key) {
+            if c.eq_ignore_ascii_case("t") && d.clone.is_none() {
+                self.actions.push(Action::PickView(!d.chat_view()));
+                return;
+            }
         }
         if app_mod(m) {
             match &ev.logical_key {
@@ -1999,6 +2063,11 @@ impl App {
         if self.vim && ev.logical_key == Key::Named(NamedKey::Escape) && !ev.repeat {
             let double = self.last_esc.is_some_and(|at| at.elapsed() < Duration::from_millis(400));
             self.last_esc = (!double).then(Instant::now);
+            if double && self.review.is_none() && self.machine_tasks.is_none() && self.dialog.is_none() && self.add_host.is_none() && self.chat.is_some() {
+                self.interrupt_chat();
+                self.focus = Focus::Normal;
+                return;
+            }
             if double && self.review.is_none() && self.machine_tasks.is_none() && self.dialog.is_none() && self.add_host.is_none() && self.session.is_some() {
                 self.send_input(b"\x1b\x1b".to_vec());
                 self.focus = Focus::Normal;
@@ -2109,15 +2178,18 @@ impl App {
                     self.actions.push(Action::CloseDialog);
                 } else if focus == Focus::Note {
                     self.actions.push(Action::Review(ReviewAction::SaveNote));
+                } else if focus == Focus::Message {
+                    self.interrupt_chat();
                 } else {
                     self.focus = self.rest();
                 }
             }
-            Key::Named(NamedKey::Enter) if matches!(focus, Focus::Prompt | Focus::Note) && shift => self.insert("\n"),
+            Key::Named(NamedKey::Enter) if matches!(focus, Focus::Prompt | Focus::Note | Focus::Message) && shift => self.insert("\n"),
             Key::Named(NamedKey::Enter) => match focus {
                 Focus::Note => self.actions.push(Action::Review(ReviewAction::SaveNote)),
                 Focus::CommitMsg => self.actions.push(Action::Review(ReviewAction::Commit(Ship::Commit))),
                 Focus::Prompt | Focus::Base | Focus::Repo => self.actions.push(Action::Start),
+                Focus::Message => self.actions.push(Action::SendChat),
                 Focus::HostSsh | Focus::HostName | Focus::HostRepo => self.actions.push(Action::AddHost),
                 _ => self.focus = self.rest(),
             },
@@ -2166,6 +2238,7 @@ impl App {
             (Focus::Repo, Some(d)) => &mut d.repo,
             (Focus::Filter, _) => &mut self.filter,
             (Focus::TasksFilter, _) => &mut self.mt_filter,
+            (Focus::Message, _) if self.selected.is_some() => self.drafts.entry(self.selected.unwrap()).or_default(),
             _ => &mut self.spare,
         }
     }
@@ -2255,6 +2328,8 @@ impl App {
                     (self.answering, self.answered) = (None, self.ask());
                 }
                 Action::Focus(f) => {
+                    // "The agent" is its message box when it runs headless.
+                    let f = if f == Focus::Term && self.chat_wanted().is_some() { Focus::Message } else { f };
                     self.confirm_delete = None;
                     if self.focus != f {
                         self.anchor = None;
@@ -2321,6 +2396,7 @@ impl App {
                     }
                 }
                 Action::Clone(key) => self.open_clone(key),
+                Action::SendChat => self.send_chat(None),
                 Action::Delete(key @ (m, id)) => {
                     self.spawn_request(m, Tag::Delete, Request::Kill { id });
                     self.stats.remove(&key);
@@ -2338,7 +2414,7 @@ impl App {
                     if let Some(d) = self.dialog.as_mut().filter(|d| d.clone.is_none()) {
                         let agent = if i == usize::MAX { (d.agent + 1) % AGENTS.len() } else { i };
                         if agent != d.agent {
-                            (d.agent, d.model) = (agent, 0); // models are per agent
+                            (d.agent, d.model, d.effort) = (agent, 0, 0); // models and efforts are per agent
                         }
                     }
                 }
@@ -2349,6 +2425,16 @@ impl App {
                         if let Some(c) = &mut d.clone {
                             c.model = None; // the picked one, from now on
                         }
+                    }
+                }
+                Action::PickEffort => {
+                    if let Some(d) = self.dialog.as_mut().filter(|d| d.clone.is_none()) {
+                        d.effort = (d.effort + 1) % efforts(d.agent()).len();
+                    }
+                }
+                Action::PickView(chat) => {
+                    if let Some(d) = self.dialog.as_mut().filter(|d| d.clone.is_none() && headless::supported(d.agent())) {
+                        d.chat = Some(chat);
                     }
                 }
                 Action::Start => self.start(),
@@ -2988,7 +3074,7 @@ impl App {
             ]
         } else {
             let mut details = vec![
-                ("Agent", vec![(kind.to_string(), accent(kind))]),
+                ("Agent", vec![(if task.headless { format!("{kind} · headless") } else { kind.to_string() }, accent(kind))]),
                 ("Branch", vec![(branch, t.text)]),
                 ("Machine", vec![(host.name().to_string(), t.text)]),
                 ("Changes", changes),
@@ -3039,6 +3125,10 @@ impl App {
         r.rect(sec, 0.0, t.term);
         if self.hit_as(r, sec, Cursor::Text) {
             self.actions.push(Action::Focus(Focus::Term));
+        }
+        if task.headless && !self.shell {
+            self.draw_chat(r, t, sec, &task, ended);
+            return;
         }
         let grid = Rect::new(sec.x + 16.0, sec.y + 12.0, sec.w - 32.0, sec.h - 20.0);
         let cell_w = r.advance(MONO, TERM_SIZE, 400, '0');
@@ -3261,6 +3351,7 @@ impl App {
         if completion_click.is_some() { self.click = None; }
         let Some(d) = &self.dialog else { return };
         let (prompt, agent_i, model_i, base, error) = (d.prompt.clone(), d.agent, d.model, d.base.clone(), d.error.clone());
+        let (effort_i, chat_view, effort_kept) = (d.effort, d.chat_view(), d.clone.as_ref().map(|c| c.effort.clone()));
         let (branches, list) = (d.branches.clone(), d.list);
         // Cloning: (task id, agent, branch, first prompt, last prompt, its model until another's picked).
         let clone = d.clone.as_ref().map(|c| (c.key.1, c.agent.clone(), c.branch.clone(), c.first.clone(), c.last.clone(), c.model.clone()));
@@ -3417,6 +3508,17 @@ impl App {
         if self.hit(r, b) {
             self.actions.push(Action::PickModel(usize::MAX));
         }
+        // A clone keeps its source's effort; gemini takes none.
+        let effort = match effort_kept.as_deref() {
+            Some("") => "default",
+            Some(kept) => efforts(agent).iter().find(|e| e.1 == kept).map_or(kept, |e| e.0),
+            None => efforts(agent)[effort_i].0,
+        };
+        let fixed = clone.is_some() || efforts(agent).len() == 1;
+        let b = chip(r, "effort", effort, None, 0.0, fixed);
+        if !fixed && self.hit(r, b) {
+            self.actions.push(Action::PickEffort);
+        }
         if hosts.len() > 1 {
             let b = chip(r, "on", self.hosts[host_i].name(), None, 0.0, clone.is_some());
             if clone.is_none() && self.hit(r, b) {
@@ -3487,20 +3589,36 @@ impl App {
         let start_label = if clone.is_some() { "Clone" } else { "Start agent" };
         let sw = r.measure(UI, 13.0, 600, start_label) + 28.0;
         let start = Rect::new(sb.x - sw, sb.y, sw, sb.h);
+        // Where it runs, left of Start: [chat | terminal]. A clone runs as its source does.
+        let mut left = start.x - 10.0;
+        if clone.is_none() && headless::supported(agent) {
+            for (label, chat) in [("terminal", false), ("chat", true)] {
+                let lw = r.measure(UI, 12.5, 500, label) + 20.0;
+                let seg = Rect::new(left - lw, start.y + 4.0, lw, start.h - 8.0);
+                let on = chat == chat_view;
+                r.frame(seg, 0.0, if on { t.raised } else { t.dialog }, if on { t.border2 } else { t.border });
+                r.text(seg.x + 10.0, r.center(seg, UI, 12.5), label, UI, 12.5, 500, if on { t.text } else { t.text3 }, lw);
+                if !on && self.hit(r, seg) {
+                    self.actions.push(Action::PickView(chat));
+                }
+                left = seg.x + 1.0; // the two share an edge
+            }
+            left -= 11.0;
+        }
         let ready = clone.is_some() || !prompt.trim().is_empty();
         r.rect(start, 0.0, if ready { t.primary_bg } else { alpha(t.primary_bg, 0x80) });
         r.text(start.x + 14.0, r.center(start, UI, 13.0), start_label, UI, 13.0, 600, t.primary_fg, sw);
         if self.hit(r, start) {
             self.actions.push(Action::Start);
         }
-        let room = start.x - foot.x - pad - 12.0;
+        let room = left - foot.x - pad - 2.0;
         if error.is_empty() {
             // As many key hints as fit.
             let mut hx = foot.x + pad - 1.0;
             let hints: &[(&str, &str)] = if clone.is_some() {
                 &[("↵", "clone"), ("↑", "its prompts"), ("tab", "model"), ("esc", "close")]
             } else {
-                &[("↵", "start"), ("tab", "agent"), ("ctrl+tab", "model"), ("esc", "close")]
+                &[("↵", "start"), ("tab", "agent"), ("ctrl+tab", "model"), ("alt+tab", "effort"), ("ctrl+t", "chat/terminal"), ("esc", "close")]
             };
             for &(key, what) in hints {
                 let kw = r.measure(MONO, 12.0, 500, key);

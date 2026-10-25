@@ -40,6 +40,19 @@ pub fn spawn(mut cmd: Command, cols: u16, rows: u16) -> io::Result<Pty> {
     // `cmd` drops here, closing our copies of the slave so EOF reaches the master.
 }
 
+/// Full-duplex stdio over a socket pair, no terminal, for headless agents; stderr goes to `stderr`.
+/// Its own session, like `spawn`, so signals reach the whole process group.
+pub fn spawn_stdio(mut cmd: Command, stderr: std::fs::File) -> io::Result<Pty> {
+    let (parent, child) = std::os::unix::net::UnixStream::pair()?;
+    cmd.stdin(Stdio::from(OwnedFd::from(child.try_clone()?))).stdout(Stdio::from(OwnedFd::from(child))).stderr(stderr);
+    unsafe {
+        cmd.pre_exec(|| Ok(rustix::process::setsid().map(drop)?));
+    }
+    let child = cmd.spawn()?;
+    parent.set_nonblocking(true)?;
+    Ok(Pty { master: parent.into(), child })
+}
+
 pub fn resize(master: &OwnedFd, cols: u16, rows: u16) -> io::Result<()> {
     let size = Winsize { ws_col: cols, ws_row: rows, ws_xpixel: 0, ws_ypixel: 0 };
     Ok(tcsetwinsize(master, size)?)
