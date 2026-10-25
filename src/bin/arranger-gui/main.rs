@@ -207,6 +207,7 @@ enum Action {
     PickTheme(usize),
     ToggleMenu,
     ToggleVim,
+    ToggleDing,
     /// Opens the popup of every task on this machine, or closes it (None).
     MachineTasks(Option<usize>),
     /// Filters that popup to one state group (None: all).
@@ -244,6 +245,7 @@ struct App {
     theme: usize,
     /// Vim keys: a normal mode for moving and acting without the mouse.
     vim: bool,
+    ding_muted: bool,
     /// The scheme menu is open; `scheme_btn` is the title-bar button that opens it.
     menu: bool,
     scheme_btn: Rect,
@@ -377,6 +379,7 @@ fn run() -> io::Result<()> {
         pane: (80, 24),
         theme: 0,
         vim: false,
+        ding_muted: false,
         menu: false,
         scheme_btn: Rect::new(0.0, 0.0, 0.0, 0.0),
         help: false,
@@ -439,6 +442,7 @@ fn run() -> io::Result<()> {
     let settings = Settings::load();
     app.theme = theme::by_name(&settings.theme);
     app.vim = settings.vim;
+    app.ding_muted = settings.ding_muted;
     app.prompts = settings.prompts;
     app.recent = settings.recent;
     // Started inside a project (from a terminal): that's the one. Else (Finder, the Dock) ask.
@@ -463,6 +467,7 @@ fn run() -> io::Result<()> {
 struct Settings {
     theme: String,
     vim: bool,
+    ding_muted: bool,
     /// New-task prompts, oldest first, for ↑ in the dialog.
     prompts: Vec<String>,
     /// Project folders, most recent first, for the welcome screen.
@@ -1228,7 +1233,7 @@ impl App {
             t.machine = m;
         }
         if let Some(h) = self.hosts.get_mut(m).filter(|h| !h.removed) {
-            if tasks.iter().any(|task| {
+            if !self.ding_muted && tasks.iter().any(|task| {
                 h.tasks.iter().find(|old| old.id == task.id).is_some_and(|old| {
                     sound::should_ding(&old.state, &task.state)
                 })
@@ -1318,7 +1323,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        let s = Settings { theme: THEMES[self.theme].name.into(), vim: self.vim, prompts: self.prompts.clone(), recent: self.recent.clone() };
+        let s = Settings { theme: THEMES[self.theme].name.into(), vim: self.vim, ding_muted: self.ding_muted, prompts: self.prompts.clone(), recent: self.recent.clone() };
         let _ = std::fs::write(Settings::path(), serde_json::to_vec_pretty(&s).unwrap_or_default());
     }
 
@@ -2023,6 +2028,10 @@ impl App {
                     self.menu = false;
                 }
                 Action::ToggleMenu => self.menu = !self.menu,
+                Action::ToggleDing => {
+                    self.ding_muted = !self.ding_muted;
+                    self.save_settings();
+                }
                 Action::ToggleVim => {
                     self.vim = !self.vim;
                     (self.help, self.pending_g) = (false, false);
