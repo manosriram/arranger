@@ -1623,6 +1623,10 @@ impl App {
 
     /// Scrolls whatever is under the mouse by `dy` pixels (positive = towards the top).
     fn scroll_by(&mut self, dy: f32) {
+        if let Some(check) = self.review.as_mut().and_then(|r| r.check_output.as_mut()) {
+            check.scroll = (check.scroll + dy).max(0.0);
+            return;
+        }
         if self.confirm_delete.is_some() { return; }
         if let Some(d) = self.dialog.as_mut() {
             if d.prompt_bounds.is_some_and(|b| b.contains(self.mouse)) {
@@ -1919,6 +1923,10 @@ impl App {
 
     fn key(&mut self, ev: &KeyEvent) {
         let m = self.mods;
+        if let Some(rv) = self.review.as_mut().filter(|r| r.check_output.is_some()) {
+            if ev.logical_key == Key::Named(NamedKey::Escape) { rv.check_output = None; }
+            return;
+        }
         // Consume confirmation keys before shortcuts or terminal input can handle them.
         if let Some(task) = self.confirm_delete.take() {
             if !ev.repeat && !app_mod(m) && !m.control_key()
@@ -2583,7 +2591,7 @@ impl App {
 
         self.probe_changes();
         // Under an open dialog or popup nothing reacts: the views below draw without the click.
-        let modal_click = (self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || self.task_menu.is_some()).then(|| self.click.take());
+        let modal_click = (self.review.as_ref().is_some_and(|r| r.check_output.is_some()) || self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || self.task_menu.is_some()).then(|| self.click.take());
         self.draw_title(r, t, w);
         if self.welcome {
             self.draw_welcome(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H));
@@ -2625,6 +2633,7 @@ impl App {
         if self.confirm_delete.is_some() {
             self.draw_delete_confirmation(r, t, w, h);
         }
+        self.draw_check_output(r, t, w, h);
         let cursor = r.finish(self.mouse);
         self.draw_icons(r, t);
         self.hot = r.hot(self.mouse);

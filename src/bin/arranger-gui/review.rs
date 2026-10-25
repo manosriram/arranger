@@ -12,7 +12,17 @@ const HUNK_H: f32 = 36.0;
 const CARD_HEAD: f32 = 40.0;
 const NOTE_X: f32 = 110.0;
 
+pub struct CheckOutput {
+    command: String,
+    output: String,
+    ok: Option<bool>,
+    pub scroll: f32,
+    next: Instant,
+    pending: bool,
+}
+
 pub struct ReviewView {
+    pub check_output: Option<CheckOutput>,
     pub task: u64,
     /// The machine the task runs on.
     pub host: usize,
@@ -46,7 +56,7 @@ pub const FLASH: Duration = Duration::from_millis(2000);
 impl ReviewView {
     /// Something on screen moves: the button's dots while busy, or its confirmation fading.
     pub fn animating(&self) -> bool {
-        self.busy || self.flash.as_ref().is_some_and(|f| f.1.elapsed() < FLASH)
+        self.check_output.is_some() || self.busy || self.flash.as_ref().is_some_and(|f| f.1.elapsed() < FLASH)
     }
 }
 
@@ -63,6 +73,7 @@ pub enum ReviewAction {
     Close,
     Run,
     Refresh,
+    Check(String, Option<bool>),
     File(usize),
     Split(bool),
     Revert(String, String),
@@ -85,6 +96,7 @@ pub enum ReviewAction {
 
 pub enum Tag {
     Review(u64),
+    CheckOutput(u64, String),
     /// A background diff for the Review tab's enabled state.
     Changes(crate::TaskKey),
     Revert,
@@ -214,6 +226,7 @@ impl App {
         }
         let message = title(task);
         self.review = Some(ReviewView {
+            check_output: None,
             task: task.id,
             host: task.machine,
             data: None,
@@ -284,6 +297,30 @@ impl App {
         };
         let mut refresh = false;
         match (tag, reply) {
+            (Tag::CheckOutput(id, command), reply) if id == rv.task => {
+                if let Some(check) = rv.check_output.as_mut().filter(|c| c.command == command) {
+                    check.pending = false;
+                    check.next = Instant::now() + Duration::from_millis(300);
+                    match reply {
+                        Ok(Reply::Chat { items, .. }) => {
+                            if let Some((output, ok)) = items.into_iter().rev().find_map(|item| match item {
+                                proto::ChatItem::Tool { target, output, ok, .. } if target == command => Some((output, ok)),
+                                _ => None,
+                            }) {
+                                check.output = output;
+                                check.ok = ok;
+                            } else {
+                                check.output = "No output captured for this check.".into();
+                            }
+                        }
+                        Ok(Reply::Error(e)) | Err(e) => {
+                            check.output = format!("Output unavailable: {e}");
+                            check.next = Instant::now() + Duration::from_secs(60);
+                        }
+                        _ => {}
+                    }
+                }
+            }
             (Tag::Review(id), Ok(Reply::Review(data))) if id == rv.task => {
                 rv.file = rv.file.min(data.files.len().saturating_sub(1));
                 rv.data = Some(data);
@@ -359,6 +396,9 @@ impl App {
             ReviewAction::Close => {
                 self.review = None;
                 self.focus = rest;
+            }
+            ReviewAction::Check(command, ok) => {
+                rv.check_output = Some(CheckOutput { command, ok, output: String::new(), scroll: 0.0, next: Instant::now(), pending: false });
             }
             ReviewAction::Refresh => self.spawn_request(host, Tag::Review(id), Request::Review { id }),
             ReviewAction::File(i) => {
@@ -609,6 +649,7 @@ impl App {
                 let lw = r.measure(MONO, 12.0, 400, label);
                 r.text(row.x + 21.0, r.center(row, MONO, 12.0), cmd, MONO, 12.0, 400, t.tc, row.w - 30.0 - lw);
                 r.text(row.x + row.w - lw, r.center(row, MONO, 12.0), label, MONO, 12.0, 400, if ok.is_none() { t.needs } else { t.text3 }, lw + 2.0);
+                if self.hit(r, row) { acts.push(ReviewAction::Check(cmd.clone(), *ok)); }
                 y += 28.0;
             }
         }
@@ -702,6 +743,42 @@ impl App {
             rv.ship_menu = menu;
         }
         self.actions.extend(acts.into_iter().map(Action::Review));
+    }
+
+    pub fn draw_check_output(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
+        let Some(rv) = self.review.as_mut() else { return };
+        let Some(check) = rv.check_output.as_mut() else { return };
+        let request = if !check.pending && Instant::now() >= check.next {
+            check.pending = true;
+            Some((rv.host, rv.task, check.command.clone()))
+        } else { None };
+        r.rect(Rect::new(0.0, TITLE_H, w, h - TITLE_H), 0.0, [0, 0, 0, 160]);
+        let panel = Rect::new(32.0, TITLE_H + 24.0, (w - 64.0).max(1.0), (h - TITLE_H - 64.0).max(100.0));
+        r.frame(panel, 8.0, t.dialog, t.border);
+        r.text(panel.x + 16.0, panel.y + 16.0, &check.command, MONO, 13.0, 600, t.text, panel.w - 120.0);
+        let close = Rect::new(panel.x + panel.w - 80.0, panel.y + 8.0, 68.0, 32.0);
+        r.text(close.x, close.y + 8.0, "Close ✕", UI, 12.0, 400, t.text2, close.w);
+        let label = match check.ok { None => "Running • live output", Some(true) => "Passed", Some(false) => "Failed" };
+        r.text(panel.x + 16.0, panel.y + 40.0, label, UI, 12.0, 400, t.text3, panel.w - 32.0);
+        let body = Rect::new(panel.x + 16.0, panel.y + 70.0, panel.w - 32.0, panel.h - 86.0);
+        let output = if check.output.is_empty() { "Waiting for output…" } else { &check.output };
+        let lines: Vec<_> = output.lines().flat_map(|line| wrap(r, line, MONO, 12.0, body.w)).collect();
+        let max = (lines.len() as f32 * 18.0 - body.h).max(0.0);
+        check.scroll = check.scroll.min(max);
+        r.set_clip(Some(body));
+        for (i, line) in lines.iter().enumerate() {
+            let y = body.y + i as f32 * 18.0 - (max - check.scroll);
+            if y + 18.0 >= body.y && y < body.y + body.h {
+                r.text(body.x, y, line, MONO, 12.0, 400, t.text, body.w);
+            }
+        }
+        r.set_clip(None);
+        r.target(close, Cursor::Pointer);
+        let dismiss = self.click.take().is_some_and(|p| close.contains(p) || !panel.contains(p));
+        if dismiss { self.review.as_mut().unwrap().check_output = None; }
+        if let Some((host, id, command)) = request {
+            self.spawn_request(host, Tag::CheckOutput(id, command), Request::ChatPage { id, end: usize::MAX, limit: usize::MAX });
+        }
     }
 
     /// Draws one file's card; returns how far it can scroll.

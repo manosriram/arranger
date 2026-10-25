@@ -287,10 +287,14 @@ fn layout(r: &Renderer, item: &ChatItem, w: f32, open: bool) -> Laid {
             let more = !diff.is_empty() || !output.trim().is_empty();
             let mw = r.measure(UI, 11.5, 400, &meta);
             let target = if target.is_empty() { name.as_str() } else { target.as_str() };
+            // A long tool name (an MCP tool's) pushes the target over, up to a third of the line.
+            let verb = tool_verb(*kind, name);
+            let vw = r.measure(UI, 12.5, 500, &verb).min(w / 3.0);
+            let tx = (20.0 + vw + 10.0).max(96.0);
             let mut head = vec![
                 one(0.0, mark, UI, 12.5, 600, mark_ink, 14.0),
-                one(20.0, &tool_verb(*kind, name), UI, 12.5, 500, Ink::Kind(*kind), 70.0),
-                one(96.0, target, MONO, 12.5, 400, Ink::Text, (w - 96.0 - mw - 40.0).max(40.0)),
+                one(20.0, &verb, UI, 12.5, 500, Ink::Kind(*kind), vw + 1.0),
+                one(tx, target, MONO, 12.5, 400, Ink::Text, (w - tx - mw - 40.0).max(40.0)),
                 one(w - mw - 22.0, &meta, UI, 11.5, 400, Ink::Dim, mw + 1.0),
             ];
             if more {
@@ -620,33 +624,46 @@ impl App {
             _ => return bottom,
         };
         let question = matches!(task.need, Some(Event::Question { .. }));
-        let lines = wrap(r, &text, UI, 12.5, w - 120.0);
-        let h = (20.0 + lines.len() as f32 * 19.0).max(42.0) + if question { 40.0 } else { 0.0 };
+        // The text runs from 90 to the card's right edge, or to the Deny button (at w - 180).
+        let text_w = if question { w - 104.0 } else { w - 280.0 }.max(80.0);
+        let lines = wrap(r, &text, UI, 12.5, text_w);
+        // A question's options as buttons, as many rows as they take, the hint after the last.
+        let hint = "or type an answer below";
+        let hint_w = r.measure(UI, 11.5, 400, hint) + 4.0;
+        let (left, right) = (90.0, w - 14.0);
+        let mut buttons = Vec::new();
+        let (mut bx, mut row) = (left, 0);
+        for o in &options {
+            let bw = (r.measure(MONO, 12.0, 400, o) + 24.0).min(right - left);
+            if bx + bw > right && bx > left {
+                (bx, row) = (left, row + 1);
+            }
+            buttons.push((bx, row, bw, o));
+            bx += bw + 8.0;
+        }
+        let hint_at = if bx + hint_w > right && bx > left { (left, row + 1) } else { (bx, row) };
+        let rows = hint_at.1 + 1;
+        let h = (20.0 + lines.len() as f32 * 19.0).max(42.0) + if question { rows as f32 * 34.0 + 6.0 } else { 0.0 };
         let card = Rect::new(x, bottom - h - 12.0, w, h);
         r.frame(card, 0.0, t.needs_bg, t.needs_line);
         r.text(card.x + 14.0, card.y + 10.0, label, UI, 12.0, 600, t.needs, 80.0);
         for (i, line) in lines.iter().enumerate() {
-            r.text(card.x + 90.0, card.y + 10.0 + i as f32 * 19.0, line, UI, 12.5, 400, t.text, w - 220.0);
+            r.text(card.x + 90.0, card.y + 10.0 + i as f32 * 19.0, line, UI, 12.5, 400, t.text, text_w);
         }
         if question {
-            // Its options as buttons; anything else is typed in the message box.
-            let mut bx = card.x + 90.0;
-            let by = card.y + h - 36.0;
-            for o in &options {
-                let bw = r.measure(MONO, 12.0, 400, o) + 24.0;
-                if bx + bw > card.x + w - 14.0 {
-                    break;
-                }
-                let b = Rect::new(bx, by, bw, 26.0);
+            // Anything not among the options is typed in the message box.
+            let row_y = |row: usize| card.y + h - rows as f32 * 34.0 - 2.0 + row as f32 * 34.0;
+            for (bx, row, bw, o) in buttons {
+                let b = Rect::new(card.x + bx, row_y(row), bw, 26.0);
                 r.frame(b, 0.0, t.bg, t.border2);
-                r.text(b.x + 12.0, r.center(b, MONO, 12.0), o, MONO, 12.0, 400, t.text, bw);
+                r.text(b.x + 12.0, r.center(b, MONO, 12.0), o, MONO, 12.0, 400, t.text, bw - 24.0);
                 if self.hit(r, b) {
                     self.send_chat(Some(o.clone()));
                 }
-                bx += bw + 8.0;
             }
-            let hint = "or type an answer below";
-            r.text(bx + 4.0, r.center(Rect::new(0.0, by, 0.0, 26.0), UI, 11.5), hint, UI, 11.5, 400, t.text3, (card.x + w - bx - 8.0).max(0.0));
+            let (hx, hrow) = hint_at;
+            let hx = card.x + hx + if hx > left { 4.0 } else { 0.0 };
+            r.text(hx, r.center(Rect::new(0.0, row_y(hrow), 0.0, 26.0), UI, 11.5), hint, UI, 11.5, 400, t.text3, (card.x + right - hx).max(0.0));
         } else {
             let allow = Rect::new(card.x + w - 110.0, card.y + 8.0, 98.0, 26.0);
             let deny = Rect::new(allow.x - 70.0, allow.y, 62.0, 26.0);
