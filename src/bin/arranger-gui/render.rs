@@ -11,10 +11,10 @@ use swash::{FontRef, NormalizedCoord};
 
 pub const UI: usize = 0;
 pub const MONO: usize = 1;
-/// IBM Plex Mono (variable weight) for everything: the UI and the terminal share one face.
-const PLEX: &[u8] = include_bytes!("../../../assets/fonts/IBMPlexMono.ttf");
-const BUNDLED: [&[u8]; 2] = [PLEX, PLEX];
-/// System fonts tried, in order, for glyphs Plex lacks (❯ ⏺ ⎿ ✳ …). Missing files are skipped.
+/// JetBrains Mono (variable weight) for everything: the UI and the terminal share one face.
+const JETBRAINS: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono.ttf");
+const BUNDLED: [&[u8]; 2] = [JETBRAINS, JETBRAINS];
+/// System fonts tried, in order, for glyphs JetBrains Mono lacks (❯ ⏺ ⎿ ✳ …). Missing files are skipped.
 const FALLBACKS: &[&str] = &[
     "/System/Library/Fonts/Menlo.ttc",
     "/System/Library/Fonts/Apple Symbols.ttf",
@@ -141,7 +141,7 @@ pub struct Renderer {
     layer: Option<(glow::Framebuffer, glow::Texture, (u32, u32))>,
 }
 
-/// Added to every requested weight: Plex Mono reads thin on screen at its nominal weights.
+/// Added to every requested weight: the mono face reads thin on screen at its nominal weights.
 const WEIGHT_BOOST: f32 = 50.0;
 
 fn coords(font: &FontRef, weight: u16) -> Vec<NormalizedCoord> {

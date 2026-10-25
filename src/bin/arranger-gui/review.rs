@@ -141,7 +141,7 @@ pub fn plain(line: &str) -> String {
     spans(line).into_iter().map(|s| s.0).collect()
 }
 
-/// Line height of the summary's prose: roomy enough to read at a glance in Plex Mono.
+/// Line height of the summary's prose: roomy enough to read at a glance in JetBrains Mono.
 const SUMMARY_LINE_H: f32 = 22.0;
 
 /// Draws an agent's markdown (headings, bullets, code blocks, bold and `code` runs) wrapped to `w`
