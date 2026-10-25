@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "arranger"
-version = "0.1.25"
+version = "0.1.27"
 dependencies = [
  "alacritty_terminal",
  "gix",
