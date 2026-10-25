@@ -20,7 +20,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const LISTENER: Token = Token(0);
@@ -243,6 +243,38 @@ fn git(cmd: &mut Command) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Copies the uncommitted edits in worktree `from`, tracked and untracked, into worktree `to`,
+/// checked out at the same commit.
+fn carry_changes(from: &Path, to: &Path) -> Result<(), String> {
+    let diff = git_in(from).args(["diff", "--binary", "HEAD"]).output().map_err(|e| format!("git: {e}"))?;
+    if !diff.status.success() {
+        return Err(String::from_utf8_lossy(&diff.stderr).trim().to_string());
+    }
+    if !diff.stdout.is_empty() {
+        let mut apply = git_in(to)
+            .args(["apply", "--whitespace=nowarn", "-"])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("git: {e}"))?;
+        let wrote = apply.stdin.take().unwrap().write_all(&diff.stdout);
+        let out = apply.wait_with_output().map_err(|e| format!("git: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("can't carry over uncommitted edits: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        wrote.map_err(|e| format!("git: {e}"))?;
+    }
+    let untracked = git(git_in(from).args(["ls-files", "--others", "--exclude-standard", "-z"]))?;
+    for path in untracked.split('\0').filter(|p| !p.is_empty()) {
+        let dst = to.join(path);
+        if let Some(dir) = dst.parent() {
+            fs::create_dir_all(dir).map_err(e2s)?;
+        }
+        fs::copy(from.join(path), &dst).map_err(|e| format!("{path}: {e}"))?;
+    }
+    Ok(())
+}
+
 fn git_in(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir);
@@ -420,6 +452,10 @@ impl Daemon {
             },
             Request::Revive { id, prompt } => match self.revive(id, &prompt) {
                 Ok(()) => Reply::Ok,
+                Err(e) => Reply::Error(e),
+            },
+            Request::Clone { id } => match self.clone_task(id) {
+                Ok(id) => Reply::Created { id, state: self.state(id) },
                 Err(e) => Reply::Error(e),
             },
             Request::AbortMerge { id } => match self.task_paths(id).and_then(|(wt, _)| git(git_in(Path::new(&wt)).args(["merge", "--abort"]))) {
@@ -932,7 +968,7 @@ impl Daemon {
     }
 
     fn start(&mut self, id: u64) -> Result<(), String> {
-        self.spawn(id, None)
+        self.spawn(id, None, false)
     }
 
     /// Brings an ended task's agent back in its worktree, resuming its last session.
@@ -945,11 +981,65 @@ impl Daemon {
             return Err(format!("task {id} is {state}, not ended"));
         }
         self.task_paths(id)?; // its worktree must still be there
-        self.spawn(id, Some(prompt))
+        self.spawn(id, Some(prompt), false)
+    }
+
+    /// A new task on its own worktree and branch, made from task `src`'s HEAD plus its
+    /// uncommitted edits, whose agent carries on from a copy of `src`'s session.
+    fn clone_task(&mut self, src: u64) -> Result<u64, String> {
+        let row: Option<(String, String, String, String, String, String, String, String, String)> = self
+            .db
+            .query_row(
+                "SELECT agent, repo, worktree, base, base_commit, reviewed, title, prompt, model FROM tasks WHERE id = ?1",
+                [src],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+            )
+            .optional()
+            .map_err(e2s)?;
+        let (agent, repo, from, base, base_commit, reviewed, title, prompt, model) = row.ok_or(format!("no task {src}"))?;
+        let from = PathBuf::from(from);
+        if !from.exists() {
+            return Err(format!("task {src} has no worktree"));
+        }
+        let head = review::resolve(&from, "HEAD")?;
+        self.db
+            .execute(
+                "INSERT INTO tasks (agent, repo, branch, worktree, state, created, title, prompt, model)
+                 VALUES (?1, ?2, '', '', 'new', ?3, ?4, ?5, ?6)",
+                params![agent, repo, now_secs(), title, prompt, model],
+            )
+            .map_err(e2s)?;
+        let id = self.db.last_insert_rowid() as u64;
+        let branch = format!("arranger/{id}");
+        let repo_name = Path::new(&repo).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let wt = self.data.join("worktrees").join(repo_name).join(id.to_string());
+        let made = git(git_in(Path::new(&repo)).args(["worktree", "add", "-b", &branch]).arg(&wt).arg(&head)).and_then(|_| {
+            carry_changes(&from, &wt)?;
+            adapter::copy_session(&agent, &self.data, (src, &from), (id, &wt)).map_err(|e| format!("can't clone task {src}'s session: {e}"))
+        });
+        if let Err(e) = made {
+            if wt.exists() {
+                let _ = git(git_in(Path::new(&repo)).args(["worktree", "remove", "--force"]).arg(&wt));
+                let _ = git(git_in(Path::new(&repo)).args(["branch", "-D", &branch]));
+            }
+            let _ = self.db.execute("DELETE FROM tasks WHERE id = ?1", [id]);
+            return Err(e);
+        }
+        self.db
+            .execute(
+                "UPDATE tasks SET branch = ?1, worktree = ?2, state = 'exited', base = ?3, base_commit = ?4, reviewed = ?5 WHERE id = ?6",
+                params![branch, wt.to_string_lossy(), base, base_commit, reviewed, id],
+            )
+            .map_err(e2s)?;
+        self.dirty = true;
+        // Left ended if it can't start: Revive tries again.
+        self.spawn(id, Some(""), true)?;
+        Ok(id)
     }
 
     /// Launches task `id`'s agent: its first prompt, or with `resume` its last session plus that prompt.
-    fn spawn(&mut self, id: u64, resume: Option<&str>) -> Result<(), String> {
+    /// `fork` carries on in a new session of its own (a cloned task's first start).
+    fn spawn(&mut self, id: u64, resume: Option<&str>, fork: bool) -> Result<(), String> {
         let (agent, repo, wt, prompt, model): (String, String, String, String, String) = self
             .db
             .query_row("SELECT agent, repo, worktree, prompt, model FROM tasks WHERE id = ?1", [id], |r| {
@@ -958,7 +1048,7 @@ impl Daemon {
             .map_err(e2s)?;
         let prompt = resume.unwrap_or(&prompt);
         let session = resume.map(|_| fs::read_to_string(adapter::codex_session(&self.data, id)).unwrap_or_default());
-        let (argv, env) = adapter::launch(&agent, prompt, &model, session.as_deref(), &self.exe, &self.data).map_err(e2s)?;
+        let (argv, env) = adapter::launch(&agent, prompt, &model, session.as_deref(), fork, &self.exe, &self.data).map_err(e2s)?;
         let mut cmd = if Path::new(&wt).join(".arranger/setup").exists() {
             let mut sh = Command::new("sh");
             sh.args(["-c", "./.arranger/setup && exec \"$0\" \"$@\""]).args(&argv);

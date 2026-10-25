@@ -18,6 +18,7 @@
   "act": {
     "o / ↵": "Type into the agent's terminal (insert mode); from Overview, open it",
     "r": "Review the diff",
+    "c": "Clone the task onto a new worktree: same chat, same edits",
     "n": "New task",
     "m": "Add machine (Workspace)"
   },

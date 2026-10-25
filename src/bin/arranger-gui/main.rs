@@ -231,6 +231,8 @@ enum Action {
     Revive(TaskKey, String),
     /// Stop the task's agent and remove it: its worktree, log and history.
     Delete(TaskKey),
+    /// A new task on its own worktree, carrying on from this one's chat and edits.
+    Clone(TaskKey),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -262,6 +264,8 @@ struct App {
     pending_g: bool,
     /// `d` was pressed on this task and waits for `y` (delete it) or `n`.
     confirm_delete: Option<TaskKey>,
+    /// `c` was pressed on this task: the clone popup is up, with why the last try failed.
+    cloning: Option<(TaskKey, String)>,
     /// When Esc was last pressed in vim mode: a second one forwards both to the agent.
     last_esc: Option<Instant>,
     /// The selected agent's ask (task, its `since`) that switched vim keys to normal mode, where
@@ -393,6 +397,7 @@ fn run() -> io::Result<()> {
         scheme_btn: Rect::new(0.0, 0.0, 0.0, 0.0),
         help: false,
         confirm_delete: None,
+        cloning: None,
         pending_g: false,
         last_esc: None,
         answering: None,
@@ -1400,6 +1405,15 @@ impl App {
             _ => return,
         };
         let g = std::mem::take(&mut self.pending_g);
+        // The clone popup is up: ↵ or `y` clones, Esc or `n` closes it.
+        if let Some((task, _)) = self.cloning {
+            match key.as_str() {
+                "o" | "y" => self.actions.push(Action::Clone(task)),
+                "esc" | "n" => (self.cloning, self.last_esc) = (None, None), // a quick second Esc isn't for the agent
+                _ => {}
+            }
+            return;
+        }
         // The agent's menu is up: j/k move through it and ↵ picks, back in its terminal; Esc or i
         // leave it be.
         if self.answering.is_some() && self.machine_tasks.is_none() && self.review.is_none() {
@@ -1447,6 +1461,9 @@ impl App {
             "o" if self.machine_tasks.is_some() => self.open_from_popup(),
             "o" if self.review.is_none() && self.current().is_some() => self.actions.push(Action::Focus(Focus::Term)),
             "d" if self.review.is_none() && self.machine_tasks.is_none() => self.confirm_delete = self.current().map(|t| (t.machine, t.id)),
+            "c" if self.review.is_none() && self.machine_tasks.is_none() => {
+                self.cloning = self.current().filter(|t| t.state != "queued" && !t.worktree.is_empty()).map(|t| ((t.machine, t.id), String::new()));
+            }
             "r" => self.actions.push(Action::OpenReview),
             "n" => self.actions.push(Action::NewTask),
             "m" if self.review.is_none() && self.machine_tasks.is_none() => self.actions.push(Action::OpenAddHost),
@@ -1460,7 +1477,7 @@ impl App {
 
     /// The sidebar's or review rail's divider under `p`, which a press starts dragging.
     fn divider_at(&self, p: (f32, f32)) -> Option<Divider> {
-        if self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || p.1 < TITLE_H {
+        if self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.cloning.is_some() || p.1 < TITLE_H {
             return None;
         }
         match &self.review {
@@ -2053,7 +2070,7 @@ impl App {
                     (self.answering, self.answered) = (None, self.ask());
                 }
                 Action::Focus(f) => {
-                    self.confirm_delete = None;
+                    (self.confirm_delete, self.cloning) = (None, None);
                     if self.focus != f {
                         self.anchor = None;
                     }
@@ -2114,6 +2131,23 @@ impl App {
                         }
                         Ok(r) => self.revive_error = Some((key, format!("unexpected reply: {r:?}"))),
                         Err(e) => self.revive_error = Some((key, e.to_string())),
+                    }
+                }
+                Action::Clone(key @ (m, id)) => {
+                    let sock = self.sock(m);
+                    match request_at(sock.as_deref(), &Request::Clone { id }) {
+                        Ok(Reply::Created { id, .. }) => {
+                            self.cloning = None;
+                            // As for a new task: the watch push may not have it yet.
+                            if let Ok(Reply::Tasks(tasks)) = request_at(sock.as_deref(), &Request::List { files: false }) {
+                                self.user_event_tasks(m, tasks);
+                            }
+                            self.selected = Some((m, id));
+                            self.focus = self.rest();
+                            self.sync_session();
+                        }
+                        Ok(r) => self.cloning = Some((key, format!("unexpected reply: {r:?}"))),
+                        Err(e) => self.cloning = Some((key, e.to_string())),
                     }
                 }
                 Action::Delete(key @ (m, id)) => {
@@ -2279,7 +2313,7 @@ impl App {
         }
         self.stale.set(false);
         self.icons.borrow_mut().clear();
-        self.layered = !(self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || (self.help && self.vim) || self.menu);
+        self.layered = !(self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.cloning.is_some() || (self.help && self.vim) || self.menu);
         let dpi = gfx.window.scale_factor() as f32 * self.zoom;
         let (w, h) = (size.width as f32 / dpi, size.height as f32 / dpi);
         let r = &mut gfx.r;
@@ -2287,7 +2321,7 @@ impl App {
 
         self.probe_changes();
         // Under an open dialog or popup nothing reacts: the views below draw without the click.
-        let modal_click = (self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some()).then(|| self.click.take());
+        let modal_click = (self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.cloning.is_some()).then(|| self.click.take());
         self.draw_title(r, t, w);
         if self.welcome {
             self.draw_welcome(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H));
@@ -2315,6 +2349,9 @@ impl App {
         }
         if self.add_host.is_some() {
             self.draw_add_host(r, t, w, h);
+        }
+        if self.cloning.is_some() {
+            self.draw_clone(r, t, w, h);
         }
         if self.help && self.vim {
             self.draw_help(r, t, w, h);
@@ -2942,6 +2979,49 @@ impl App {
             self.field_text(r, t, b.x + 10.0, y, value, font, 12.5, b.w - 20.0, (focus, 0), focused, self.caret_for(focus, value), t.work);
         }
         self.hit_as(r, b, Cursor::Text)
+    }
+
+    /// The popup `c` opens: clone the task onto a new worktree, its chat and edits carried over.
+    fn draw_clone(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
+        let Some((key, error)) = self.cloning.clone() else { return };
+        let Some(task) = self.task(key) else {
+            self.cloning = None;
+            return;
+        };
+        let (name, agent, branch) = (title(task), adapter::kind(&task.agent).to_string(), task.branch.clone());
+        r.rect(Rect::new(0.0, 0.0, w, h), 0.0, t.scrim);
+        r.target(Rect::new(0.0, 0.0, w, h), Cursor::Arrow);
+        let dw = (w - 32.0).min(480.0);
+        let dlg = Rect::new((w - dw) / 2.0, 140.0, dw, 196.0);
+        r.frame(dlg, 8.0, t.dialog, t.border2);
+        r.rect(Rect::new(dlg.x + 1.0, dlg.y + 1.0, dlg.w - 2.0, 2.0), 1.0, t.work);
+        let x = dlg.x + 18.0;
+        let fw = dlg.w - 36.0;
+        r.text(x, dlg.y + 16.0, "CLONE TASK", UI, 11.0, 500, t.text3, 200.0);
+        let esc = Rect::new(dlg.x + dlg.w - 48.0, dlg.y + 14.0, 30.0, 16.0);
+        r.frame(esc, 3.0, t.dialog, t.border2);
+        r.text(esc.x + 6.0, r.center(esc, MONO, 10.0), "Esc", MONO, 10.0, 400, t.text3, 30.0);
+        r.text(x, dlg.y + 46.0, &name, UI, 14.0, 500, t.text, fw);
+        r.text(x, dlg.y + 70.0, &format!("{agent} · {branch}"), MONO, 11.5, 400, t.text3, fw);
+        let (note, color) = if error.is_empty() {
+            (format!("A new task on its own worktree and branch, with {agent}'s chat and every edit so far (uncommitted too)."), t.text2)
+        } else {
+            (format!("Couldn't clone: {error}"), t.del)
+        };
+        r.text(x, dlg.y + 96.0, &note, UI, 12.0, 400, color, fw);
+
+        let foot = Rect::new(dlg.x + 1.0, dlg.y + dlg.h - 58.0, dlg.w - 2.0, 57.0);
+        r.rect(Rect::new(foot.x, foot.y, foot.w, 1.0), 0.0, t.border);
+        let label = "Clone ↵";
+        let bw = r.measure(UI, 13.0, 500, label) + 32.0;
+        let clone = Rect::new(foot.x + foot.w - 14.0 - bw, foot.y + 12.0, bw, 34.0);
+        r.rect(clone, 4.0, t.work);
+        r.text(clone.x + 16.0, r.center(clone, UI, 13.0), label, UI, 13.0, 500, t.on_accent, bw);
+        if self.hit(r, clone) {
+            self.actions.push(Action::Clone(key));
+        } else if self.hit(r, esc) {
+            self.cloning = None;
+        }
     }
 
     fn draw_add_host(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {

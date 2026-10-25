@@ -1,5 +1,5 @@
 //! End to end through a real daemon: start a fake agent on its own worktree, answer its
-//! permission ask, review and merge its work, then revive it.
+//! permission ask, review and merge its work, then revive it; clone another onto a new worktree.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,20 +10,25 @@ struct Home(PathBuf);
 
 impl Home {
     fn arranger(&self, dir: &Path, args: &[&str]) -> (bool, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_arranger")).current_dir(dir).env("ARRANGER_HOME", &self.0).args(args).output().unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_arranger")).current_dir(dir).env("ARRANGER_HOME", &self.0)
+            .env("CLAUDE_CONFIG_DIR", self.0.join("claude")).args(args).output().unwrap();
         (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr))
     }
 
     /// `arranger ls`'s state column for task 1, once it is one of `want`.
     fn wait_state(&self, dir: &Path, want: &[&str]) -> String {
+        self.wait_task(dir, 1, want)
+    }
+
+    fn wait_task(&self, dir: &Path, id: u64, want: &[&str]) -> String {
         let start = Instant::now();
         loop {
             let (_, ls) = self.arranger(dir, &["ls"]);
-            let state = ls.lines().find(|l| l.starts_with("1 ")).and_then(|l| l.split_whitespace().nth(1)).unwrap_or("").to_string();
+            let state = ls.lines().find(|l| l.starts_with(&format!("{id} "))).and_then(|l| l.split_whitespace().nth(1)).unwrap_or("").to_string();
             if want.contains(&state.as_str()) {
                 return state;
             }
-            assert!(start.elapsed() < Duration::from_secs(15), "task 1 never got to {want:?}:\n{ls}");
+            assert!(start.elapsed() < Duration::from_secs(15), "task {id} never got to {want:?}:\n{ls}");
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -165,4 +170,51 @@ fn task_lifecycle() {
     assert!(home.arranger(&repo, &["deny", "1", "not now"]).0);
     home.wait_state(&repo, &["done", "exited"]);
     assert!(std::fs::read_to_string(home.0.join("decision")).unwrap().contains("not now"));
+}
+
+// A claude stand-in: the first run edits a tracked file, adds an untracked one and saves a
+// session where claude would; every run records its args.
+const CLAUDE: &str = r#"#!/bin/sh
+echo "$*" >> "$ARRANGER_HOME/args-$ARRANGER_TASK"
+[ -f hello.txt ] && exit 0
+echo hello > hello.txt
+echo changed >> README
+d="$CLAUDE_CONFIG_DIR/projects/$(pwd -P | sed 's/[^a-zA-Z0-9]/-/g')"
+mkdir -p "$d" && echo '{}' > "$d/s$ARRANGER_TASK.jsonl"
+"#;
+
+#[test]
+fn clone_task() {
+    let home = Home(std::env::temp_dir().join(format!("arranger-clone-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&home.0);
+    let repo = home.0.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README"), "hi\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    let bin = home.0.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let claude = bin.join("claude");
+    std::fs::write(&claude, CLAUDE).unwrap();
+    std::fs::set_permissions(&claude, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    assert!(home.arranger(&repo, &["new", claude.to_str().unwrap(), "go"]).0);
+    home.wait_state(&repo, &["exited"]);
+    let (ok, out) = home.arranger(&repo, &["clone", "1"]);
+    assert!(ok, "{out}");
+    assert_eq!(out.split_whitespace().next(), Some("2"));
+    home.wait_task(&repo, 2, &["exited"]);
+
+    // Its own branch, with task 1's edits, committed or not, and a fork of its session.
+    let (ok, out) = home.arranger(&repo, &["run", "2", "sh", "-c", "cat hello.txt README; git branch --show-current"]);
+    assert!(ok, "{out}");
+    assert_eq!(out, "hello\nhi\nchanged\narranger/2\n");
+    let args = std::fs::read_to_string(home.0.join("args-2")).unwrap();
+    assert!(args.contains("--continue --fork-session"), "{args}");
+    let wt = std::fs::canonicalize(home.0.join("worktrees/repo/2")).unwrap();
+    let name: String = wt.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    assert!(home.0.join("claude/projects").join(name).join("s1.jsonl").exists());
+    assert_eq!(std::fs::read_to_string(repo.join("README")).unwrap(), "hi\n"); // task 1 is untouched
+    assert!(!home.arranger(&repo, &["clone", "999999"]).0);
 }

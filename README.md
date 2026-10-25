@@ -57,6 +57,8 @@ The **Terminal** tab is a shell in the selected task's worktree, for running the
 
 If merging hits a conflict, `main` is left alone: the conflict lands in the agent's worktree, and Review offers to have the agent resolve it (or take one side) before merging again.
 
+With Vim keys on, `c` clones the selected task: a new task on its own worktree and branch, made from the task's current state (uncommitted edits too), whose agent carries on from a fork of the same chat. Cloning works for Claude Code and Codex.
+
 An agent that has ended can be revived: it resumes its last session in the same worktree, with a new prompt if you give one (also how Review hands a conflict to an agent that has already exited).
 
 Agents waiting on a permission show it as a card at the top of the sidebar, with Allow once and Deny right there. **See all** on a machine's header opens every task on it, ended ones too, grouped by state with one action per row: Approve, Answer, Review, Open or Revive.
@@ -76,6 +78,7 @@ arranger run 3 cargo test                  # test directly in its worktree
 arranger diff 3                            # changes since its base or your last commit
 arranger send 3 "also update the docs"     # type into it
 arranger revive 3 "carry on"               # resume an ended agent
+arranger clone 3                           # its chat and edits, on a new worktree
 arranger commit 3 --merge                  # commit, merge into its base branch
 arranger commit 3 --pr                     # or: commit, push, open a PR
 arranger stop                              # stop the daemon and its agents

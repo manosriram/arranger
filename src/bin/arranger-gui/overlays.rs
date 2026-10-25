@@ -274,11 +274,11 @@ impl App {
     pub fn draw_help(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
         const SECTIONS: [(&str, &[(&str, &str)]); 3] = [
             ("MOVE", &[("j / k", "next / prev agent"), ("gg  G", "first / last"), ("J / K", "next / prev needing you"), ("h / l", "prev / next view"), ("/", "filter agents")]),
-            ("ACT", &[("o  ↵", "type into agent"), ("j / k", "its menu, when it asks"), ("↵", "pick from the menu"), ("r", "review diff"), ("d", "delete task"), ("n", "new task"), ("m", "add machine")]),
+            ("ACT", &[("o  ↵", "type into agent"), ("j / k", "its menu, when it asks"), ("↵", "pick from the menu"), ("r", "review diff"), ("d", "delete task"), ("c", "clone task"), ("n", "new task"), ("m", "add machine")]),
             ("MODE", &[("i", "type into agent"), ("esc", "normal mode"), ("esc esc", "stop the agent"), ("?", "this sheet")]),
         ];
         let sw = 720.0_f32.min(w - 24.0);
-        let sheet = Rect::new(w - 12.0 - sw, h - STATUS_H - 8.0 - 234.0, sw, 234.0);
+        let sheet = Rect::new(w - 12.0 - sw, h - STATUS_H - 8.0 - 257.0, sw, 257.0);
         r.rect(Rect::new(sheet.x - 1.0, sheet.y + 4.0, sheet.w + 2.0, sheet.h + 2.0), 8.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
         r.frame(sheet, 6.0, t.bg, t.border2);
         r.target(sheet, Cursor::Arrow);

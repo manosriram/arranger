@@ -9,7 +9,7 @@ use std::path::PathBuf;
 const MAX_FRAME: usize = 64 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 12;
+pub const VERSION: u32 = 13;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -54,6 +54,9 @@ pub enum Request {
     TakeSide { id: u64, ours: bool },
     /// Repository paths for the new-task prompt’s @ picker.
     Paths { repo: PathBuf },
+    /// A new task on its own worktree, made from task `id`'s current state (uncommitted edits
+    /// too), whose agent carries on from a copy of `id`'s session. Replied to with Created.
+    Clone { id: u64 },
 }
 
 /// What happens after the commit.

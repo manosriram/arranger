@@ -8,7 +8,7 @@ use crate::proto::{Event, ToolKind};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{self, BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const PI_EXTENSION: &str = include_str!("adapters/pi.ts");
 /// Permission asks wait for a human; the hook is killed after this many seconds.
@@ -32,14 +32,18 @@ pub const PARENT_SESSION_ENV: &[&str] = &[
 /// ("" leaves the agent's default; claude, codex, gemini and pi all take `--model`).
 /// `resume` picks up the agent's last session in this directory (a revived task) instead of a new one;
 /// for codex it carries the task's session id ("" starts a new one), since its `--last` also
-/// matches sessions from the main checkout and sibling worktrees.
-pub fn launch(agent: &str, prompt: &str, model: &str, resume: Option<&str>, exe: &Path, data: &Path) -> io::Result<(Vec<String>, Vec<(String, String)>)> {
+/// matches sessions from the main checkout and sibling worktrees. `fork` resumes into a new
+/// session of its own (a cloned task), leaving the one it came from as it was.
+pub fn launch(agent: &str, prompt: &str, model: &str, resume: Option<&str>, fork: bool, exe: &Path, data: &Path) -> io::Result<(Vec<String>, Vec<(String, String)>)> {
     let hook = |name: &str| format!("'{}' hook {name}", exe.display());
     let mut argv = vec![agent.to_string()];
     if let Some(session) = resume {
         // ponytail: gemini's and pi's flags are from their docs, untested here
         let args: &[&str] = match kind(agent) {
+            "claude" if fork => &["--continue", "--fork-session"],
             "claude" | "pi" => &["--continue"],
+            // ponytail: `codex fork` is from its docs, untested here
+            "codex" if fork && !session.is_empty() => &["fork", session],
             "codex" if !session.is_empty() => &["resume", session],
             "gemini" => &["--resume", "latest"],
             _ => &[],
@@ -102,8 +106,43 @@ pub fn launch(agent: &str, prompt: &str, model: &str, resume: Option<&str>, exe:
 }
 
 /// Where the hook keeps task `task`'s codex session id, for `launch` to resume it.
-pub fn codex_session(data: &Path, task: u64) -> std::path::PathBuf {
+pub fn codex_session(data: &Path, task: u64) -> PathBuf {
     data.join(format!("adapters/codex-session-{task}"))
+}
+
+/// Copies task `from`'s session (started in worktree `from.1`) to where `launch` with `fork` in
+/// worktree `to.1`, as task `to.0`, picks it up: for cloning a task. claude keeps its sessions per
+/// directory, so the latest one is copied over; codex's are global, found by the id the hook saved.
+pub fn copy_session(agent: &str, data: &Path, from: (u64, &Path), to: (u64, &Path)) -> io::Result<()> {
+    match kind(agent) {
+        "claude" => {
+            // Named after the directory it saw, symlinks resolved.
+            let real = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            let (src, dst) = (claude_sessions(&real(from.1)), claude_sessions(&real(to.1)));
+            let latest = fs::read_dir(&src)?
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+                .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+                .ok_or_else(|| io::Error::other("it has no claude session yet"))?;
+            fs::create_dir_all(&dst)?;
+            fs::copy(latest.path(), dst.join(latest.file_name())).map(drop)
+        }
+        "codex" => match fs::read_to_string(codex_session(data, from.0)) {
+            Ok(id) if !id.trim().is_empty() => fs::write(codex_session(data, to.0), id),
+            _ => Err(io::Error::other("it has no codex session yet")),
+        },
+        other => Err(io::Error::other(format!("{other} sessions can't be cloned"))),
+    }
+}
+
+/// Where claude keeps sessions started in `cwd`: `projects/` in its config dir, under the path
+/// with everything but ASCII letters and digits made `-`.
+fn claude_sessions(cwd: &Path) -> PathBuf {
+    let config = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".claude"));
+    let name: String = cwd.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    config.join("projects").join(name)
 }
 
 /// Adapter name from the agent command, e.g. `/usr/local/bin/claude` -> "claude".
@@ -365,13 +404,18 @@ mod tests {
     #[test]
     fn resume_args() {
         let (exe, data) = (Path::new("/bin/arranger"), Path::new("/tmp"));
-        let (argv, _) = launch("claude", "fix it", "", Some(""), exe, data).unwrap();
+        let (argv, _) = launch("claude", "fix it", "", Some(""), false, exe, data).unwrap();
         assert_eq!((argv[1].as_str(), argv.last().unwrap().as_str()), ("--continue", "fix it"));
-        let (argv, _) = launch("codex", "", "", Some("01a1"), exe, data).unwrap();
+        let (argv, _) = launch("codex", "", "", Some("01a1"), false, exe, data).unwrap();
         assert_eq!(&argv[1..3], ["resume", "01a1"]);
-        let (argv, _) = launch("codex", "", "", Some(""), exe, data).unwrap();
+        let (argv, _) = launch("codex", "", "", Some(""), false, exe, data).unwrap();
         assert_ne!(argv[1], "resume"); // no session of its own: a new one, never another worktree's
-        assert!(!launch("claude", "", "", None, exe, data).unwrap().0.contains(&"--continue".to_string()));
+        assert!(!launch("claude", "", "", None, false, exe, data).unwrap().0.contains(&"--continue".to_string()));
+        // A clone carries on in a session of its own.
+        let (argv, _) = launch("claude", "", "", Some(""), true, exe, data).unwrap();
+        assert_eq!(&argv[1..3], ["--continue", "--fork-session"]);
+        let (argv, _) = launch("codex", "", "", Some("01a1"), true, exe, data).unwrap();
+        assert_eq!(&argv[1..3], ["fork", "01a1"]);
     }
 
     #[test]
@@ -391,9 +435,9 @@ mod tests {
     #[test]
     fn launch_model() {
         let (exe, data) = (Path::new("/bin/arranger"), Path::new("/tmp"));
-        let (argv, _) = launch("claude", "hi", "claude-sonnet-5-5", None, exe, data).unwrap();
+        let (argv, _) = launch("claude", "hi", "claude-sonnet-5-5", None, false, exe, data).unwrap();
         assert_eq!(argv[argv.len() - 4..], ["--model", "claude-sonnet-5-5", "--", "hi"]);
-        let (argv, env) = launch("claude", "", "", None, exe, data).unwrap();
+        let (argv, env) = launch("claude", "", "", None, false, exe, data).unwrap();
         assert!(!argv.contains(&"--model".to_string()));
         assert!(env.iter().any(|(k, v)| k == "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN" && v == "1")); // replayable history
     }
@@ -401,9 +445,9 @@ mod tests {
     #[test]
     fn dash_prompt_is_not_a_flag() {
         let (exe, data) = (Path::new("/bin/arranger"), Path::new("/tmp"));
-        let (argv, _) = launch("codex", "- fix it", "", None, exe, data).unwrap();
+        let (argv, _) = launch("codex", "- fix it", "", None, false, exe, data).unwrap();
         assert_eq!(argv[argv.len() - 2..], ["--", "- fix it"]);
-        let (argv, _) = launch("claude", "-x", "", Some(""), exe, data).unwrap();
+        let (argv, _) = launch("claude", "-x", "", Some(""), false, exe, data).unwrap();
         assert_eq!(argv[argv.len() - 2..], ["--", "-x"]);
     }
 

@@ -15,7 +15,7 @@ use std::{env, thread};
 const USAGE: &str = "usage: arranger            open the workspace window
        arranger [ls [--files] | new <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
                  | approve <id> | deny <id> [reason] | events <id> | diff <id> | revert <id> <path> <hunk#>
-                 | run <id> [command ...] | send <id> <text> | revive <id> [prompt] | commit <id> [--merge|--pr] [message] | ping | stop | serve | hook <adapter>
+                 | run <id> [command ...] | send <id> <text> | revive <id> [prompt] | clone <id> | commit <id> [--merge|--pr] [message] | ping | stop | serve | hook <adapter>
                  | machine [ls | add <name> <user@host> [repo] | rm <name>] | endpoint]";
 /// Ctrl-\, raw and in kitty keyboard encoding.
 const DETACH: &[&[u8]] = &[b"\x1c", b"\x1b[92;5u"];
@@ -66,6 +66,10 @@ fn main() {
         ["new", agent, ref prompt @ ..] => new(agent, None, prompt),
         ["run", id, ref command @ ..] => parse_id(id).and_then(|id| run(id, command)),
         ["attach", id] => parse_id(id).and_then(attach),
+        ["clone", id] => parse_id(id).and_then(|id| match request(&Request::Clone { id })? {
+            Reply::Created { id, state } => Ok(println!("{id} {state}")),
+            reply => Err(unexpected(reply)),
+        }),
         ["kill", id] => parse_id(id).and_then(|id| request(&Request::Kill { id }).map(drop)),
         _ => {
             eprintln!("{USAGE}");
