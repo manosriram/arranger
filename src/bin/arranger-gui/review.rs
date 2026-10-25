@@ -752,15 +752,24 @@ impl App {
             check.pending = true;
             Some((rv.host, rv.task, check.command.clone()))
         } else { None };
-        r.rect(Rect::new(0.0, TITLE_H, w, h - TITLE_H), 0.0, [0, 0, 0, 160]);
-        let panel = Rect::new(32.0, TITLE_H + 24.0, (w - 64.0).max(1.0), (h - TITLE_H - 64.0).max(100.0));
-        r.frame(panel, 8.0, t.dialog, t.border);
+        r.set_clip(None);
+        let bounds = Rect::new(0.0, TITLE_H, w, (h - TITLE_H).max(0.0));
+        r.rect(bounds, 0.0, t.scrim);
+        r.target(bounds, Cursor::Arrow);
+        let pw = (w - 32.0).clamp(1.0, 960.0);
+        let ph = (bounds.h - 32.0).clamp(1.0, 640.0);
+        let panel = Rect::new((w - pw) / 2.0, bounds.y + (bounds.h - ph) / 2.0, pw, ph);
+        r.frame(panel, 8.0, t.dialog, t.border2);
+        r.target(panel, Cursor::Arrow);
         r.text(panel.x + 16.0, panel.y + 16.0, &check.command, MONO, 13.0, 600, t.text, panel.w - 120.0);
         let close = Rect::new(panel.x + panel.w - 80.0, panel.y + 8.0, 68.0, 32.0);
-        r.text(close.x, close.y + 8.0, "Close ✕", UI, 12.0, 400, t.text2, close.w);
+        r.frame(close, 4.0, t.raised, t.border2);
+        r.text(close.x + 8.0, close.y + 8.0, "Close ✕", UI, 12.0, 500, t.text, close.w - 16.0);
         let label = match check.ok { None => "Running • live output", Some(true) => "Passed", Some(false) => "Failed" };
         r.text(panel.x + 16.0, panel.y + 40.0, label, UI, 12.0, 400, t.text3, panel.w - 32.0);
-        let body = Rect::new(panel.x + 16.0, panel.y + 70.0, panel.w - 32.0, panel.h - 86.0);
+        let logs = Rect::new(panel.x + 12.0, panel.y + 64.0, (panel.w - 24.0).max(1.0), (panel.h - 76.0).max(1.0));
+        r.frame(logs, 4.0, t.term, t.border2);
+        let body = Rect::new(logs.x + 10.0, logs.y + 10.0, (logs.w - 28.0).max(1.0), (logs.h - 20.0).max(1.0));
         let output = if check.output.is_empty() { "Waiting for output…" } else { &check.output };
         let lines: Vec<_> = output.lines().flat_map(|line| wrap(r, line, MONO, 12.0, body.w)).collect();
         let max = (lines.len() as f32 * 18.0 - body.h).max(0.0);
@@ -769,10 +778,16 @@ impl App {
         for (i, line) in lines.iter().enumerate() {
             let y = body.y + i as f32 * 18.0 - (max - check.scroll);
             if y + 18.0 >= body.y && y < body.y + body.h {
-                r.text(body.x, y, line, MONO, 12.0, 400, t.text, body.w);
+                r.text(body.x, y, line, MONO, 12.0, 400, readable(t.text, t.term), body.w);
             }
         }
         r.set_clip(None);
+        if max > 0.0 {
+            let track = Rect::new(logs.x + logs.w - 10.0, body.y, 4.0, body.h);
+            let thumb_h = (body.h * body.h / (max + body.h)).max(20.0).min(body.h);
+            r.rect(track, 0.0, t.border);
+            r.rect(Rect::new(track.x, track.y + (body.h - thumb_h) * (1.0 - check.scroll / max), track.w, thumb_h), 0.0, t.text3);
+        }
         r.target(close, Cursor::Pointer);
         let dismiss = self.click.take().is_some_and(|p| close.contains(p) || !panel.contains(p));
         if dismiss { self.review.as_mut().unwrap().check_output = None; }
