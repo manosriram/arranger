@@ -9,3 +9,4 @@ pub mod proto;
 pub mod pty;
 pub mod review;
 pub mod screen;
+pub mod shell;

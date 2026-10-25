@@ -126,6 +126,8 @@ struct Session {
     writer: UnixStream,
     screen: Screen,
     size: (u16, u16),
+    /// The task's shell in its worktree (Terminal tab), not its agent.
+    shell: bool,
 }
 
 impl Drop for Session {
@@ -196,6 +198,8 @@ enum Action {
     CloseDialog,
     OpenReview,
     Review(ReviewAction),
+    /// Show (true) or leave the Terminal tab: a shell in the selected task's worktree.
+    Shell(bool),
     /// Folds or unfolds a sidebar section ("needs" or "host:<i>").
     Toggle(String),
     PickHost(usize),
@@ -289,6 +293,8 @@ struct App {
     /// A machine whose Remove was clicked once; the next click removes it.
     remove_armed: Option<usize>,
     review: Option<ReviewView>,
+    /// The Terminal tab is on (under Review, when that's open too).
+    shell: bool,
     /// Whether each probed task has anything to review, keyed by the state it was probed in.
     changes: std::collections::HashMap<TaskKey, (String, Option<bool>)>,
     /// Replay of a finished task's log, shown in place of a live session.
@@ -403,6 +409,7 @@ fn run() -> io::Result<()> {
         add_host: None,
         remove_armed: None,
         review: None,
+        shell: false,
         changes: Default::default(),
         history: None,
         wheel: 0.0,
@@ -587,6 +594,9 @@ impl ApplicationHandler<Msg> for App {
                     self.selected = pick.or_else(|| self.order().first().copied());
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_REVIEW").is_some() {
                         self.open_review();
+                    }
+                    if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_TERMINAL").is_some() {
+                        self.shell = true;
                     }
                     // `ARRANGER_POPUP` snapshots this machine's "See all" popup instead, and
                     // `ARRANGER_NEWTASK` the new-task box.
@@ -1257,7 +1267,7 @@ impl App {
             }
         }
         let on_screen = self.machine_tasks.is_none() && self.review.is_none() && self.dialog.is_none() && self.add_host.is_none();
-        let attached = self.session.as_ref().map(|s| s.task) == ask.map(|a| a.0);
+        let attached = self.session.as_ref().filter(|s| !s.shell).map(|s| s.task) == ask.map(|a| a.0);
         if self.vim && ask.is_some() && ask != self.answered && on_screen && attached && matches!(self.focus, Focus::Term | Focus::Normal) {
             (self.answering, self.answered) = (ask, ask);
             self.focus = Focus::Normal;
@@ -1344,13 +1354,22 @@ impl App {
         self.actions.push(Action::Focus(Focus::Term));
     }
 
-    /// Switches between Workspace and Review; Review needs something to review.
+    /// Steps Workspace → Review → Terminal; Review needs something to review, Terminal a worktree.
     fn cycle_view(&mut self) {
         if self.review.is_some() {
-            self.actions.push(Action::Review(ReviewAction::Close));
+            self.actions.push(if self.shellable() { Action::Shell(true) } else { Action::Review(ReviewAction::Close) });
+        } else if self.shell {
+            self.actions.push(Action::Shell(false));
         } else if self.reviewable() {
             self.actions.push(Action::OpenReview);
+        } else if self.shellable() {
+            self.actions.push(Action::Shell(true));
         }
+    }
+
+    /// The selected task has a worktree for the Terminal tab's shell.
+    fn shellable(&self) -> bool {
+        self.current().is_some_and(|t| t.state != "queued" && !t.worktree.is_empty())
     }
 
     /// Vim's normal mode: one key, one command (`gg` takes two).
@@ -1543,16 +1562,18 @@ impl App {
     }
 
     fn sync_session(&mut self) {
-        let want = self.current().filter(|t| is_live(&t.state)).map(|t| (t.machine, t.id));
+        let shell = self.shell;
+        let want = self.current().filter(|t| if shell { self.shellable() } else { is_live(&t.state) }).map(|t| (t.machine, t.id));
         self.load_history();
-        if self.session.as_ref().map(|s| s.task) == want {
+        if self.session.as_ref().map(|s| (s.task, s.shell)) == want.map(|k| (k, shell)) {
             return;
         }
         self.session = None;
         let Some(key @ (m, id)) = want else { return };
         let (cols, rows) = self.pane;
         let Ok(mut sock) = connect_at(self.sock(m).as_deref()) else { return };
-        if sock.write_all(&proto::frame(&Request::Attach { id, cols, rows, native: true })).is_err() {
+        let req = if shell { Request::Shell { id, cols, rows } } else { Request::Attach { id, cols, rows, native: true } };
+        if sock.write_all(&proto::frame(&req)).is_err() {
             return;
         }
         let Ok(mut reader) = sock.try_clone() else { return };
@@ -1566,7 +1587,7 @@ impl App {
             }
             let _ = p.send_event(Msg::Exited(seq));
         });
-        self.session = Some(Session { seq, task: key, writer: sock, screen: Screen::new(cols, rows), size: (cols, rows) });
+        self.session = Some(Session { seq, task: key, writer: sock, screen: Screen::new(cols, rows), size: (cols, rows), shell });
     }
 
     /// For a task that is no longer running, replays its PTY log so its chat stays readable.
@@ -1716,6 +1737,7 @@ impl App {
                 Key::Character(c) => match c.to_lowercase().as_str() {
                     "n" => self.actions.push(Action::NewTask),
                     "r" => self.actions.push(Action::OpenReview),
+                    "e" => self.actions.push(Action::Shell(!self.shell || self.review.is_some())),
                     "j" | "k" if self.review.is_some() => {
                         let files = self.review.as_ref().and_then(|rv| rv.data.as_ref()).map_or(0, |d| d.files.len());
                         let cur = self.review.as_ref().map_or(0, |rv| rv.file);
@@ -1817,6 +1839,12 @@ impl App {
                 self.actions.push(Action::Review(ReviewAction::Close));
             }
             return; // the agent's terminal isn't on screen
+        }
+        if self.focus == Focus::Term && self.shell && self.session.is_none() {
+            if ev.logical_key == Key::Named(NamedKey::Enter) {
+                self.sync_session(); // a new shell, after the last one exited
+            }
+            return;
         }
         if self.focus == Focus::Term {
             let app_cursor = self.session.as_ref().is_some_and(|s| s.screen.mode().contains(TermMode::APP_CURSOR));
@@ -2097,6 +2125,13 @@ impl App {
                     }
                 }
                 Action::Review(a) => self.review_action(a),
+                Action::Shell(on) => {
+                    if self.dialog.is_none() && (!on || self.shellable()) {
+                        (self.shell, self.review, self.machine_tasks) = (on, None, None);
+                        self.focus = self.rest();
+                        self.sync_session();
+                    }
+                }
                 Action::Toggle(key) => {
                     if !self.collapsed.remove(&key) {
                         self.collapsed.insert(key);
@@ -2306,20 +2341,29 @@ impl App {
             self.actions.push(Action::Welcome);
         }
 
-        // Views: Workspace | Review.
+        // Views: Workspace | Review | Terminal.
         let mut nx = x + 26.0 + rw;
         let review = self.review.is_some();
-        let tabs = [("Workspace", !review), ("Review", review)];
+        let tabs = [("Workspace", !review && !self.shell), ("Review", review), ("Terminal", !review && self.shell)];
         for (label, on) in tabs.into_iter().filter(|_| !self.welcome) {
             let tw = r.measure(UI, 13.0, 500, label) + 24.0;
             let tab = Rect::new(nx, (TITLE_H - 30.0) / 2.0, tw, 30.0);
             if on {
                 r.rect(tab, 0.0, t.raised);
             }
-            let off = label == "Review" && !on && !self.reviewable();
+            let off = !on && match label {
+                "Review" => !self.reviewable(),
+                "Terminal" => !self.shellable(),
+                _ => false,
+            };
             r.text(tab.x + 12.0, r.center(tab, UI, 13.0), label, UI, 13.0, 500, if on { t.text } else if off { alpha(t.text3, 90) } else { t.text3 }, tw);
             if self.hit(r, tab) && !on && !off {
-                self.actions.push(if label == "Review" { Action::OpenReview } else { Action::Review(ReviewAction::Close) });
+                self.actions.push(match label {
+                    "Review" => Action::OpenReview,
+                    "Terminal" => Action::Shell(true),
+                    _ if review => Action::Review(ReviewAction::Close),
+                    _ => Action::Shell(false),
+                });
             }
             nx += tw + 4.0;
         }
@@ -2656,13 +2700,24 @@ impl App {
             ],
             None => vec![("—".into(), t.text3)],
         };
-        let details: [(&str, Vec<(String, Rgba)>); 5] = [
-            ("Agent", vec![(kind.to_string(), accent(kind))]),
-            ("Branch", vec![(branch, t.text)]),
-            ("Machine", vec![(host.name().to_string(), t.text)]),
-            ("Changes", changes),
-            ("Elapsed", vec![(age(&task), t.text)]),
-        ];
+        let details: Vec<(&str, Vec<(String, Rgba)>)> = if self.shell {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let wt = task.worktree.strip_prefix(&home).filter(|_| task.machine == 0 && !home.is_empty()).map_or(task.worktree.clone(), |rest| format!("~{rest}"));
+            vec![
+                ("Shell", vec![("confined to this worktree".into(), t.done)]),
+                ("Branch", vec![(branch, t.text)]),
+                ("Changes", changes),
+                ("Worktree", vec![(wt, t.text)]),
+            ]
+        } else {
+            vec![
+                ("Agent", vec![(kind.to_string(), accent(kind))]),
+                ("Branch", vec![(branch, t.text)]),
+                ("Machine", vec![(host.name().to_string(), t.text)]),
+                ("Changes", changes),
+                ("Elapsed", vec![(age(&task), t.text)]),
+            ]
+        };
         let (ly, vy) = (area.y + 46.0, area.y + 60.0);
         let mut dx = area.x + 20.0;
         for (label, parts) in details {
@@ -2679,7 +2734,7 @@ impl App {
         }
 
         // The agent's own terminal, sized to the pane; once the agent has ended, a bar to bring it back below.
-        let ended = group(&task.state) == 4;
+        let ended = group(&task.state) == 4 && !self.shell;
         let input_area = Rect::new(area.x, area.y + area.h - 49.0, area.w, 49.0);
         if ended {
             r.rect(Rect::new(area.x, input_area.y, area.w, 1.0), 0.0, t.border);
@@ -2710,7 +2765,7 @@ impl App {
         self.pane = size;
         let term_focus = self.focus == Focus::Term && self.dialog.is_none();
         let screen = match (&mut self.session, &mut self.history) {
-            (Some(s), _) if s.task == (task.machine, task.id) => {
+            (Some(s), _) if s.task == (task.machine, task.id) && s.shell == self.shell => {
                 if s.size != size {
                     s.size = size;
                     s.screen.resize(size.0, size.1);
@@ -2718,7 +2773,7 @@ impl App {
                 }
                 Some(&s.screen)
             }
-            (_, Some((key, screen))) if *key == (task.machine, task.id) => Some(&*screen), // kept at the size it was drawn for
+            (_, Some((key, screen))) if *key == (task.machine, task.id) && !self.shell => Some(&*screen), // kept at the size it was drawn for
             _ => None,
         };
         match screen {
@@ -2757,6 +2812,8 @@ impl App {
             }
             None => {
                 let note = match task.state.as_str() {
+                    _ if self.shell && self.shellable() => "No shell running · press ↵ to start one".to_string(),
+                    _ if self.shell => "No worktree yet · the shell starts once the task does".to_string(),
                     "queued" => "Queued · starts when a slot frees up".to_string(),
                     "exited" => "Agent exited".into(),
                     "dead" => "Agent died with the daemon (no output recorded)".into(),

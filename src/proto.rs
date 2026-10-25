@@ -9,7 +9,7 @@ use std::path::PathBuf;
 const MAX_FRAME: usize = 64 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -28,6 +28,8 @@ pub enum Request {
     /// `native`: the viewer answers permission asks in the agent's own UI (terminal attach),
     /// rather than through Answer (GUI).
     Attach { id: u64, cols: u16, rows: u16, native: bool },
+    /// Like Attach, but to the task's shell in its worktree (the Terminal tab), started if needed.
+    Shell { id: u64, cols: u16, rows: u16 },
     /// Subscribes to `Tasks` pushes whenever any task changes.
     Watch,
     Input(Vec<u8>),

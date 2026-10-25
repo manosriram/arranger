@@ -28,6 +28,8 @@ const CHILD: Token = Token(1);
 const STOP: Token = Token(2);
 /// Task PTYs use `Token(TASK + id)`; client connections count up from 3.
 const TASK: usize = 1 << 40;
+/// Task shells (the Terminal tab) use `Token(SHELL + id)`.
+const SHELL: usize = 1 << 41;
 /// Commit/PR jobs use `Token(JOB + n)`.
 const JOB: usize = 1 << 39;
 const LOG_CHUNK: usize = 64 * 1024;
@@ -51,6 +53,13 @@ struct Task {
     queued: usize,
     /// Ignore late status hooks from a cancelled turn until a new prompt starts.
     interrupted: bool,
+}
+
+/// A shell in a task's worktree; it lives until it exits or the task is deleted.
+struct Shell {
+    pty: Pty,
+    screen: Screen,
+    viewers: Vec<Token>,
 }
 
 /// What a running agent is up to, derived from its events.
@@ -78,6 +87,8 @@ struct Conn {
     attached: Option<u64>,
     /// Attached from a terminal: asks are answered in the agent's own UI.
     native: bool,
+    /// `attached` is the task's shell, not its agent.
+    shell: bool,
     watching: bool,
     writable: bool,
 }
@@ -99,6 +110,7 @@ struct Daemon {
     listener: UnixListener,
     conns: HashMap<Token, Conn>,
     tasks: HashMap<u64, Task>,
+    shells: HashMap<u64, Shell>,
     /// Hook connections blocked on a human decision: (task, hook connection), oldest first.
     asks: Vec<(u64, Token)>,
     db: Connection,
@@ -169,6 +181,7 @@ pub fn run() -> io::Result<()> {
         listener,
         conns: HashMap::new(),
         tasks: HashMap::new(),
+        shells: HashMap::new(),
         asks: Vec::new(),
         db,
         zstd: zstd::bulk::Compressor::new(3)?,
@@ -199,6 +212,7 @@ pub fn run() -> io::Result<()> {
                     d.shutdown(&sock);
                     return Ok(());
                 }
+                Token(t) if t >= SHELL => d.read_shell((t - SHELL) as u64),
                 Token(t) if t >= TASK => d.read_task((t - TASK) as u64),
                 Token(t) if t >= JOB => d.read_job(t - JOB),
                 t => d.conn_event(t, ev.is_readable(), ev.is_writable()),
@@ -320,6 +334,7 @@ impl Daemon {
                     outbuf: Vec::new(),
                     attached: None,
                     native: false,
+                    shell: false,
                     watching: false,
                     writable: false,
                 };
@@ -368,6 +383,7 @@ impl Daemon {
 
     fn handle(&mut self, t: Token, req: Request) {
         let attached = self.conns.get(&t).and_then(|c| c.attached);
+        let on_shell = self.conns.get(&t).is_some_and(|c| c.shell);
         let reply = match req {
             Request::Ping => Reply::Pong,
             Request::Version => Reply::Version(proto::VERSION),
@@ -499,6 +515,32 @@ impl Daemon {
                     None => Reply::Error(format!("task {id} is not running")),
                 }
             }
+            Request::Shell { id, cols, rows } => {
+                self.detach(t);
+                match self.open_shell(id) {
+                    Ok(()) => {
+                        self.shells.get_mut(&id).unwrap().viewers.push(t);
+                        self.resize_shell(id, cols, rows);
+                        if let Some(c) = self.conns.get_mut(&t) {
+                            (c.attached, c.shell, c.native) = (Some(id), true, false);
+                        }
+                        Reply::Output(self.shells[&id].screen.snapshot())
+                    }
+                    Err(e) => Reply::Error(e),
+                }
+            }
+            Request::Input(bytes) if on_shell => {
+                if let Some(shell) = attached.and_then(|id| self.shells.get(&id)) {
+                    write_pty(&shell.pty.master, &bytes);
+                }
+                return;
+            }
+            Request::Resize { cols, rows } if on_shell => {
+                if let Some(id) = attached {
+                    self.resize_shell(id, cols, rows);
+                }
+                return;
+            }
             Request::Input(bytes) => {
                 if let Some(id) = attached {
                     if let Some(task) = self.tasks.get(&id) {
@@ -557,10 +599,79 @@ impl Daemon {
     }
 
     fn detach(&mut self, t: Token) {
-        if let Some(id) = self.conns.get_mut(&t).and_then(|c| c.attached.take()) {
-            if let Some(task) = self.tasks.get_mut(&id) {
-                task.viewers.retain(|&v| v != t);
+        let Some(c) = self.conns.get_mut(&t) else { return };
+        let (id, shell) = (c.attached.take(), std::mem::take(&mut c.shell));
+        let Some(id) = id else { return };
+        let viewers = if shell { self.shells.get_mut(&id).map(|s| &mut s.viewers) } else { self.tasks.get_mut(&id).map(|t| &mut t.viewers) };
+        if let Some(viewers) = viewers {
+            viewers.retain(|&v| v != t);
+        }
+    }
+
+    /// Starts task `id`'s shell in its worktree, unless it's already running.
+    fn open_shell(&mut self, id: u64) -> Result<(), String> {
+        if self.shells.contains_key(&id) {
+            return Ok(());
+        }
+        let (wt, _) = self.task_paths(id)?;
+        let repo: String = self.db.query_row("SELECT repo FROM tasks WHERE id = ?1", [id], |r| r.get(0)).map_err(e2s)?;
+        let mut cmd = crate::shell::command(Path::new(&wt), Path::new(&repo), &self.data.join("shell")).map_err(e2s)?;
+        for key in adapter::PARENT_SESSION_ENV {
+            cmd.env_remove(key);
+        }
+        cmd.env("TERM", "xterm-256color").env("COLORTERM", "truecolor").env("ARRANGER_TASK", id.to_string());
+        let (cols, rows) = (80, 24);
+        let pty = pty::spawn(cmd, cols, rows).map_err(|e| format!("shell: {e}"))?;
+        self.poll
+            .registry()
+            .register(&mut SourceFd(&pty.master.as_raw_fd()), Token(SHELL + id as usize), Interest::READABLE)
+            .map_err(e2s)?;
+        self.shells.insert(id, Shell { pty, screen: Screen::new(cols, rows), viewers: Vec::new() });
+        Ok(())
+    }
+
+    fn resize_shell(&mut self, id: u64, cols: u16, rows: u16) {
+        let (cols, rows) = (cols.max(2), rows.max(1));
+        if let Some(shell) = self.shells.get_mut(&id) {
+            let _ = pty::resize(&shell.pty.master, cols, rows);
+            shell.screen.resize(cols, rows);
+        }
+    }
+
+    fn read_shell(&mut self, id: u64) {
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let Some(shell) = self.shells.get_mut(&id) else { return };
+            match rustix::io::read(&shell.pty.master, &mut buf) {
+                Ok(0) => return,
+                Ok(n) => {
+                    let replies = shell.screen.feed(&buf[..n]);
+                    if shell.viewers.is_empty() {
+                        write_pty(&shell.pty.master, &replies);
+                    }
+                    let frame = proto::frame(&Reply::Output(buf[..n].to_vec()));
+                    for v in shell.viewers.clone() {
+                        self.send(v, &frame);
+                    }
+                }
+                Err(Errno::INTR) => {}
+                Err(_) => return,
             }
+        }
+    }
+
+    /// Ends task `id`'s shell (already exited, or killed here) and tells its viewers.
+    fn close_shell(&mut self, id: u64) {
+        let Some(mut shell) = self.shells.remove(&id) else { return };
+        let _ = rustix::process::kill_process_group(Pid::from_child(&shell.pty.child), Signal::KILL);
+        let _ = shell.pty.child.wait();
+        let _ = self.poll.registry().deregister(&mut SourceFd(&shell.pty.master.as_raw_fd()));
+        let frame = proto::frame(&Reply::Exited);
+        for v in shell.viewers {
+            if let Some(c) = self.conns.get_mut(&v) {
+                (c.attached, c.shell) = (None, false);
+            }
+            self.send(v, &frame);
         }
     }
 
@@ -735,6 +846,11 @@ impl Daemon {
             self.read_task(id);
             self.finish(id, "exited");
         }
+        let exited: Vec<u64> = self.shells.iter_mut().filter_map(|(&id, s)| matches!(s.pty.child.try_wait(), Ok(Some(_))).then_some(id)).collect();
+        for id in exited {
+            self.read_shell(id);
+            self.close_shell(id);
+        }
         self.start_queued();
     }
 
@@ -884,6 +1000,7 @@ impl Daemon {
             let _ = task.pty.child.wait();
             self.finish(id, "killed");
         }
+        self.close_shell(id);
         if !wt.is_empty() && Path::new(&wt).exists() {
             git(git_in(Path::new(&repo)).args(["worktree", "remove", "--force"]).arg(&wt))?;
         }

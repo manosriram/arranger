@@ -42,6 +42,43 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// The Terminal tab's shell on task 1: a `cd` out of the worktree steps back in, and on macOS
+/// the main checkout can't be read nor anything written beside the worktree. Exiting ends it.
+fn shell_stays_in_worktree(home: &Home, repo: &Path) {
+    use arranger::proto::{Reply, Request, frame, unframe};
+    use std::io::{Read, Write};
+    let mut sock = std::os::unix::net::UnixStream::connect(home.0.join("arranger.sock")).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let typed = format!("cd ..; cat {}; echo x > ../x; echo DO''NE\r", repo.join("README").display());
+    for req in [Request::Version, Request::Shell { id: 1, cols: 200, rows: 50 }, Request::Input(typed.into_bytes())] {
+        sock.write_all(&frame(&req)).unwrap();
+    }
+    let (mut buf, mut out, mut exited) = (Vec::new(), String::new(), false);
+    let mut chunk = [0u8; 8192];
+    while !exited {
+        let n = sock.read(&mut chunk).unwrap_or_else(|e| panic!("{e}; shell said:\n{out}"));
+        assert!(n > 0, "daemon hung up; shell said:\n{out}");
+        buf.extend_from_slice(&chunk[..n]);
+        while let Some(reply) = unframe::<Reply>(&mut buf) {
+            match reply.unwrap() {
+                Reply::Output(bytes) => out.push_str(&String::from_utf8_lossy(&bytes)),
+                Reply::Exited => exited = true,
+                Reply::Error(e) => panic!("{e}"),
+                _ => {}
+            }
+        }
+        if out.contains("DONE\r\n") && !out.contains("exit\r") {
+            sock.write_all(&frame(&Request::Input(b"exit\r".to_vec()))).unwrap();
+            out.push_str("exit\r");
+        }
+    }
+    assert!(out.contains("outside this worktree"), "{out}");
+    if cfg!(target_os = "macos") {
+        assert!(out.to_lowercase().matches("operation not permitted").count() >= 2, "{out}");
+        assert!(!home.0.join("worktrees/repo/x").exists());
+    }
+}
+
 // The agent edits a file, asks to run a command and records the answer, then says it's done.
 const AGENT: &str = r#"#!/bin/sh
 echo "run $#" >> "$ARRANGER_HOME/runs"
@@ -90,6 +127,7 @@ fn task_lifecycle() {
     let failed = Command::new(env!("CARGO_BIN_EXE_arranger"))
         .env("ARRANGER_HOME", &home.0).args(["run", "1", "sh", "-c", "exit 42"]).status().unwrap();
     assert_eq!(failed.code(), Some(42));
+    shell_stays_in_worktree(&home, &repo);
     let (_, events) = home.arranger(&repo, &["events", "1"]);
     assert!(events.contains("make test") && events.contains("Added hello.txt"), "{events}");
 
