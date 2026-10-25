@@ -6,10 +6,10 @@ use std::env;
 use std::io::{self, Read};
 use std::path::PathBuf;
 
-const MAX_FRAME: usize = 64 << 20;
+pub const MAX_FRAME: usize = 16 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 18;
+pub const VERSION: u32 = 19;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -67,6 +67,9 @@ pub enum Request {
     /// too), whose agent carries on from a copy of `id`'s session, sent `prompt` if not empty.
     /// `model`: None keeps `id`'s. Replied to with Created.
     Clone { id: u64, prompt: String, model: Option<String> },
+    /// Stop through the protected socket; never signal a PID read from a stale file.
+    /// Append new variants so an old hook cannot be reinterpreted as a different operation.
+    Shutdown,
 }
 
 /// What happens after the commit.
@@ -277,6 +280,16 @@ pub fn frame<T: Serialize>(msg: &T) -> Vec<u8> {
     out
 }
 
+/// A reply that cannot fit must produce an error the client can read, rather than a disconnect.
+pub fn reply_frame(msg: &Reply) -> Vec<u8> {
+    let bytes = frame(msg);
+    if bytes.len() > MAX_FRAME {
+        frame(&Reply::Error("reply exceeds the 16 MiB limit; request a smaller page or use git for large diffs".into()))
+    } else {
+        bytes
+    }
+}
+
 /// Pops one complete message off the front of `buf`, if there is one.
 pub fn unframe<T: DeserializeOwned>(buf: &mut Vec<u8>) -> Option<io::Result<T>> {
     let len = u32::from_le_bytes(buf.get(..4)?.try_into().unwrap()) as usize;
@@ -307,9 +320,8 @@ pub fn socket_path() -> PathBuf {
         return PathBuf::from(home).join("arranger.sock");
     }
     let dir = env::var_os("XDG_RUNTIME_DIR")
-        .or_else(|| env::var_os("TMPDIR"))
         .unwrap_or("/tmp".into());
-    PathBuf::from(dir).join("arranger.sock")
+    PathBuf::from(dir).join(format!("arranger-{}", rustix::process::geteuid().as_raw())).join("arranger.sock")
 }
 
 pub fn data_dir() -> PathBuf {

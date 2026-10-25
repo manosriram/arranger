@@ -27,8 +27,6 @@ use std::path::{Path, PathBuf};
 pub(crate) use acp::tool_kind as acp_tool_kind;
 pub(crate) use codex::command as codex_command;
 
-const MAX_LINE: usize = 16 << 20;
-
 /// Agents that can run headless.
 pub fn supported(agent: &str) -> bool {
     matches!(adapter::kind(agent), "claude" | "codex" | "pi" | "gemini")
@@ -176,7 +174,9 @@ impl Ask {
 /// What the daemon holds per headless task: its transport, fed whole lines.
 pub struct Agent {
     t: Box<dyn Transport>,
-    input: Vec<u8>,
+    input: crate::security::JsonLines,
+    received: usize,
+    failed: bool,
 }
 
 impl Deref for Agent {
@@ -193,6 +193,16 @@ impl DerefMut for Agent {
 }
 
 impl Agent {
+    pub fn failed(&self) -> bool { self.failed }
+
+    pub fn prompt(&mut self, text: String) -> Vec<Event> {
+        let core = self.t.core();
+        let queued: usize = core.prompts.iter().map(String::len).sum();
+        if self.failed || core.prompts.len() >= 32 || queued.saturating_add(text.len()) > (1 << 20) || core.output.len() > (1 << 20) {
+            return vec![Event::Error { message: "the agent's prompt queue is full or its stream has failed".into() }];
+        }
+        self.t.prompt(text)
+    }
     pub fn busy(&self) -> bool {
         self.t.core().busy
     }
@@ -215,10 +225,19 @@ impl Agent {
 
     /// Stdout from the CLI: the events it means, and the lines that belong in its chat log.
     pub fn feed(&mut self, bytes: &[u8]) -> (Vec<Event>, Vec<u8>) {
-        self.input.extend_from_slice(bytes);
+        if self.failed { return (Vec::new(), Vec::new()); }
+        self.received = self.received.saturating_add(bytes.len());
+        if self.received > crate::security::MAX_LOG {
+            self.failed = true;
+            return (vec![Event::Error { message: "agent output exceeded the 64 MiB session limit; revive to continue".into() }], Vec::new());
+        }
         let (mut events, mut kept) = (Vec::new(), Vec::new());
-        while let Some(end) = self.input.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = self.input.drain(..=end).collect();
+        let (lines, oversized) = self.input.feed(bytes);
+        if oversized {
+            self.failed = true;
+            return (vec![Event::Error { message: "the agent wrote a JSON line over the 1 MiB limit".into() }], Vec::new());
+        }
+        for line in lines {
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
@@ -230,10 +249,6 @@ impl Agent {
                 }
                 Err(_) => events.push(Event::Error { message: "the agent wrote a line that isn't JSON; see its stderr log".into() }),
             }
-        }
-        if self.input.len() > MAX_LINE {
-            self.input.clear();
-            events.push(Event::Error { message: "the agent wrote a line over the size limit".into() });
         }
         (events, kept)
     }
@@ -262,7 +277,7 @@ pub fn start(program: &str, cwd: &Path, model: &str, effort: &str, session: Opti
             Box::new(claude::Claude::new(cwd))
         }
     };
-    (argv, Agent { t, input: Vec::new() })
+    (argv, Agent { t, input: Default::default(), received: 0, failed: false })
 }
 
 /// Where the daemon keeps task `task`'s headless session.
@@ -281,6 +296,9 @@ pub fn copy_session(agent: &str, data: &Path, from: (u64, &Path), to: (u64, &Pat
     match adapter::kind(agent) {
         // claude finds sessions under the directory they started in.
         "claude" => {
+            if session.len() > 128 || !session.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+                return Err(io::Error::other("invalid Claude session identifier"));
+            }
             let name = format!("{session}.jsonl");
             let (src, dst) = (adapter::claude_sessions(from.1).join(&name), adapter::claude_sessions(to.1));
             fs::create_dir_all(&dst)?;
@@ -290,7 +308,7 @@ pub fn copy_session(agent: &str, data: &Path, from: (u64, &Path), to: (u64, &Pat
         "codex" | "pi" => {}
         kind => return Err(io::Error::other(format!("{kind} can't carry a session to another worktree"))),
     }
-    fs::write(session_file(data, to.0), session)
+    crate::security::write_private(&session_file(data, to.0), session.as_bytes())
 }
 
 fn string(v: &Value) -> String {

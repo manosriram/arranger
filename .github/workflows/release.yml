@@ -7,10 +7,21 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: cargo audit --deny warnings
   build:
+    permissions:
+      contents: read
     strategy:
       matrix:
         include:
@@ -19,32 +30,45 @@ jobs:
           - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libgl-dev
       - run: rustup target add ${{ matrix.target }}
-      - run: cargo test --release
+      - run: cargo test --release --locked
         if: matrix.target != 'x86_64-apple-darwin' # cross-built on arm, can't run there
-      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package
         run: |
           name=arranger-${{ matrix.target }} # no version: install.sh fetches releases/latest/download/<name>
           mkdir "$name"
-          cp target/${{ matrix.target }}/release/{arranger,arranger-gui} README.md "$name"/
+          cp target/${{ matrix.target }}/release/{arranger,arranger-gui} README.md SECURITY.md SECURITY_AUDIT.md "$name"/
           if [[ ${{ matrix.target }} == *apple* ]]; then scripts/bundle.sh target/${{ matrix.target }}/release "$name" "$GITHUB_REF_NAME"; fi
           tar czf "$name.tar.gz" "$name"
-      - uses: actions/upload-artifact@v4
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.target }}
-          path: arranger-*.tar.gz
+          path: |
+            arranger-*.tar.gz
+            arranger-*.tar.gz.sha256
 
   release:
-    needs: build
+    needs: [build, audit]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           merge-multiple: true
-      - run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes arranger-*.tar.gz scripts/install.sh
+      - run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes arranger-*.tar.gz arranger-*.tar.gz.sha256 scripts/install.sh
         env:
           GH_TOKEN: ${{ github.token }}

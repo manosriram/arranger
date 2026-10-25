@@ -51,17 +51,18 @@ pub fn command(wt: &Path, repo: &Path, rc: &Path) -> io::Result<Command> {
     let mut zdotdir = None;
     match Path::new(&shell).file_name().and_then(|n| n.to_str()) {
         Some("zsh") => {
+            crate::security::private_dir(rc)?;
             let dir = rc.join("zsh");
-            fs::create_dir_all(&dir)?;
-            fs::write(dir.join(".zshenv"), ZSHENV)?;
-            fs::write(dir.join(".zprofile"), ZPROFILE)?;
-            fs::write(dir.join(".zshrc"), ZSHRC)?;
+            crate::security::private_dir(&dir)?;
+            crate::security::write_private(&dir.join(".zshenv"), ZSHENV.as_bytes())?;
+            crate::security::write_private(&dir.join(".zprofile"), ZPROFILE.as_bytes())?;
+            crate::security::write_private(&dir.join(".zshrc"), ZSHRC.as_bytes())?;
             argv.push("-l".into());
             zdotdir = Some(dir);
         }
         Some("bash") => {
-            fs::create_dir_all(rc)?;
-            fs::write(rc.join("bashrc"), BASHRC)?;
+            crate::security::private_dir(rc)?;
+            crate::security::write_private(&rc.join("bashrc"), BASHRC.as_bytes())?;
             argv.extend(["--rcfile".into(), rc.join("bashrc").into(), "-i".into()]);
         }
         _ => argv.push("-l".into()),
@@ -87,8 +88,9 @@ pub fn command(wt: &Path, repo: &Path, rc: &Path) -> io::Result<Command> {
 /// written, and nothing else outside `wt`, .git, temp dirs, /dev or `home`'s dotfiles can be written.
 fn profile(wt: &Path, repo: &Path, others: &Path, home: &Path) -> String {
     let (wt, git, repo, others) = (q(wt), q(&repo.join(".git")), q(repo), q(others));
-    // Regex specials in the home path, bracketed; `[.]` sidesteps the profile's own escaping.
-    let home: String = home.to_string_lossy().chars().map(|c| if ".$()*+?{}|".contains(c) { format!("[{c}]") } else { c.to_string() }).collect();
+    // Escape regex syntax first, then the sandbox string literal; paths can contain both.
+    let home: String = home.to_string_lossy().chars().map(|c| if ".\\^$|?*+()[]{}".contains(c) { format!("\\{c}") } else { c.to_string() }).collect();
+    let dotfiles = q(Path::new(&format!("^{home}/[.][^/]+")));
     format!(
         "(version 1)(allow default)
 (deny file-read-data file-write*
@@ -96,7 +98,7 @@ fn profile(wt: &Path, repo: &Path, others: &Path, home: &Path) -> String {
   (require-all (subpath {others}) (require-not (subpath {wt}))))
 (deny file-write* (require-not (require-any
   (subpath {wt}) (subpath {git}) (subpath \"/dev\") (subpath \"/private/tmp\") (subpath \"/private/var/folders\")
-  (regex #\"^{home}/[.][^/]+\"))))"
+  (regex #{dotfiles}))))"
     )
 }
 
@@ -113,7 +115,7 @@ mod tests {
         let p = profile(Path::new("/d/wt/api/2"), Path::new("/src/api"), Path::new("/d/wt/api"), Path::new("/Users/a.b"));
         assert!(p.contains(r#"(require-all (subpath "/src/api") (require-not (subpath "/src/api/.git")))"#));
         assert!(p.contains(r#"(require-all (subpath "/d/wt/api") (require-not (subpath "/d/wt/api/2")))"#));
-        assert!(p.contains(r#"(regex #"^/Users/a[.]b/[.][^/]+")"#));
+        assert!(p.contains(r#"(regex #"^/Users/a\\.b/[.][^/]+")"#));
         assert_eq!(q(Path::new(r#"/a "b"\c"#)), r#""/a \"b\"\\c""#);
     }
 }

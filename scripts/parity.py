@@ -24,7 +24,7 @@ PARENT_ENV = ["CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE
               "CLAUDE_CODE_MESSAGING_TOKEN"]
 # How arranger starts headless claude (background::argv), and how ac59e61 did.
 HEADLESS = ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--include-partial-messages",
-            "--replay-user-messages", "--permission-prompt-tool", "stdio", "--setting-sources", "user,project,local", "--tools", "default"]
+            "--replay-user-messages", "--permission-prompt-tool", "stdio", "--setting-sources", "user", "--tools", "default"]
 OLD = ["--print", "--verbose", "--input-format", "stream-json", "--output-format", "stream-json",
        "--include-partial-messages", "--permission-prompt-tool", "stdio"]
 
@@ -444,7 +444,7 @@ def main():
     p.add_argument("--codex", default=shutil.which("codex") or "codex")
     p.add_argument("--claude", default=shutil.which("claude") or "claude")
     p.add_argument("--model", default="")
-    p.add_argument("--permission-mode", default="auto", help="passed to headless claude; match your interactive default")
+    p.add_argument("--permission-mode", default="default", help="passed to headless claude; arranger requires approvals by default")
     p.add_argument("--out", default="")
     p.add_argument("--keep", action="store_true", help="keep the scratch repo")
     a = p.parse_args()

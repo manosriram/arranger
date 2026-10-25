@@ -103,6 +103,24 @@ arranger machine add gpu-box you@10.0.4.12 ~/src/api   # name, ssh target, defau
 
 The app reaches each machine with your own `ssh` (keys, agent, `~/.ssh/config`) and starts its daemon if it isn't running. Nothing listens on the network.
 
+Before adding a machine, connect with `ssh user@host` and verify its host-key fingerprint through a trusted channel. Arranger requires a known host key, disables SSH-agent and X11 forwarding, and accepts host aliases or `user@host` targets. Machine names use 1–32 ASCII letters, digits, hyphens or underscores.
+
+## Security and upgrades
+
+Arranger is a single-user application. Agent executables, selected repositories, Git configuration/hooks, your shell startup files and registered remote machines are trusted. Worktrees separate edits; they do not isolate hostile code. Processes running as your OS user can control the daemon, including approvals. Use a separate OS account or VM for untrusted code, and retain each coding agent's own sandbox and approval controls. The Terminal tab's directory hooks are a convenience; the macOS sandbox has broad tool-cache and shared-Git access, and Linux does not add an OS sandbox.
+
+The daemon uses a private `0700` directory and `0600` socket at `${XDG_RUNTIME_DIR:-/tmp}/arranger-<uid>/arranger.sock`. Application state is private to your user. `ARRANGER_HOME`, when set, must be an absolute path to a dedicated directory with trusted parent directories; symlinks and unsafe shared parents are rejected. Do not point it at your home directory or a shared system directory.
+
+This security update changes the daemon protocol to **19**. Stop the old daemon **using the old executable before replacing it**, then install the same release on every connected machine and restart Arranger. Closing the window alone does not stop the daemon. A new executable deliberately refuses older or unsafe sockets; do not remove a live daemon's socket to force an upgrade.
+
+Chat-mode Claude now uses `default` approval mode and user settings; repository `.claude` settings are not loaded there. Arranger no longer bypasses Codex hook trust and no longer automatically executes `.arranger/setup`. Review and run a repository's setup yourself when needed. ACP's **Allow once** cancels requests that only offer a permanent grant. Terminal pastes strip control characters; outside bracketed paste, line breaks become spaces so a paste requires Enter to execute.
+
+The installer verifies a release's SHA-256 checksum before extracting it. It requires releases containing `.tar.gz.sha256` assets; older releases without checksums fail closed. This checks download integrity against the release publisher; it does not independently authenticate a compromised publisher or the installer script. For more control, download and inspect the installer before running it, or build the reviewed source with `cargo build --release --locked`.
+
+Input and display limits protect the daemon: requests and JSON lines are limited to 1 MiB, replies to 16 MiB, decoded logs and chat streams to 64 MiB, and review files to 2 MiB each / 8 MiB total / 2000 files. Oversized reviews report an error; inspect them with Git. Headless tasks exceeding the stream limit are stopped. Start a new task for very large conversations. Wayland window decorations retain their controls but omit title text to avoid an unmaintained font parser.
+
+See [SECURITY.md](SECURITY.md) for the trust model and [the audit report](SECURITY_AUDIT.md) for findings, fixes, tests and remaining release requirements.
+
 ## Develop
 
 ```sh

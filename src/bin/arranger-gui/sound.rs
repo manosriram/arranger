@@ -15,11 +15,12 @@ pub fn ding() {
             .unwrap_or_default()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("arranger-ding-{}-{stamp}", std::process::id()));
-        if std::fs::create_dir(&dir).is_err() {
+        use std::os::unix::fs::DirBuilderExt;
+        if std::fs::DirBuilder::new().mode(0o700).create(&dir).is_err() {
             return;
         }
         let path = dir.join("ding.wav");
-        if std::fs::write(&path, include_bytes!("../../../assets/ding.wav")).is_err() {
+        if arranger::security::write_private(&path, include_bytes!("../../../assets/ding.wav")).is_err() {
             let _ = std::fs::remove_dir(dir);
             return;
         }

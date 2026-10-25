@@ -47,9 +47,9 @@ impl Acp {
         vec![Event::Prompt { text }]
     }
 
-    /// Picks the permission option of `kind` (else its other once/always variant).
+    /// An Allow once action must never select a persistent permission grant.
     fn choose(&mut self, ask: &Ask, allow: bool) {
-        let kinds: &[&str] = if allow { &["allow_once", "allow_always"] } else { &["reject_once", "reject_always"] };
+        let kinds: &[&str] = if allow { &["allow_once"] } else { &["reject_once", "reject_always"] };
         let options = ask.params["options"].as_array().cloned().unwrap_or_default();
         let option = kinds.iter().find_map(|k| options.iter().find(|o| o["kind"] == *k));
         let outcome = option.map_or(json!({"outcome":"cancelled"}), |o| json!({"outcome":"selected","optionId":o["optionId"]}));
@@ -253,5 +253,13 @@ mod tests {
         let out = sent(&mut a);
         assert_eq!(out[0]["result"]["outcome"]["outcome"], "cancelled");
         assert_eq!(out[1]["method"], "session/cancel");
+    }
+
+    #[test]
+    fn allow_once_never_grants_a_persistent_permission() {
+        let (mut a, _) = started(None, json!({}));
+        receive(&mut a, json!({"jsonrpc":"2.0","id":8,"method":"session/request_permission","params":{"toolCall":{},"options":[{"optionId":"always","kind":"allow_always"}]}}));
+        a.answer(true, "").unwrap();
+        assert_eq!(sent(&mut a)[0]["result"]["outcome"]["outcome"], "cancelled");
     }
 }

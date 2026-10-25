@@ -173,6 +173,51 @@ fn task_lifecycle() {
     assert!(std::fs::read_to_string(home.0.join("decision")).unwrap().contains("not now"));
 }
 
+#[test]
+fn daemon_rejects_unsafe_inputs_and_repository_setup() {
+    use arranger::proto::{self, Reply, Request};
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+    let home = Home(std::env::temp_dir().join(format!("arranger-sec-{}", std::process::id())));
+    let repo = home.0.join("repo");
+    std::fs::create_dir_all(repo.join(".arranger")).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join(".arranger/setup"), "#!/bin/sh\ntouch \"$ARRANGER_HOME/setup-ran\"\n").unwrap();
+    std::fs::set_permissions(repo.join(".arranger/setup"), PermissionsExt::from_mode(0o755)).unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "fixture"]);
+    let (ok, out) = home.arranger(&repo, &["new", "/usr/bin/true"]);
+    assert!(ok, "{out}");
+    home.wait_state(&repo, &["exited"]);
+    assert!(!home.0.join("setup-ran").exists());
+    for path in [&home.0, &home.0.join("logs"), &home.0.join("adapters")] {
+        assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+    }
+    let socket = home.0.join("arranger.sock");
+    assert_eq!(std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777, 0o600);
+    let mut bad = UnixStream::connect(&socket).unwrap();
+    bad.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    bad.write_all(&(2u32 << 20).to_le_bytes()).unwrap();
+    let mut byte = [0];
+    assert!(matches!(bad.read(&mut byte), Ok(0)));
+    assert!(home.arranger(&repo, &["ping"]).0);
+
+    // Finished requests must still be processed if a hook closes immediately after writing.
+    let mut sock = UnixStream::connect(&socket).unwrap();
+    sock.write_all(&proto::frame(&Request::Ask { task: 999, event: proto::Event::PermissionRequest { tool: "Bash".into(), detail: "test".into() } })).unwrap();
+    assert!(matches!(proto::read_msg::<Reply>(&mut sock).unwrap(), Reply::Decision { allow: Some(false), .. }));
+
+    // A stale/tampered PID file must have no influence on shutdown.
+    let mut unrelated = Command::new("sleep").arg("30").spawn().unwrap();
+    std::fs::write(home.0.join("daemon.pid"), unrelated.id().to_string()).unwrap();
+    assert!(home.arranger(&repo, &["stop"]).0);
+    let survived = unrelated.try_wait().unwrap().is_none();
+    let _ = unrelated.kill();
+    let _ = unrelated.wait();
+    assert!(survived, "shutdown signalled the PID file's unrelated process");
+}
+
 // A claude stand-in: the first run edits a tracked file, adds an untracked one and saves a
 // session where claude would; every run records its args.
 const CLAUDE: &str = r#"#!/bin/sh
@@ -299,7 +344,7 @@ fn headless_task() {
     assert!(ok, "{out}");
     home.wait_state(&repo, &["needs-you"]);
     let args = std::fs::read_to_string(home.0.join("args-1")).unwrap();
-    for flag in ["--input-format stream-json", "--permission-prompt-tool stdio", "--setting-sources user,project,local", "--permission-mode auto"] {
+    for flag in ["--input-format stream-json", "--permission-prompt-tool stdio", "--setting-sources user", "--permission-mode default"] {
         assert!(args.contains(flag), "{flag} missing: {args}");
     }
     assert!(!args.contains("--system-prompt") && !args.contains("--settings"), "{args}");

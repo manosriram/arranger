@@ -1477,7 +1477,9 @@ impl App {
 
     fn save_settings(&self) {
         let s = Settings { theme: THEMES[self.theme].name.into(), vim: self.vim, ding_muted: self.ding_muted, prompts: self.prompts.clone(), recent: self.recent.clone() };
-        let _ = std::fs::write(Settings::path(), serde_json::to_vec_pretty(&s).unwrap_or_default());
+        if arranger::security::private_dir(&proto::data_dir()).is_ok() {
+            let _ = arranger::security::write_private(&Settings::path(), &serde_json::to_vec_pretty(&s).unwrap_or_default());
+        }
     }
 
     /// Selects the next (or previous) task that needs you, wrapping around.
@@ -1780,7 +1782,7 @@ impl App {
         self.history = None;
         thread::spawn(move || {
             if let Ok(Reply::Log(zst)) = request_at(sock.as_deref(), &Request::Log { id: key.1 })
-                && let Ok(bytes) = zstd::decode_all(&zst[..]) {
+                && let Ok(bytes) = arranger::security::decode_log(&zst[..]) {
                 let _ = p.send_event(Msg::History(key, bytes));
             }
         });
@@ -2242,7 +2244,7 @@ impl App {
         let text = clipboard();
         if self.focus == Focus::Term {
             let bracketed = self.session.as_ref().is_some_and(|s| s.screen.mode().contains(TermMode::BRACKETED_PASTE));
-            let bytes = if bracketed { format!("\x1b[200~{text}\x1b[201~") } else { text.replace('\n', "\r") };
+            let bytes = arranger::security::paste_text(&text, bracketed);
             self.send_input(bytes.into_bytes());
         } else {
             self.insert(&text);
@@ -3830,7 +3832,7 @@ fn last_size(log: &[u8]) -> Option<(u16, u16)> {
     let rest = &log[at + 4..];
     let end = rest.iter().take(12).position(|&b| b == b't')?;
     let (rows, cols) = std::str::from_utf8(&rest[..end]).ok()?.split_once(';')?;
-    Some((cols.parse().ok()?, rows.parse().ok()?))
+    Some(arranger::screen::bounded_size(cols.parse().ok()?, rows.parse().ok()?))
 }
 
 /// The arranger mark ("Seats"): the status icons' eight players as empty rings around the amber

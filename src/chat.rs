@@ -28,7 +28,8 @@ pub struct Chat {
     /// Items changed or added since `take_changed`.
     changed: BTreeSet<usize>,
     cwd: String,
-    input: Vec<u8>,
+    input: crate::security::JsonLines,
+    received: usize,
     /// The message streaming now, and its blocks' items by stream index.
     message: String,
     streamed: HashMap<u64, usize>,
@@ -51,9 +52,15 @@ impl Chat {
 
     /// Raw stdout bytes; only complete lines count.
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.input.extend_from_slice(bytes);
-        while let Some(end) = self.input.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = self.input.drain(..=end).collect();
+        if self.received > crate::security::MAX_LOG { return; }
+        self.received = self.received.saturating_add(bytes.len());
+        if self.received > crate::security::MAX_LOG {
+            self.notice("Chat reached its 64 MiB display limit; start another task to continue.".into(), true);
+            return;
+        }
+        let (lines, oversized) = self.input.feed(bytes);
+        if oversized { self.notice("Skipped an oversized JSON log record.".into(), true); }
+        for line in lines {
             // Older logs start with a terminal size mark glued to the first line.
             let json = line.iter().position(|&b| b == b'{').map_or(&line[..0], |i| &line[i..]);
             if let Ok(v) = serde_json::from_slice::<Value>(json) {

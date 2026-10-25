@@ -6,6 +6,7 @@ use crate::headless::{self, Agent};
 use crate::proto::{self, Event, Reply, Request, Ship, TaskInfo};
 use crate::pty::{self, Pty};
 use crate::review;
+use crate::security;
 use alacritty_terminal::term::TermMode;
 use crate::screen::Screen;
 use mio::net::{UnixListener, UnixStream};
@@ -99,6 +100,8 @@ struct Conn {
     /// Subscribed to this task's chat.
     chat: Option<u64>,
     writable: bool,
+    received: bool,
+    last_input: Instant,
 }
 
 /// A commit/PR script running in a task's worktree; its output goes back to `conn`.
@@ -132,6 +135,7 @@ struct Daemon {
     dirty: bool,
     jobs: HashMap<usize, Job>,
     next_job: usize,
+    stopping: bool,
     /// Headless tasks' conversations, loaded from their logs when first asked for.
     chats: HashMap<u64, Chat>,
     /// When changed chat items next go out to their viewers.
@@ -140,21 +144,34 @@ struct Daemon {
 
 pub fn run() -> io::Result<()> {
     let data = proto::data_dir();
-    fs::create_dir_all(data.join("logs"))?;
-    fs::create_dir_all(data.join("adapters"))?;
+    // Set before spawning threads or children. All daemon-created state is private by default.
+    rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
+    security::private_dir(&data)?;
+    security::private_dir(&data.join("logs"))?;
+    security::private_dir(&data.join("adapters"))?;
     let sock = proto::socket_path();
+    security::private_dir(sock.parent().ok_or_else(|| io::Error::other("socket has no directory"))?)?;
+    // Retain the lock for the daemon's lifetime. Concurrent starts must never unlink a live socket.
+    let _lock = security::private_file(&sock.with_extension("lock"), false)?;
+    rustix::fs::flock(&_lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .map_err(|_| io::Error::other("daemon already running or starting"))?;
     if StdUnixStream::connect(&sock).is_ok() {
         return Err(io::Error::other("daemon already running"));
     }
-    let _ = fs::remove_file(&sock);
+    match security::check_socket(&sock) {
+        Ok(()) => fs::remove_file(&sock)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let mut listener = UnixListener::bind(&sock)?;
     fs::set_permissions(&sock, Permissions::from_mode(0o600))?;
-    fs::write(data.join("daemon.pid"), std::process::id().to_string())?;
+    security::write_private(&data.join("daemon.pid"), std::process::id().to_string().as_bytes())?;
     // Don't keep the starting client's directory: if it's deleted later (a removed worktree, a temp
     // dir), anything that resolves paths against the cwd fails, e.g. gix::discover in `create`.
     let data = fs::canonicalize(&data)?;
     std::env::set_current_dir(&data)?;
 
+    security::private_file(&data.join("arranger.db"), false)?;
     let db = Connection::open(data.join("arranger.db")).map_err(io::Error::other)?;
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS tasks (
@@ -204,10 +221,11 @@ pub fn run() -> io::Result<()> {
         exe: std::env::current_exe()?,
         sigchld,
         next_conn: 3,
-        max_live: std::env::var("ARRANGER_MAX_AGENTS").ok().and_then(|v| v.parse().ok()).unwrap_or(20),
+        max_live: std::env::var("ARRANGER_MAX_AGENTS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(20).clamp(1, 64),
         dirty: false,
         jobs: HashMap::new(),
         next_job: 0,
+        stopping: false,
         chats: HashMap::new(),
         chat_due: None,
     };
@@ -215,7 +233,7 @@ pub fn run() -> io::Result<()> {
 
     let mut events = Events::with_capacity(256);
     loop {
-        let timeout = d.chat_due.map(|due| due.saturating_duration_since(Instant::now()));
+        let timeout = Some(d.chat_due.map_or(Duration::from_secs(1), |due| due.saturating_duration_since(Instant::now()).min(Duration::from_secs(1))));
         if let Err(e) = d.poll.poll(&mut events, timeout) {
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
@@ -223,6 +241,7 @@ pub fn run() -> io::Result<()> {
             return Err(e);
         }
         for ev in &events {
+            if d.stopping { break; }
             match ev.token() {
                 LISTENER => d.accept(),
                 CHILD => d.reap(),
@@ -244,6 +263,12 @@ pub fn run() -> io::Result<()> {
                 t => d.conn_event(t, ev.is_readable(), ev.is_writable()),
             }
         }
+        if d.stopping {
+            d.shutdown(&sock);
+            return Ok(());
+        }
+        let expired: Vec<Token> = d.conns.iter().filter(|(_, c)| (!c.received || !c.inbuf.is_empty()) && c.last_input.elapsed() > Duration::from_secs(30)).map(|(&t, _)| t).collect();
+        for t in expired { d.close(t); }
         if d.dirty {
             d.dirty = false;
             d.push_tasks();
@@ -293,13 +318,12 @@ fn carry_changes(from: &Path, to: &Path) -> Result<(), String> {
         }
         wrote.map_err(|e| format!("git: {e}"))?;
     }
-    let untracked = git(git_in(from).args(["ls-files", "--others", "--exclude-standard", "-z"]))?;
-    for path in untracked.split('\0').filter(|p| !p.is_empty()) {
-        let dst = to.join(path);
-        if let Some(dir) = dst.parent() {
-            fs::create_dir_all(dir).map_err(e2s)?;
-        }
-        fs::copy(from.join(path), &dst).map_err(|e| format!("{path}: {e}"))?;
+    let untracked = git_in(from).args(["ls-files", "--others", "--exclude-standard", "-z"]).output().map_err(e2s)?;
+    if !untracked.status.success() { return Err(String::from_utf8_lossy(&untracked.stderr).into_owned()); }
+    use std::os::unix::ffi::OsStrExt;
+    for path in untracked.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+        let path = Path::new(std::ffi::OsStr::from_bytes(path));
+        security::copy_worktree_file(from, to, path).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -331,7 +355,7 @@ fn flush_log(path: &Path, log: &mut Vec<u8>, zstd: &mut zstd::bulk::Compressor) 
         return;
     }
     let res = zstd.compress(log).and_then(|frame| {
-        fs::OpenOptions::new().create(true).append(true).open(path)?.write_all(&frame)
+        security::private_file(path, true)?.write_all(&frame)
     });
     if let Err(e) = res {
         eprintln!("log {}: {e}", path.display());
@@ -389,6 +413,7 @@ fn e2s(e: impl std::fmt::Display) -> String {
 impl Daemon {
     fn accept(&mut self) {
         while let Ok((mut stream, _)) = self.listener.accept() {
+            if self.conns.len() >= 128 { continue; }
             let t = Token(self.next_conn);
             self.next_conn += 1;
             if self.poll.registry().register(&mut stream, t, Interest::READABLE).is_ok() {
@@ -402,6 +427,8 @@ impl Daemon {
                     watching: false,
                     chat: None,
                     writable: false,
+                    received: false,
+                    last_input: Instant::now(),
                 };
                 self.conns.insert(t, conn);
             }
@@ -417,13 +444,28 @@ impl Daemon {
         }
         let mut buf = [0u8; 16 * 1024];
         let mut closed = false;
+        let mut bad_input = false;
         while let Some(c) = self.conns.get_mut(&t) {
             match c.stream.read(&mut buf) {
                 Ok(0) => {
                     closed = true;
                     break;
                 }
-                Ok(n) => c.inbuf.extend_from_slice(&buf[..n]),
+                Ok(n) => {
+                    c.last_input = Instant::now();
+                    // Check before allocation; a writer must not fill memory before parsing begins.
+                    if c.inbuf.len().saturating_add(n) > (1 << 20) {
+                        closed = true;
+                        bad_input = true;
+                        break;
+                    }
+                    c.inbuf.extend_from_slice(&buf[..n]);
+                    if c.inbuf.len() >= 4 && u32::from_le_bytes(c.inbuf[..4].try_into().unwrap()) > (1 << 20) {
+                        closed = true;
+                        bad_input = true;
+                        break;
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => {
@@ -432,9 +474,13 @@ impl Daemon {
                 }
             }
         }
-        while let Some(msg) = self.conns.get_mut(&t).and_then(|c| proto::unframe(&mut c.inbuf)) {
+        while !bad_input && let Some(msg) = self.conns.get_mut(&t).and_then(|c| proto::unframe(&mut c.inbuf)) {
             match msg {
-                Ok(req) => self.handle(t, req),
+                Ok(req) => {
+                    if let Some(c) = self.conns.get_mut(&t) { c.received = true; }
+                    self.handle(t, req);
+                    if self.stopping { break; }
+                },
                 Err(_) => {
                     closed = true;
                     break;
@@ -466,6 +512,10 @@ impl Daemon {
                 }
             },
             Request::Ping => Reply::Pong,
+            Request::Shutdown => {
+                self.stopping = true;
+                Reply::Ok
+            },
             Request::Chat { id, limit } => match self.chat(id) {
                 Ok(chat) => {
                     let total = chat.items.len();
@@ -496,7 +546,7 @@ impl Daemon {
                 Ok(id) => Reply::Created { id, state: self.state(id) },
                 Err(e) => Reply::Error(e),
             },
-            Request::Log { id } => match fs::read(self.data.join(format!("logs/{id}.zst"))) {
+            Request::Log { id } => match fs::File::open(self.data.join(format!("logs/{id}.zst"))).and_then(|f| security::read_limited(f, MAX_OUTBUF - 1024)) {
                 Ok(bytes) => Reply::Log(bytes),
                 Err(e) => Reply::Error(format!("no log for task {id}: {e}")),
             },
@@ -544,7 +594,7 @@ impl Daemon {
                     let (busy, asking) = (agent.busy(), agent.asking());
                     // Only its terminal has this command: the viewer opens one with it typed.
                     if let Some(command) = agent.terminal(&text).filter(|_| !asking) {
-                        self.send(t, &proto::frame(&Reply::Terminal { command }));
+                        self.send(t, &proto::reply_frame(&Reply::Terminal { command }));
                         return;
                     }
                     let events = agent.prompt(text);
@@ -559,11 +609,7 @@ impl Daemon {
                     Reply::Ok
                 }
                 Some(task) => {
-                    let mut bytes = if task.screen.mode().contains(TermMode::BRACKETED_PASTE) {
-                        format!("\x1b[200~{text}\x1b[201~").into_bytes()
-                    } else {
-                        text.replace('\n', "\r").into_bytes()
-                    };
+                    let mut bytes = security::paste_text(&text, task.screen.mode().contains(TermMode::BRACKETED_PASTE)).into_bytes();
                     bytes.push(b'\r');
                     write_pty(&task.pty.master, &bytes);
                     // Busy agents hold the prompt until their turn ends.
@@ -606,6 +652,10 @@ impl Daemon {
                 return;
             }
             Request::Ask { task, event } => {
+                if !self.tasks.contains_key(&task) || self.asks.iter().any(|a| a.1 == t) {
+                    self.send(t, &proto::reply_frame(&Reply::Decision { allow: Some(false), message: "no live task or another ask is already pending".into() }));
+                    return;
+                }
                 self.record(task, event);
                 if !self.has_native_viewer(task) {
                     self.asks.push((task, t));
@@ -633,7 +683,7 @@ impl Daemon {
             Request::Answer { id, allow, message } => match self.asks.iter().position(|a| a.0 == id) {
                 Some(i) => {
                     let (_, hook) = self.asks.remove(i);
-                    self.send(hook, &proto::frame(&Reply::Decision { allow: Some(allow), message }));
+                    self.send(hook, &proto::reply_frame(&Reply::Decision { allow: Some(allow), message }));
                     self.resume(id);
                     self.dirty = true;
                     Reply::Ok
@@ -721,17 +771,17 @@ impl Daemon {
                 return;
             }
         };
-        self.send(t, &proto::frame(&reply));
+        self.send(t, &proto::reply_frame(&reply));
     }
 
     fn send(&mut self, t: Token, frame: &[u8]) {
         let Some(c) = self.conns.get_mut(&t) else { return };
-        c.outbuf.extend_from_slice(frame);
-        if c.outbuf.len() > MAX_OUTBUF {
+        if c.outbuf.len().saturating_add(frame.len()) > MAX_OUTBUF {
             // ponytail: a viewer this far behind is dropped; it can reattach for a fresh snapshot
             self.close(t);
             return;
         }
+        c.outbuf.extend_from_slice(frame);
         self.flush(t);
     }
 
@@ -739,6 +789,10 @@ impl Daemon {
         let Some(c) = self.conns.get_mut(&t) else { return };
         while !c.outbuf.is_empty() {
             match c.stream.write(&c.outbuf) {
+                Ok(0) => {
+                    self.close(t);
+                    return;
+                }
                 Ok(n) => {
                     c.outbuf.drain(..n);
                 }
@@ -791,7 +845,7 @@ impl Daemon {
     }
 
     fn resize_shell(&mut self, id: u64, cols: u16, rows: u16) {
-        let (cols, rows) = (cols.max(2), rows.max(1));
+        let (cols, rows) = crate::screen::bounded_size(cols, rows);
         if let Some(shell) = self.shells.get_mut(&id) {
             let _ = pty::resize(&shell.pty.master, cols, rows);
             shell.screen.resize(cols, rows);
@@ -809,7 +863,7 @@ impl Daemon {
                     if shell.viewers.is_empty() {
                         write_pty(&shell.pty.master, &replies);
                     }
-                    let frame = proto::frame(&Reply::Output(buf[..n].to_vec()));
+                    let frame = proto::reply_frame(&Reply::Output(buf[..n].to_vec()));
                     for v in shell.viewers.clone() {
                         self.send(v, &frame);
                     }
@@ -826,7 +880,7 @@ impl Daemon {
         let _ = rustix::process::kill_process_group(Pid::from_child(&shell.pty.child), Signal::KILL);
         let _ = shell.pty.child.wait();
         let _ = self.poll.registry().deregister(&mut SourceFd(&shell.pty.master.as_raw_fd()));
-        let frame = proto::frame(&Reply::Exited);
+        let frame = proto::reply_frame(&Reply::Exited);
         for v in shell.viewers {
             if let Some(c) = self.conns.get_mut(&v) {
                 (c.attached, c.shell) = (None, false);
@@ -845,7 +899,7 @@ impl Daemon {
 
     fn resize(&mut self, id: u64, cols: u16, rows: u16) {
         // alacritty panics below its minimum size (e.g. a 0x0 pty from `script`)
-        let (cols, rows) = (cols.max(2), rows.max(1));
+        let (cols, rows) = crate::screen::bounded_size(cols, rows);
         if let Some(task) = self.tasks.get_mut(&id).filter(|t| t.headless.is_none()) {
             let _ = pty::resize(&task.pty.master, cols, rows);
             task.screen.resize(cols, rows);
@@ -871,8 +925,11 @@ impl Daemon {
         if let Some(agent) = &mut task.headless {
             let session = agent.session().to_string();
             let (events, lines) = agent.feed(bytes);
+            if agent.failed() {
+                let _ = rustix::process::kill_process_group(Pid::from_child(&task.pty.child), Signal::KILL);
+            }
             if agent.session() != session {
-                let _ = fs::write(headless::session_file(&self.data, id), agent.session());
+                let _ = security::write_private(&headless::session_file(&self.data, id), agent.session().as_bytes());
             }
             task.log.extend_from_slice(&lines);
             if task.log.len() >= LOG_CHUNK {
@@ -899,7 +956,7 @@ impl Daemon {
             // Attached viewers' own terminals answer queries; answer only when nobody is.
             write_pty(&task.pty.master, &replies);
         }
-        let frame = proto::frame(&Reply::Output(bytes.to_vec()));
+        let frame = proto::reply_frame(&Reply::Output(bytes.to_vec()));
         for v in task.viewers.clone() {
             self.send(v, &frame);
         }
@@ -968,8 +1025,8 @@ impl Daemon {
                 return Err(format!("task {id} runs in a terminal; it has no chat"));
             }
             let mut chat = Chat::new(&agent, &wt);
-            if let Ok(zst) = fs::read(log_path(&self.data, id, true)) {
-                chat.feed(&zstd::decode_all(&zst[..]).unwrap_or_default());
+            if let Ok(file) = fs::File::open(log_path(&self.data, id, true)) {
+                chat.feed(&security::decode_log(file).map_err(e2s)?);
             }
             if let Some(task) = self.tasks.get(&id) {
                 chat.feed(&task.log); // not flushed to the file yet
@@ -986,7 +1043,7 @@ impl Daemon {
         let mut frames: Vec<(u64, Vec<u8>)> = Vec::new();
         for (&id, chat) in &mut self.chats {
             for index in chat.take_changed() {
-                frames.push((id, proto::frame(&Reply::ChatPatch { index, item: chat.items[index].clone() })));
+                frames.push((id, proto::reply_frame(&Reply::ChatPatch { index, item: chat.items[index].clone() })));
             }
         }
         for (id, frame) in frames {
@@ -1009,6 +1066,9 @@ impl Daemon {
         line.push(b'\n');
         if let Some(task) = self.tasks.get_mut(&id) {
             task.log.extend_from_slice(&line);
+            if task.log.len() >= LOG_CHUNK {
+                flush_log(&log_path(&self.data, id, true), &mut task.log, &mut self.zstd);
+            }
         }
         if let Some(chat) = self.chats.get_mut(&id) {
             chat.feed(&line);
@@ -1070,7 +1130,7 @@ impl Daemon {
             return;
         }
         let Ok(tasks) = self.list(false) else { return };
-        let frame = proto::frame(&Reply::Tasks(tasks));
+        let frame = proto::reply_frame(&Reply::Tasks(tasks));
         for t in watchers {
             self.send(t, &frame);
         }
@@ -1116,7 +1176,7 @@ impl Daemon {
 
     /// Hands pending asks back to the agent undecided, so it shows its own prompt to the viewer.
     fn release_asks(&mut self, id: u64) {
-        let frame = proto::frame(&Reply::Decision { allow: None, message: String::new() });
+        let frame = proto::reply_frame(&Reply::Decision { allow: None, message: String::new() });
         let (mine, rest): (Vec<_>, Vec<_>) = self.asks.drain(..).partition(|a| a.0 == id);
         self.asks = rest;
         self.dirty |= !mine.is_empty();
@@ -1158,7 +1218,7 @@ impl Daemon {
     fn finish(&mut self, id: u64, state: &str) {
         let Some(mut task) = self.tasks.remove(&id) else { return };
         flush_log(&log_path(&self.data, id, task.headless.is_some()), &mut task.log, &mut self.zstd);
-        let frame = proto::frame(&Reply::Exited);
+        let frame = proto::reply_frame(&Reply::Exited);
         for v in task.viewers {
             if let Some(c) = self.conns.get_mut(&v) {
                 c.attached = None;
@@ -1319,16 +1379,8 @@ impl Daemon {
             let (argv, env) = adapter::launch(&agent, prompt, &model, &effort, session.as_deref(), fork, &self.exe, &self.data).map_err(e2s)?;
             (argv, env, None)
         };
-        let mut cmd = if Path::new(&wt).join(".arranger/setup").exists() {
-            let mut sh = Command::new("sh");
-            // On stderr: a headless agent's stdout is its JSON stream.
-            sh.args(["-c", "./.arranger/setup >&2 && exec \"$0\" \"$@\""]).args(&argv);
-            sh
-        } else {
-            let mut cmd = Command::new(&argv[0]);
-            cmd.args(&argv[1..]);
-            cmd
-        };
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
         for key in adapter::PARENT_SESSION_ENV {
             cmd.env_remove(key);
         }
@@ -1341,7 +1393,7 @@ impl Daemon {
             .env("PORT", (20000 + id % 1000 * 10).to_string()); // PORT..PORT+9 is this task's
         let (cols, rows) = (80, 24);
         let pty = if headless {
-            let stderr = fs::File::options().create(true).append(true).open(self.data.join(format!("logs/{id}.stderr"))).map_err(e2s)?;
+            let stderr = security::private_file(&self.data.join(format!("logs/{id}.stderr")), true).map_err(e2s)?;
             pty::spawn_stdio(cmd, stderr)
         } else {
             pty::spawn(cmd, cols, rows)
@@ -1520,6 +1572,11 @@ impl Daemon {
         let message = if message.trim().is_empty() { title.lines().next().unwrap_or("arranger task").to_string() } else { message.to_string() };
         let summary = self.review(id).map(|r| r.summary).unwrap_or_default();
         let base = if base == "HEAD" { String::new() } else { base };
+        if ship != Ship::Commit {
+            if base.is_empty() { return Err("no base branch selected".into()); }
+            git(git_in(Path::new(&wt)).args(["check-ref-format", "--branch", &base]))?;
+            git(git_in(Path::new(&wt)).args(["show-ref", "--verify", &format!("refs/heads/{base}")]))?;
+        }
         let (out, write) = std::io::pipe().map_err(e2s)?;
         let child = Command::new("sh")
             .args(["-c", review::COMMIT_SCRIPT, "arranger-commit", &message, match ship { Ship::Commit => "", Ship::Merge => "merge", Ship::Pr => "pr" }, &summary, &base])
@@ -1544,7 +1601,10 @@ impl Daemon {
         loop {
             match (&job.out).read(&mut buf) {
                 Ok(0) => break,
-                Ok(k) => job.buf.extend_from_slice(&buf[..k]),
+                Ok(k) => {
+                    let keep = k.min((1usize << 20).saturating_sub(job.buf.len()));
+                    job.buf.extend_from_slice(&buf[..keep]);
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => break,
@@ -1572,15 +1632,18 @@ impl Daemon {
             let _ = self.db.execute("UPDATE tasks SET shipped = ?1, updated = ?2 WHERE id = ?3", params![shipped, now(), job.task]);
             self.dirty = true;
         }
-        self.send(job.conn, &proto::frame(&Reply::JobDone { ok, output }));
+        self.send(job.conn, &proto::reply_frame(&Reply::JobDone { ok, output }));
     }
 
     fn events(&self, id: u64) -> Result<Vec<(u64, Event)>, String> {
         let mut stmt = self.db.prepare("SELECT ts, event FROM events WHERE task = ?1 ORDER BY id").map_err(e2s)?;
         let rows = stmt.query_map([id], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?))).map_err(e2s)?;
         let mut events = Vec::new();
+        let mut bytes = 0usize;
         for row in rows {
             let (ts, json) = row.map_err(e2s)?;
+            bytes = bytes.saturating_add(json.len());
+            if bytes > (8 << 20) || events.len() >= 100_000 { return Err("event history exceeds the in-memory limit".into()); }
             events.push((ts, serde_json::from_str(&json).map_err(e2s)?));
         }
         Ok(events)

@@ -103,12 +103,27 @@ pub fn diff(worktree: &Path, base: &str, only: Option<&str>) -> Result<Vec<FileD
     }
 
     let mut files = Vec::new();
+    let mut total_bytes = 0usize;
     for path in paths.into_iter().filter(|p| only.is_none_or(|o| o == p)) {
+        crate::security::relative_path(Path::new(&path)).map_err(e2s)?;
         let old = match base_tree.lookup_entry_by_path(&path).map_err(e2s)? {
-            Some(entry) if entry.mode().is_blob() => Some(entry.object().map_err(e2s)?.data.clone()),
+            Some(entry) if entry.mode().is_blob() || entry.mode().is_link() => {
+                if repo.find_header(entry.object_id()).map_err(e2s)?.size() > (2 << 20) {
+                    return Err(format!("{path}: file exceeds the 2 MiB review limit"));
+                }
+                Some(entry.object().map_err(e2s)?.data.clone())
+            },
             _ => None,
         };
-        let new = std::fs::read(worktree.join(&path)).ok();
+        let new = match crate::security::worktree_file(worktree, Path::new(&path), 2 << 20) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("{path}: {e}")),
+        };
+        total_bytes += old.as_ref().map_or(0, Vec::len) + new.as_ref().map_or(0, Vec::len);
+        if total_bytes > (8 << 20) || files.len() >= 2000 {
+            return Err("diff exceeds the review limit (8 MiB or 2000 files); review it with git".into());
+        }
         if old == new {
             continue;
         }
@@ -195,12 +210,27 @@ fn scope(lines: &[&str], start: u32) -> Option<String> {
 
 /// A one-hunk unified patch, for `git apply`.
 fn patch(file: &FileDiff, hunk: &Hunk) -> String {
+    // Git's C quoting keeps tabs/newlines in filenames from creating additional patch headers.
+    let quote = |path: &str| {
+        if path == "/dev/null" { return path.to_string(); }
+        let mut out = String::from("\"");
+        for b in path.bytes() {
+            match b {
+                b'"' => out.push_str("\\\""),
+                b'\\' => out.push_str("\\\\"),
+                0x20..=0x7e => out.push(b as char),
+                _ => out.push_str(&format!("\\{b:03o}")),
+            }
+        }
+        out.push('"');
+        out
+    };
     let (a, b) = match file.status {
         'A' => ("/dev/null".to_string(), format!("b/{}", file.path)),
         'D' => (format!("a/{}", file.path), "/dev/null".to_string()),
         _ => (format!("a/{}", file.path), format!("b/{}", file.path)),
     };
-    let mut p = format!("--- {a}\n+++ {b}\n{}\n", hunk.header.split("  ").next().unwrap_or(&hunk.header));
+    let mut p = format!("--- {}\n+++ {}\n{}\n", quote(&a), quote(&b), hunk.header.split("  ").next().unwrap_or(&hunk.header));
     for l in &hunk.lines {
         p.push(l.kind);
         p.push_str(&l.text);
@@ -354,7 +384,12 @@ mod tests {
         let base = resolve(&dir, "HEAD").unwrap();
         std::fs::write(dir.join("f.txt"), old.replace("line 2\n", "two\n").replace("line 18\n", "eighteen\n")).unwrap();
         std::fs::write(dir.join("new.txt"), "hello\n").unwrap();
+        let unusual = "line\nbreak\t\"\\.txt";
+        std::fs::write(dir.join(unusual), "safe content\n").unwrap();
 
+        let unusual_diff = diff(&dir, &base, Some(unusual)).unwrap();
+        revert(&dir, &base, unusual, &unusual_diff[0].hunks[0].header).unwrap();
+        assert!(!dir.join(unusual).exists());
         let files = diff(&dir, &base, None).unwrap();
         assert_eq!(files.iter().map(|f| (f.path.as_str(), f.status)).collect::<Vec<_>>(), [("f.txt", 'M'), ("new.txt", 'A')]);
         assert_eq!(files[0].hunks.len(), 2);

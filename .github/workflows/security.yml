@@ -1,0 +1,38 @@
+name: security
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '23 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: cargo audit --deny warnings
+  test:
+    strategy:
+      matrix:
+        os: [macos-14, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libgl-dev
+      - run: cargo test --locked
+      # Existing UI and launch APIs intentionally have many parameters and tuple payloads.
+      - run: cargo clippy --locked --all-targets -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity
+      - run: sh -n scripts/install.sh
+      - run: python3 tests/install.py

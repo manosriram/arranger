@@ -18,7 +18,6 @@ repo() {
 cleanup() {
     for h in "$demo"/hosts/*; do ARRANGER_HOME=$h "$bin" stop >/dev/null 2>&1 || true; done
     ARRANGER_HOME=$demo "$bin" stop >/dev/null 2>&1 || true
-    pkill -f "sleep 86399" 2>/dev/null || true
     rm -rf "$demo"
 }
 
@@ -31,15 +30,15 @@ shot() {
     mkdir -p "$demo/bin"
     for a in claude codex gemini; do ln -s "$src/scripts/demo-agent.py" "$demo/bin/$a"; done
     ln -s "$bin" "$demo/bin/arranger"
-    # Stand-in for ssh: each machine is a daemon under hosts/<name> here, and a "tunnel" a symlink.
+    # Stand-in for ssh: each machine is a daemon under hosts/<name>, reached by a private socket.
     cat > "$demo/bin/ssh" <<EOF
 #!/bin/sh
 fwd= host=
 while [ \$# -gt 0 ]; do # options come before and after the host
-  case \$1 in -o) shift 2 ;; -N) shift ;; -L) fwd=\$2; shift 2 ;; *) [ -z "\$host" ] || break; host=\$1; shift ;; esac
+  case \$1 in -o) shift 2 ;; -N | --) shift ;; -L) fwd=\$2; shift 2 ;; *) [ -z "\$host" ] || break; host=\$1; shift ;; esac
 done
 export ARRANGER_HOME=$demo/hosts/\$host
-if [ -n "\$fwd" ]; then ln -sf "\${fwd#*:}" "\${fwd%%:*}"; exec sleep 86399; fi
+if [ -n "\$fwd" ]; then exec python3 "$src/scripts/demo-tunnel.py" "\$fwd"; fi
 exec sh -c "\$*"
 EOF
     chmod +x "$demo/bin/ssh"

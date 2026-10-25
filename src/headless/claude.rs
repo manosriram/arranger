@@ -8,24 +8,20 @@ use super::{Ask, Core, Transport, detail, error_message, string};
 use crate::adapter;
 use crate::proto::Event;
 use serde_json::{Value, json};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Arguments after the program. `resume` is the session to carry on ("" for the latest in this
 /// directory); `fork` carries it on in a new session (a cloned task). `mode` is the permission mode
-/// ("" for the one interactive claude would use, see `default_mode`).
-pub fn argv(model: &str, effort: &str, mode: &str, resume: Option<&str>, fork: bool, cwd: &Path) -> Vec<String> {
+/// ("" uses the interactive approval mode). Project settings are not trusted in chat mode.
+pub fn argv(model: &str, effort: &str, mode: &str, resume: Option<&str>, fork: bool, _cwd: &Path) -> Vec<String> {
     let mut argv: Vec<String> = [
         "--output-format", "stream-json", "--verbose", "--input-format", "stream-json",
         "--include-partial-messages", "--replay-user-messages", "--permission-prompt-tool", "stdio",
-        "--setting-sources", "user,project,local", "--tools", "default",
+        "--setting-sources", "user", "--tools", "default",
     ]
     .map(String::from)
     .into();
-    let mode = if mode.is_empty() { default_mode(cwd) } else { Some(mode.to_string()) };
-    if let Some(mode) = mode {
-        argv.extend(["--permission-mode".into(), mode]);
-    }
+    argv.extend(["--permission-mode".into(), if mode.is_empty() { "default".into() } else { mode.into() }]);
     match resume {
         Some("") => argv.push("--continue".into()),
         Some(session) => argv.extend(["--resume".into(), session.into()]),
@@ -41,23 +37,6 @@ pub fn argv(model: &str, effort: &str, mode: &str, resume: Option<&str>, fork: b
         argv.extend(["--effort".into(), effort.into()]);
     }
     argv
-}
-
-/// Interactive claude starts in the settings' `permissions.defaultMode`, else the account's default
-/// (auto, where it's offered); headless claude would start in "default". None leaves it to the
-/// settings, which claude reads itself.
-fn default_mode(cwd: &Path) -> Option<String> {
-    let files = [config_dir().join("settings.json"), cwd.join(".claude/settings.json"), cwd.join(".claude/settings.local.json")];
-    let set = files.iter().any(|f| {
-        fs::read(f).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).is_some_and(|v| v["permissions"]["defaultMode"].is_string())
-    });
-    (!set).then(|| "auto".into())
-}
-
-fn config_dir() -> PathBuf {
-    std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".claude"))
 }
 
 pub struct Claude {

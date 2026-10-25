@@ -12,6 +12,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{env, thread};
 
+// Reports include repository and agent text. Only `attach` forwards raw terminal bytes.
+macro_rules! print {
+    ($($arg:tt)*) => { std::print!("{}", arranger::security::terminal_text(&format!($($arg)*))) };
+}
+macro_rules! println {
+    () => { std::println!() };
+    ($($arg:tt)*) => { std::println!("{}", arranger::security::terminal_text(&format!($($arg)*))) };
+}
+macro_rules! eprintln {
+    ($($arg:tt)*) => { std::eprintln!("{}", arranger::security::terminal_text(&format!($($arg)*))) };
+}
+
 const USAGE: &str = "usage: arranger            open the workspace window
        arranger [ls [--files] | new [--headless|--terminal] [--effort <e>] <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
                  | approve <id> | deny <id> [reason] | events <id> | chat <id> | diff <id> | revert <id> <path> <hunk#>
@@ -83,6 +95,7 @@ fn main() {
 }
 
 fn add_machine(name: &str, ssh: &str, repo: &str) -> io::Result<()> {
+    machine::validate_name(name)?;
     let sock = machine::endpoint(ssh)?;
     println!("{name}: daemon at {}", sock.display());
     let mut list = machine::load();
@@ -116,7 +129,8 @@ fn named_link(gui: &std::path::Path) -> Option<std::path::PathBuf> {
     let link = proto::data_dir().join("app/arranger");
     let (a, b) = (fs::metadata(&gui).ok()?, fs::metadata(&link));
     if !b.is_ok_and(|b| (b.dev(), b.ino()) == (a.dev(), a.ino())) {
-        fs::create_dir_all(link.parent()?).ok()?;
+        arranger::security::private_dir(&proto::data_dir()).ok()?;
+        arranger::security::private_dir(link.parent()?).ok()?;
         let _ = fs::remove_file(&link);
         fs::hard_link(&gui, &link).ok()?;
     }
@@ -261,14 +275,16 @@ fn chat(id: u64) -> io::Result<()> {
 /// forwards events, and for permission asks waits for the human and prints the decision.
 fn hook(adapter: &str) -> io::Result<()> {
     let Some(task) = env::var("ARRANGER_TASK").ok().and_then(|t| t.parse().ok()) else { return Ok(()) };
-    let mut sock = UnixStream::connect(proto::socket_path())?; // no auto-start: no daemon, no tracking
+    let path = proto::socket_path();
+    arranger::security::check_socket(&path)?;
+    let mut sock = UnixStream::connect(path)?; // no auto-start: no daemon, no tracking
     let mut totals = adapter::Totals::default();
     for value in serde_json::Deserializer::from_reader(io::stdin().lock()).into_iter() {
         let value: serde_json::Value = value?;
         // rollout-<time>-<uuid>.jsonl names the session too
         let rollout = value["transcript_path"].as_str().and_then(|p| p.strip_suffix(".jsonl")).and_then(|p| p.get(p.len().saturating_sub(36)..));
         if let Some(session) = value["session_id"].as_str().or(rollout).filter(|_| adapter == "codex") {
-            let _ = fs::write(adapter::codex_session(&proto::data_dir(), task), session);
+            let _ = arranger::security::write_private(&adapter::codex_session(&proto::data_dir(), task), session.as_bytes());
         }
         let (events, ask) = adapter::parse(adapter, &value, &mut totals);
         for event in events {

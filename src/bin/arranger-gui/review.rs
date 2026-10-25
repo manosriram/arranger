@@ -1147,9 +1147,10 @@ fn open_worktree_terminal(path: &str, remote: Option<&str>) -> std::io::Result<(
     if path.is_empty() {
         return Err(std::io::Error::other("Task has no worktree"));
     }
+    if let Some(host) = remote { arranger::machine::validate_target(host)?; }
     let script = format!("cd -- {} && exec \"${{SHELL:-/bin/sh}}\" -l", shell_quote(path));
     let command = match remote {
-        Some(host) => format!("ssh -t -- {} {}", shell_quote(host), shell_quote(&script)),
+        Some(host) => format!("ssh -t -o StrictHostKeyChecking=yes -o ForwardAgent=no -o ForwardX11=no -- {} {}", shell_quote(host), shell_quote(&script)),
         None => script,
     };
     if cfg!(target_os = "macos") {

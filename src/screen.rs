@@ -12,6 +12,10 @@ use std::rc::Rc;
 
 const SCROLLBACK: usize = 2000;
 
+pub fn bounded_size(cols: u16, rows: u16) -> (u16, u16) {
+    (cols.clamp(2, 400), rows.clamp(1, 200))
+}
+
 /// Collects the bytes the terminal wants written back to the PTY (query replies).
 #[derive(Clone, Default)]
 struct Replies(Rc<RefCell<Vec<u8>>>);
@@ -49,6 +53,7 @@ pub struct Screen {
 
 impl Screen {
     pub fn new(cols: u16, rows: u16) -> Self {
+        let (cols, rows) = bounded_size(cols, rows);
         let replies = Replies::default();
         let config = Config { scrolling_history: SCROLLBACK, ..Config::default() };
         let size = Size { cols: cols.into(), rows: rows.into() };
@@ -75,6 +80,7 @@ impl Screen {
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        let (cols, rows) = bounded_size(cols, rows);
         self.term.resize(Size { cols: cols.into(), rows: rows.into() });
     }
 
@@ -201,6 +207,13 @@ fn color(s: &mut String, color: Color, base: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_dimensions_are_bounded_before_allocation() {
+        assert_eq!(bounded_size(0, 0), (2, 1));
+        let screen = Screen::new(u16::MAX, u16::MAX);
+        assert_eq!((screen.grid().columns(), screen.grid().screen_lines()), (400, 200));
+    }
 
     fn text(s: &Screen) -> Vec<String> {
         let g = s.term.grid();

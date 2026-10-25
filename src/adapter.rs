@@ -36,7 +36,7 @@ pub const PARENT_SESSION_ENV: &[&str] = &[
 /// matches sessions from the main checkout and sibling worktrees. `fork` resumes into a new
 /// session of its own (a cloned task), leaving the one it came from as it was.
 pub fn launch(agent: &str, prompt: &str, model: &str, effort: &str, resume: Option<&str>, fork: bool, exe: &Path, data: &Path) -> io::Result<(Vec<String>, Vec<(String, String)>)> {
-    let hook = |name: &str| format!("'{}' hook {name}", exe.display());
+    let hook = |name: &str| format!("{} hook {name}", crate::security::shell_quote(&exe.to_string_lossy()));
     let mut argv = vec![agent.to_string()];
     if let Some(session) = resume {
         // ponytail: gemini's and pi's flags are from their docs, untested here
@@ -66,7 +66,6 @@ pub fn launch(agent: &str, prompt: &str, model: &str, effort: &str, resume: Opti
             env.push(("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN".into(), "1".into()));
         }
         "codex" => {
-            argv.push("--dangerously-bypass-hook-trust".into());
             let command = serde_json::to_string(&hook("codex")).unwrap(); // a valid TOML basic string
             for (event, timeout) in
                 [("UserPromptSubmit", 10), ("PreToolUse", 10), ("PostToolUse", 10), ("PermissionRequest", ASK_TIMEOUT), ("Stop", 30)]
@@ -82,12 +81,12 @@ pub fn launch(agent: &str, prompt: &str, model: &str, effort: &str, resume: Opti
                 "BeforeAgent": h, "BeforeTool": h, "AfterTool": h, "AfterAgent": h, "Notification": h,
             }});
             let path = data.join("adapters/gemini.json");
-            fs::write(&path, settings.to_string())?;
+            crate::security::write_private(&path, settings.to_string().as_bytes())?;
             env.push(("GEMINI_CLI_SYSTEM_SETTINGS_PATH".into(), path.display().to_string()));
         }
         "pi" => {
             let path = data.join("adapters/pi.ts");
-            fs::write(&path, PI_EXTENSION)?;
+            crate::security::write_private(&path, PI_EXTENSION.as_bytes())?;
             argv.extend(["-e".into(), path.display().to_string()]);
         }
         _ => {}
@@ -98,7 +97,7 @@ pub fn launch(agent: &str, prompt: &str, model: &str, effort: &str, resume: Opti
     if !effort.is_empty() {
         match kind(agent) {
             "claude" => argv.extend(["--effort".into(), effort.into()]),
-            "codex" => argv.extend(["-c".into(), format!("model_reasoning_effort=\"{effort}\"")]),
+            "codex" => argv.extend(["-c".into(), format!("model_reasoning_effort={}", serde_json::to_string(effort)?)]),
             "pi" => argv.extend(["--thinking".into(), effort.into()]),
             _ => {}
         }
@@ -107,7 +106,7 @@ pub fn launch(agent: &str, prompt: &str, model: &str, effort: &str, resume: Opti
     if !prompt.is_empty() {
         match kind(agent) {
             "gemini" => argv.push(format!("--prompt-interactive={prompt}")), // its positional prompt runs non-interactively
-            "pi" => argv.push(prompt.into()), // ponytail: whether pi takes `--` is untested
+            "pi" => argv.extend(["--".into(), prompt.into()]),
             _ => argv.extend(["--".into(), prompt.into()]),
         }
     }
@@ -135,7 +134,7 @@ pub fn copy_session(agent: &str, data: &Path, from: (u64, &Path), to: (u64, &Pat
             fs::copy(latest.path(), dst.join(latest.file_name())).map(drop)
         }
         "codex" => match fs::read_to_string(codex_session(data, from.0)) {
-            Ok(id) if !id.trim().is_empty() => fs::write(codex_session(data, to.0), id),
+            Ok(id) if !id.trim().is_empty() => crate::security::write_private(&codex_session(data, to.0), id.as_bytes()),
             _ => Err(io::Error::other("it has no codex session yet")),
         },
         other => Err(io::Error::other(format!("{other} sessions can't be cloned"))),
