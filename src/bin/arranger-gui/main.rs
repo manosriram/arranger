@@ -159,6 +159,9 @@ enum Focus {
 struct Dialog {
     completion: completion::Completion,
     prompt: String,
+    prompt_scroll: f32,
+    prompt_bounds: Option<Rect>,
+    prompt_position: Option<(usize, usize)>,
     agent: usize,
     /// Index into the agent's `models`; 0 is its default.
     model: usize,
@@ -651,6 +654,11 @@ impl ApplicationHandler<Msg> for App {
                     }
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_NEWTASK").is_some() {
                         self.open_dialog();
+                        if let Ok(path) = std::env::var("ARRANGER_NEWTASK_PROMPT_FILE") {
+                            if let Ok(prompt) = std::fs::read_to_string(path) {
+                                self.insert(&prompt);
+                            }
+                        }
                     }
                     if let Some(key) = self.selected.filter(|_| std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_CLONE").is_some()) {
                         self.open_clone(key);
@@ -1516,6 +1524,12 @@ impl App {
     /// Scrolls whatever is under the mouse by `dy` pixels (positive = towards the top).
     fn scroll_by(&mut self, dy: f32) {
         if self.confirm_delete.is_some() { return; }
+        if let Some(d) = self.dialog.as_mut() {
+            if d.prompt_bounds.is_some_and(|b| b.contains(self.mouse)) {
+                d.prompt_scroll = (d.prompt_scroll - dy).max(0.0);
+            }
+            return;
+        }
         if self.machine_tasks.is_some() {
             self.mt_scroll = (self.mt_scroll - dy).max(0.0);
         } else if let Some(rv) = self.review.as_mut().filter(|_| self.mouse.1 > TITLE_H + review::STRIP_H) {
@@ -1694,7 +1708,7 @@ impl App {
     fn open_dialog(&mut self) {
         // Starts on the selected task's machine.
         let host = self.current().map_or(0, |t| t.machine);
-        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), agent: 0, model: 0, host: 0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: None });
+        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model: 0, host: 0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: None });
         self.pick_host(host);
         self.focus = Focus::Prompt;
         self.anchor = None;
@@ -1707,7 +1721,7 @@ impl App {
         let agent = adapter::kind(&t.agent).to_string();
         let model = models(&agent).iter().position(|m| m.1 == t.model).unwrap_or(0);
         let clone = CloneFrom { key, agent, branch: t.branch.clone(), first: t.title.clone(), last: String::new(), model: Some(t.model.clone()) };
-        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), agent: 0, model, host: key.0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: Some(clone) });
+        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model, host: key.0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: Some(clone) });
         self.focus = Focus::Prompt;
         self.anchor = None;
         self.spawn_request(key.0, Tag::LastPrompt(key), Request::Events { id: key.1 });
@@ -3148,9 +3162,9 @@ impl App {
         let dw = (w - 32.0).min(680.0);
         let pad = 22.0;
         let prompt_lines = wrap(r, &prompt, UI, 16.0, dw - 2.0 * pad);
-        let text_h = (prompt_lines.len().max(3) as f32) * 26.0;
+        let content_h = (prompt_lines.len().max(3) as f32) * 26.0;
         let repo_h = if remote { 44.0 } else { 0.0 };
-        let recent_h = if recent.is_empty() { 0.0 } else { 36.0 + recent.len() as f32 * 36.0 };
+        let mut recent_h = if recent.is_empty() { 0.0 } else { 36.0 + recent.len() as f32 * 36.0 };
         // A clone's prompts so far, quoted, two lines each: what it picks up from.
         let quotes: Vec<(&str, Vec<String>)> = clone.as_ref().map_or_else(Vec::new, |c| {
             [("STARTED FROM", &c.3), ("LAST FROM YOU", &c.4)]
@@ -3167,8 +3181,17 @@ impl App {
                 .collect()
         });
         let clone_h = if clone.is_some() { 30.0 + quotes.iter().map(|q| 22.0 + q.1.len() as f32 * 20.0 + 12.0).sum::<f32>() + 24.0 } else { 0.0 };
-        let dh = 20.0 + clone_h + text_h + 16.0 + 32.0 + 18.0 + repo_h + recent_h + 58.0;
-        let dlg = Rect::new((w - dw) / 2.0, 104.0, dw, dh);
+        // Reserve space for the controls before letting the editor grow. Recent prompts
+        // are optional when a short window needs the space for editing instead.
+        let fixed_h = 20.0 + clone_h + 16.0 + 32.0 + 18.0 + repo_h + 58.0;
+        let available_h = (h - TITLE_H - 32.0).max(0.0);
+        if fixed_h + recent_h + 78.0 > available_h {
+            recent_h = 0.0;
+        }
+        let text_h = content_h.min((available_h - fixed_h - recent_h).max(26.0));
+        let dh = fixed_h + text_h + recent_h;
+        let top = 104.0_f32.min((h - dh - 16.0).max(TITLE_H + 16.0));
+        let dlg = Rect::new((w - dw) / 2.0, top, dw, dh);
         r.rect(Rect::new(dlg.x - 1.0, dlg.y + 6.0, dlg.w + 2.0, dlg.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x1C }));
         r.frame(dlg, 0.0, t.dialog, t.border2);
 
@@ -3198,9 +3221,34 @@ impl App {
             r.text(dlg.x + pad, ty, "What should the agent do? (@ to reference files)", UI, 16.0, 400, t.faint, dlg.w - 2.0 * pad);
         }
         let caret = self.caret_for(Focus::Prompt, &prompt).map(|at| caret_line(&prompt, &prompt_lines, at));
+        let editor = Rect::new(dlg.x + pad, ty, dlg.w - 2.0 * pad, text_h);
+        let d = self.dialog.as_mut().unwrap();
+        let position = (prompt.len(), caret.map_or(0, |c| c.0));
+        if d.prompt_position != Some(position) {
+            if let Some((line, _)) = caret {
+                let y = line as f32 * 26.0;
+                if y < d.prompt_scroll { d.prompt_scroll = y; }
+                if y + 26.0 > d.prompt_scroll + text_h { d.prompt_scroll = y + 26.0 - text_h; }
+            }
+            d.prompt_position = Some(position);
+        }
+        d.prompt_scroll = d.prompt_scroll.min((content_h - text_h).max(0.0));
+        d.prompt_bounds = Some(editor);
+        let scroll = d.prompt_scroll;
+        let old_clip = r.clip();
+        r.set_clip(Some(editor));
         for (i, (line, start)) in prompt_lines.iter().zip(line_starts(&prompt, &prompt_lines)).enumerate() {
+            let y = ty + i as f32 * 26.0 - scroll;
+            if y + 26.0 <= ty || y >= ty + text_h { continue; }
             let at = caret.filter(|c| c.0 == i).map(|c| c.1);
-            self.field_text(r, t, dlg.x + pad, ty + i as f32 * 26.0, line, UI, 16.0, dlg.w - 2.0 * pad, (Focus::Prompt, start), prompt_focus, at, t.work);
+            self.field_text(r, t, dlg.x + pad, y, line, UI, 16.0, dlg.w - 2.0 * pad, (Focus::Prompt, start), prompt_focus, at, t.work);
+        }
+        r.set_clip(old_clip);
+        if content_h > text_h {
+            let thumb_h = (text_h * text_h / content_h).max(16.0).min(text_h);
+            let thumb_y = ty + scroll / (content_h - text_h) * (text_h - thumb_h);
+            r.rect(Rect::new(dlg.x + dlg.w - 8.0, ty, 3.0, text_h), 0.0, t.border);
+            r.rect(Rect::new(dlg.x + dlg.w - 8.0, thumb_y, 3.0, thumb_h), 0.0, t.text3);
         }
         if self.hit_as(r, Rect::new(dlg.x, ty - 20.0, dlg.w, text_h + 32.0), Cursor::Text) {
             self.actions.push(Action::Focus(Focus::Prompt));
@@ -3287,7 +3335,7 @@ impl App {
 
         // Recent prompts, to start from.
         let mut reuse = None;
-        if !recent.is_empty() {
+        if recent_h > 0.0 {
             r.rect(Rect::new(dlg.x + 1.0, y, dlg.w - 2.0, 1.0), 0.0, t.border);
             r.text(dlg.x + pad, y + 12.0, "RECENT", UI, 11.5, 600, t.text3, 100.0);
             for (i, p) in recent.iter().enumerate() {

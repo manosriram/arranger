@@ -10,7 +10,8 @@ struct Home(PathBuf);
 
 impl Home {
     fn arranger(&self, dir: &Path, args: &[&str]) -> (bool, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_arranger")).current_dir(dir).env("ARRANGER_HOME", &self.0)
+        // Inside an arranger task ARRANGER_CLI names that build; the daemon must be this one.
+        let out = Command::new(env!("CARGO_BIN_EXE_arranger")).current_dir(dir).env("ARRANGER_HOME", &self.0).env_remove("ARRANGER_CLI")
             .env("CLAUDE_CONFIG_DIR", self.0.join("claude")).args(args).output().unwrap();
         (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr))
     }

@@ -1,0 +1,9 @@
+Square borders
+For working, queued, done statuses use previously used arranger status svgs
+Do we need overview tab? i dont think that adds any value. Just have a button "See more" somewhere for every machine where you feel right. That opens a pop up with all tasks lazy loaded
+Those tasks will have revive button if dead
+Instead of overview tab, give some ideas on what user needs
+Text should be very easy to read. Use IBM Plex Mono font but make it readable not too conjusted
+Give some new fresh themes, 4 dark 4 light. In dark, add gruvbox as one of them
+Add logo near arranger, from (https://claude.ai/artifact/PDZ84if7WYKb8aXTHjXrKk), pick Seats as logo
+Agent summary should be a summary of that chat, not just pasting agent's last message

@@ -33,6 +33,8 @@ _arranger_jail() {
     *) echo "arranger: $PWD is outside this worktree" >&2; builtin cd -- "$ARRANGER_ROOT" ;;
   esac
 }
+# Like zsh's chpwd: step back at once, not only at the next prompt, so the rest of the line runs inside.
+cd() { builtin cd "$@"; local s=$?; _arranger_jail; return $s; }
 PROMPT_COMMAND="_arranger_jail${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 "#;
 
