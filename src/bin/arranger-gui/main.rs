@@ -156,9 +156,25 @@ enum Focus {
     HostRepo,
 }
 
+#[derive(Default)]
+struct PromptLayout {
+    text: String,
+    width: f32,
+    lines: Vec<String>,
+    starts: Vec<usize>,
+    references: Vec<std::ops::Range<usize>>,
+}
+
+impl PromptLayout {
+    fn matches(&self, text: &str, width: f32) -> bool {
+        self.width == width && self.text == text && !self.lines.is_empty()
+    }
+}
+
 struct Dialog {
     completion: completion::Completion,
     prompt: String,
+    prompt_layout: std::rc::Rc<PromptLayout>,
     prompt_scroll: f32,
     prompt_bounds: Option<Rect>,
     prompt_position: Option<(usize, usize)>,
@@ -1128,14 +1144,20 @@ fn wrap(r: &Renderer, text: &str, font: usize, size: f32, max_w: f32) -> Vec<Str
     let mut lines = Vec::new();
     for para in text.split('\n') {
         let mut line = String::new();
+        let mut width = 0.0;
+        let space = r.advance(font, size, 400, ' ');
         for word in para.split(' ') {
-            let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
-            if !line.is_empty() && r.measure(font, size, 400, &candidate) > max_w {
+            let word_width = r.measure(font, size, 400, word);
+            if !line.is_empty() && width + space + word_width > max_w {
                 lines.push(std::mem::take(&mut line));
-                line = word.to_string();
-            } else {
-                line = candidate;
+                width = 0.0;
             }
+            if !line.is_empty() {
+                line.push(' ');
+                width += space;
+            }
+            line.push_str(word);
+            width += word_width;
         }
         lines.push(line);
     }
@@ -1713,7 +1735,7 @@ impl App {
     fn open_dialog(&mut self) {
         // Starts on the selected task's machine.
         let host = self.current().map_or(0, |t| t.machine);
-        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model: 0, host: 0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: None });
+        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_layout: Default::default(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model: 0, host: 0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: None });
         self.pick_host(host);
         self.focus = Focus::Prompt;
         self.anchor = None;
@@ -1726,7 +1748,7 @@ impl App {
         let agent = adapter::kind(&t.agent).to_string();
         let model = models(&agent).iter().position(|m| m.1 == t.model).unwrap_or(0);
         let clone = CloneFrom { key, agent, branch: t.branch.clone(), first: t.title.clone(), last: String::new(), model: Some(t.model.clone()) };
-        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model, host: key.0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: Some(clone) });
+        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_layout: Default::default(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model, host: key.0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: Some(clone) });
         self.focus = Focus::Prompt;
         self.anchor = None;
         self.spawn_request(key.0, Tag::LastPrompt(key), Request::Events { id: key.1 });
@@ -2310,7 +2332,7 @@ impl App {
     /// press or drag over it puts the caret there. Returns the width.
     fn field_text(&self, r: &mut Renderer, t: &Theme, x: f32, y: f32, s: &str, font: usize, size: f32, max_w: f32, src: (Focus, usize), focused: bool, caret: Option<usize>, color: Rgba) -> f32 {
         let w = if src.0 == Focus::Prompt {
-            let ranges = self.dialog.as_ref().map(|d| completion::reference_ranges(&d.prompt)).unwrap_or_default();
+            let ranges = self.dialog.as_ref().map_or(&[][..], |d| d.prompt_layout.references.as_slice());
             let mut width = 0.0;
             let mut start = 0;
             while start < s.len() && width < max_w {
@@ -3166,7 +3188,16 @@ impl App {
         r.target(Rect::new(0.0, 0.0, w, h), Cursor::Arrow); // nothing under the scrim reacts
         let dw = (w - 32.0).min(680.0);
         let pad = 22.0;
-        let prompt_lines = wrap(r, &prompt, UI, 16.0, dw - 2.0 * pad);
+        let width = dw - 2.0 * pad;
+        let d = self.dialog.as_mut().unwrap();
+        if !d.prompt_layout.matches(&prompt, width) {
+            let lines = wrap(r, &prompt, UI, 16.0, width);
+            let starts = line_starts(&prompt, &lines);
+            let references = completion::reference_ranges(&prompt);
+            d.prompt_layout = std::rc::Rc::new(PromptLayout { text: prompt.clone(), width, lines, starts, references });
+        }
+        let layout = d.prompt_layout.clone();
+        let prompt_lines = &layout.lines;
         let content_h = (prompt_lines.len().max(3) as f32) * 26.0;
         let repo_h = if remote { 44.0 } else { 0.0 };
         let mut recent_h = if recent.is_empty() { 0.0 } else { 36.0 + recent.len() as f32 * 36.0 };
@@ -3225,7 +3256,7 @@ impl App {
         if prompt.is_empty() && clone.is_none() {
             r.text(dlg.x + pad, ty, "What should the agent do? (@ to reference files)", UI, 16.0, 400, t.faint, dlg.w - 2.0 * pad);
         }
-        let caret = self.caret_for(Focus::Prompt, &prompt).map(|at| caret_line(&prompt, &prompt_lines, at));
+        let caret = self.caret_for(Focus::Prompt, &prompt).map(|at| caret_line_at(&layout.lines, &layout.starts, at));
         let editor = Rect::new(dlg.x + pad, ty, dlg.w - 2.0 * pad, text_h);
         let d = self.dialog.as_mut().unwrap();
         let position = (prompt.len(), caret.map_or(0, |c| c.0));
@@ -3242,7 +3273,10 @@ impl App {
         let scroll = d.prompt_scroll;
         let old_clip = r.clip();
         r.set_clip(Some(editor));
-        for (i, (line, start)) in prompt_lines.iter().zip(line_starts(&prompt, &prompt_lines)).enumerate() {
+        let first = (scroll / 26.0).floor() as usize;
+        let end = (((scroll + text_h) / 26.0).ceil() as usize).min(prompt_lines.len());
+        for i in first..end {
+            let (line, start) = (&prompt_lines[i], layout.starts[i]);
             let y = ty + i as f32 * 26.0 - scroll;
             if y + 26.0 <= ty || y >= ty + text_h { continue; }
             let at = caret.filter(|c| c.0 == i).map(|c| c.1);
@@ -3453,11 +3487,21 @@ fn word_right(s: &str, at: usize) -> usize {
 }
 
 /// Which of `text`'s wrapped `lines` holds byte `at`, and where in it.
+#[cfg(test)]
 fn caret_line(text: &str, lines: &[String], at: usize) -> (usize, usize) {
-    for (i, (line, start)) in lines.iter().zip(line_starts(text, lines)).enumerate() {
-        if at <= start + line.len() {
-            return (i, at.saturating_sub(start));
-        }
+    caret_line_at(lines, &line_starts(text, lines), at)
+}
+
+fn caret_line_at(lines: &[String], starts: &[usize], at: usize) -> (usize, usize) {
+    let mut low = 0;
+    let mut high = lines.len();
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if starts[mid] + lines[mid].len() < at { low = mid + 1; } else { high = mid; }
+    }
+    let i = low;
+    if let Some(line) = lines.get(i) {
+        return (i, at.saturating_sub(starts[i]).min(line.len()));
     }
     (lines.len().saturating_sub(1), lines.last().map_or(0, |l| l.len()))
 }
@@ -3468,7 +3512,9 @@ fn line_starts(text: &str, lines: &[String]) -> Vec<usize> {
     let mut pos = 0;
     lines
         .iter()
-        .map(|line| {
+        .enumerate()
+        .map(|(i, line)| {
+            if i > 0 && text[pos..].starts_with('\n') { pos += 1; }
             let start = text[pos..].find(line.as_str()).map_or(pos, |o| pos + o);
             pos = start + line.len();
             start
@@ -3714,6 +3760,30 @@ mod tests {
         assert_eq!(caret_line("fix the bug", &lines, 5), (0, 5));
         assert_eq!(caret_line("fix the bug", &lines, 9), (1, 1));
         assert_eq!(caret_line("fix the bug", &lines, 11), (1, 3));
+    }
+
+    #[test]
+    fn prompt_layout_invalidates_on_edits_and_resize() {
+        let layout = PromptLayout {
+            text: "large prompt".into(),
+            width: 600.0,
+            lines: vec!["large prompt".into()],
+            ..Default::default()
+        };
+        assert!(layout.matches("large prompt", 600.0));
+        assert!(!layout.matches("other prompt", 600.0)); // same byte length
+        assert!(!layout.matches("large prompt", 500.0));
+        assert!(!PromptLayout::default().matches("", 0.0));
+    }
+
+    #[test]
+    fn cached_caret_preserves_empty_and_unicode_lines() {
+        let text = "héllo\n\nworld";
+        let lines = vec!["héllo".into(), "".into(), "world".into()];
+        let starts = line_starts(text, &lines);
+        assert_eq!(caret_line_at(&lines, &starts, 6), (0, 6));
+        assert_eq!(caret_line_at(&lines, &starts, 7), (1, 0));
+        assert_eq!(caret_line_at(&lines, &starts, 8), (2, 0));
     }
 
     #[test]
