@@ -306,14 +306,20 @@ fn new(mut args: &[&str]) -> io::Result<()> {
     let prompt = Some(prompt.join(" ")).filter(|p| !p.is_empty());
     let req = Request::New { agent: agent.to_string(), repo: env::current_dir()?, base: base.map(Into::into), prompt, model: None, effort: effort.into(), headless };
     match request(&req)? {
-        Reply::Created { id, state } => Ok(println!("{id} {state}")),
+        Reply::Created { id, state } => {
+            println!("{id} {state}");
+            Ok(())
+        },
         reply => Err(unexpected(reply)),
     }
 }
 
 fn clone(id: u64, model: Option<&str>, prompt: &[&str]) -> io::Result<()> {
     match request(&Request::Clone { id, prompt: prompt.join(" "), model: model.map(Into::into) })? {
-        Reply::Created { id, state } => Ok(println!("{id} {state}")),
+        Reply::Created { id, state } => {
+            println!("{id} {state}");
+            Ok(())
+        },
         reply => Err(unexpected(reply)),
     }
 }

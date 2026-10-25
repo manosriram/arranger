@@ -258,8 +258,10 @@ impl Chat {
         let thinking = kind == "thinking";
         // The streamed item it completes: the oldest of this message's of the same kind.
         let items = &self.items;
-        let at = self.pending.get(message).and_then(|p| p.iter().position(|&i| matches!(items[i], ChatItem::Thinking { .. }) == thinking));
-        let streamed = at.map(|k| self.pending.get_mut(message).unwrap().remove(k));
+        let streamed = self.pending.get_mut(message).and_then(|pending| {
+            let at = pending.iter().position(|&i| matches!(items[i], ChatItem::Thinking { .. }) == thinking)?;
+            Some(pending.remove(at))
+        });
         let item = if thinking { ChatItem::Thinking { text } } else { ChatItem::Assistant { text } };
         match streamed {
             Some(i) => self.set(i, |old| *old = item),
@@ -274,8 +276,7 @@ impl Chat {
         let (name, input) = (b["name"].as_str().unwrap_or("tool"), &b["input"]);
         if name == "TodoWrite" {
             let items = input["todos"].as_array().into_iter().flatten().map(|t| (string(&t["content"]), string(&t["status"]))).collect();
-            let i = self.push(ChatItem::Todos { items });
-            self.tools.insert(string(&b["id"]), i);
+            self.tool_call(string(&b["id"]), ChatItem::Todos { items });
             return;
         }
         let (kind, target) = self.kind_target(name, input);
@@ -289,8 +290,7 @@ impl Chat {
             ok: None,
             diff: edit_diff(name, input),
         };
-        let i = self.push(item);
-        self.tools.insert(string(&b["id"]), i);
+        self.tool_call(string(&b["id"]), item);
     }
 
     fn user(&mut self, v: &Value) {

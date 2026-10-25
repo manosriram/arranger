@@ -331,7 +331,7 @@ fn flush_log(path: &Path, log: &mut Vec<u8>, zstd: &mut zstd::bulk::Compressor) 
         return;
     }
     let res = zstd.compress(log).and_then(|frame| {
-        fs::OpenOptions::new().create(true).append(true).open(&path)?.write_all(&frame)
+        fs::OpenOptions::new().create(true).append(true).open(path)?.write_all(&frame)
     });
     if let Err(e) = res {
         eprintln!("log {}: {e}", path.display());
@@ -366,10 +366,9 @@ fn checks(events: &[(u64, Event)]) -> Vec<(String, Option<bool>)> {
                 }
             }
             Event::ToolEnd { ok } => {
-                if let Some(cmd) = running.take() {
-                    if let Some(c) = out.iter_mut().find(|(c, _)| *c == cmd) {
-                        c.1 = Some(*ok);
-                    }
+                if let Some(cmd) = running.take()
+                    && let Some(c) = out.iter_mut().find(|(c, _)| *c == cmd) {
+                    c.1 = Some(*ok);
                 }
             }
             _ => {}
@@ -1022,10 +1021,9 @@ impl Daemon {
     fn agent_events(&mut self, id: u64, events: Vec<Event>) {
         let echoes = self.tasks.get(&id).and_then(|t| t.headless.as_ref()).is_none_or(|a| a.echoes());
         for event in events {
-            if let Event::Prompt { text } = &event {
-                if !echoes {
-                    self.chat_line(id, serde_json::json!({"type":"arranger_user","text":text}));
-                }
+            if let Event::Prompt { text } = &event
+                && !echoes {
+                self.chat_line(id, serde_json::json!({"type":"arranger_user","text":text}));
             }
             self.record(id, event);
         }
@@ -1081,14 +1079,13 @@ impl Daemon {
     /// A human answered (approve/deny or typing): back to running unless more asks wait.
     fn resume(&mut self, id: u64) {
         let waiting = self.asks.iter().any(|a| a.0 == id) || self.tasks.get(&id).and_then(|t| t.headless.as_ref()).is_some_and(Agent::asking);
-        if let Some(task) = self.tasks.get_mut(&id) {
-            if task.activity == Activity::NeedsYou && !waiting {
-                task.activity = Activity::Running;
-                task.action = "working".into();
-                task.need = None;
-                task.since = now();
-                self.dirty = true;
-            }
+        if let Some(task) = self.tasks.get_mut(&id)
+            && task.activity == Activity::NeedsYou && !waiting {
+            task.activity = Activity::Running;
+            task.action = "working".into();
+            task.need = None;
+            task.since = now();
+            self.dirty = true;
         }
     }
 

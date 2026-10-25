@@ -688,12 +688,10 @@ impl ApplicationHandler<Msg> for App {
     fn user_event(&mut self, _: &ActiveEventLoop, msg: Msg) {
         match msg {
             Msg::Paths(host, repo, reply) => {
-                if let Some(d) = &mut self.dialog {
-                    if d.host == host && d.repo == repo {
-                        if let Ok(Reply::Paths(paths)) = reply {
-                            d.completion.files = paths;
-                        }
-                    }
+                if let Some(d) = &mut self.dialog
+                    && d.host == host && d.repo == repo
+                    && let Ok(Reply::Paths(paths)) = reply {
+                    d.completion.files = paths;
                 }
             }
             Msg::Tasks(m, tasks) => {
@@ -723,10 +721,9 @@ impl ApplicationHandler<Msg> for App {
                     }
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_NEWTASK").is_some() {
                         self.open_dialog();
-                        if let Ok(path) = std::env::var("ARRANGER_NEWTASK_PROMPT_FILE") {
-                            if let Ok(prompt) = std::fs::read_to_string(path) {
-                                self.insert(&prompt);
-                            }
+                        if let Ok(path) = std::env::var("ARRANGER_NEWTASK_PROMPT_FILE")
+                            && let Ok(prompt) = std::fs::read_to_string(path) {
+                            self.insert(&prompt);
                         }
                     }
                     if let Some(key) = self.selected.filter(|_| std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_CLONE").is_some()) {
@@ -804,10 +801,9 @@ impl ApplicationHandler<Msg> for App {
                 el.exit();
             }
             WindowEvent::Resized(size) => {
-                if let Some(g) = &self.gfx {
-                    if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
-                        g.surface.resize(&g.context, w, h);
-                    }
+                if let Some(g) = &self.gfx
+                    && let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
+                    g.surface.resize(&g.context, w, h);
                 }
                 self.redraw();
             }
@@ -1789,10 +1785,9 @@ impl App {
         let (sock, p) = (self.sock(key.0), self.proxy.clone());
         self.history = None;
         thread::spawn(move || {
-            if let Ok(Reply::Log(zst)) = request_at(sock.as_deref(), &Request::Log { id: key.1 }) {
-                if let Ok(bytes) = zstd::decode_all(&zst[..]) {
-                    let _ = p.send_event(Msg::History(key, bytes));
-                }
+            if let Ok(Reply::Log(zst)) = request_at(sock.as_deref(), &Request::Log { id: key.1 })
+                && let Ok(bytes) = zstd::decode_all(&zst[..]) {
+                let _ = p.send_event(Msg::History(key, bytes));
             }
         });
     }
@@ -1996,11 +1991,10 @@ impl App {
             return;
         }
         // Ctrl+T: the new task in a chat or a terminal.
-        if let (Some(d), true, Key::Character(c)) = (self.dialog.as_ref(), m.control_key() && !app_mod(m), &ev.logical_key) {
-            if c.eq_ignore_ascii_case("t") && d.clone.is_none() {
-                self.actions.push(Action::PickView(!d.chat_view()));
-                return;
-            }
+        if let (Some(d), true, Key::Character(c)) = (self.dialog.as_ref(), m.control_key() && !app_mod(m), &ev.logical_key)
+            && c.eq_ignore_ascii_case("t") && d.clone.is_none() {
+            self.actions.push(Action::PickView(!d.chat_view()));
+            return;
         }
         if app_mod(m) {
             match &ev.logical_key {
@@ -3467,8 +3461,8 @@ impl App {
         r.set_clip(Some(editor));
         let first = (scroll / 26.0).floor() as usize;
         let end = (((scroll + text_h) / 26.0).ceil() as usize).min(prompt_lines.len());
-        for i in first..end {
-            let (line, start) = (&prompt_lines[i], layout.starts[i]);
+        for (i, line) in prompt_lines.iter().enumerate().take(end).skip(first) {
+            let start = layout.starts[i];
             let y = ty + i as f32 * 26.0 - scroll;
             if y + 26.0 <= ty || y >= ty + text_h { continue; }
             let at = caret.filter(|c| c.0 == i).map(|c| c.1);

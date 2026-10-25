@@ -64,9 +64,13 @@ impl Chat {
                 self.tool_done(&id, string(&item["aggregatedOutput"]), Some(ok));
             }
             "fileChange" if started => {
-                let changes = item["changes"].as_array().cloned().unwrap_or_default();
-                let cwd = self.cwd.clone();
-                let paths: Vec<String> = changes.iter().map(|c| string(&c["path"])).map(|p| p.strip_prefix(&cwd).map_or(p.clone(), |r| r.trim_start_matches('/').to_string())).collect();
+                let changes = item["changes"].as_array().map(Vec::as_slice).unwrap_or_default();
+                let paths: Vec<String> = changes.iter().map(|c| string(&c["path"])).map(|p| {
+                    match p.strip_prefix(&self.cwd) {
+                        Some(relative) => relative.trim_start_matches('/').to_string(),
+                        None => p,
+                    }
+                }).collect();
                 let diff = changes.iter().flat_map(change_diff).collect();
                 let tool = ChatItem::Tool { id: id.clone(), name: "Edit".into(), kind: ToolKind::Edit, target: paths.join(", "), input: paths.join("\n"), output: String::new(), ok: None, diff };
                 self.tool_call(id, tool);
@@ -81,8 +85,8 @@ impl Chat {
             }
             "mcpToolCall" | "dynamicToolCall" => {
                 let result = if item["error"].is_object() { &item["error"] } else { &item["result"] };
-                let blocks = result["content"].as_array().or(item["contentItems"].as_array()).cloned().unwrap_or_default();
-                let text: Vec<String> = blocks.iter().filter_map(|c| c["text"].as_str().map(str::to_string)).collect();
+                let blocks = result["content"].as_array().or(item["contentItems"].as_array()).map(Vec::as_slice).unwrap_or_default();
+                let text: Vec<&str> = blocks.iter().filter_map(|c| c["text"].as_str()).collect();
                 let out = if text.is_empty() && !result.is_null() { result.to_string() } else { text.join("\n") };
                 self.tool_done(&id, out, Some(item["status"] == "completed"));
             }
