@@ -51,7 +51,7 @@ use winit::platform::macos::WindowAttributesExtMacOS;
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 const TITLE_H: f32 = 44.0;
-const STATUS_H: f32 = 22.0;
+const STATUS_H: f32 = 26.0;
 const SIDEBAR_W: f32 = 340.0;
 const HEADER_H: f32 = 80.0;
 const ROW_H: f32 = 28.0;
@@ -2777,29 +2777,29 @@ impl App {
             counts[group(&task.state).min(3)] += 1;
         }
         let mut x = 12.0;
-        let y = r.center(bar, MONO, 10.5);
+        let y = r.center(bar, MONO, 11.5);
         if self.vim {
             // NORMAL, or INSERT while keys go to a field or the agent.
             let insert = self.focus != Focus::Normal;
             let label = if insert { "INSERT" } else { "NORMAL" };
-            let pw = r.measure(MONO, 10.5, 500, label) + 18.0;
+            let pw = r.measure(MONO, 11.5, 500, label) + 18.0;
             let pill = Rect::new(0.0, bar.y + 1.0, pw, STATUS_H - 1.0);
             r.rect(pill, 0.0, if insert { t.work } else { t.raised });
-            r.text(9.0, y, label, MONO, 10.5, 500, if insert { t.on_accent } else { t.text }, pw);
+            r.text(9.0, y, label, MONO, 11.5, 500, if insert { t.on_accent } else { t.text }, pw);
             x = pw + 12.0;
             if self.answering.is_some() {
-                x += r.text(x, y, "j/k choose · ↵ answer · esc leave", MONO, 10.5, 500, t.needs, 300.0) + 14.0;
+                x += r.text(x, y, "j/k choose · ↵ answer · esc leave", MONO, 11.5, 500, t.needs, 300.0) + 14.0;
             }
         }
         let confirm = self.confirm_delete.filter(|_| self.focus == Focus::Normal).and_then(|k| self.task(k)).map(title);
         if let Some(name) = &confirm {
             // In place of the counts: the question `d` asked.
-            let qw = r.text(x, y, &format!("Delete task “{name}” and its worktree?"), MONO, 10.5, 500, t.del, (w / 2.0 - x).max(80.0));
-            r.text(x + qw + 10.0, y, "y / n", MONO, 10.5, 400, t.text2, 60.0);
+            let qw = r.text(x, y, &format!("Delete task “{name}” and its worktree?"), MONO, 11.5, 500, t.del, (w / 2.0 - x).max(80.0));
+            r.text(x + qw + 10.0, y, "y / n", MONO, 11.5, 400, t.text2, 60.0);
         }
         for (i, (sym, label)) in [("■", "need you"), ("●", "running"), ("○", "queued"), ("✓", "done")].iter().enumerate().filter(|_| confirm.is_none()) {
             let c = [t.needs, t.work, t.text3, t.done][i];
-            x += r.text(x, y, &format!("{sym} {} {label}", counts[i]), MONO, 10.5, 400, c, 200.0) + 14.0;
+            x += r.text(x, y, &format!("{sym} {} {label}", counts[i]), MONO, 11.5, 400, c, 200.0) + 14.0;
         }
         let lost = matches!(self.hosts[0].link, Link::Down(_));
         let remotes: Vec<&Host> = self.hosts.iter().filter(|h| h.cfg.is_some() && !h.removed).collect();
@@ -2813,23 +2813,23 @@ impl App {
         };
         let mut right_x = w - 12.0;
         let version = concat!("v", env!("CARGO_PKG_VERSION"));
-        let version_w = r.measure(MONO, 10.5, 400, version);
-        r.text(right_x - version_w, y, version, MONO, 10.5, 400, t.text3, version_w + 2.0);
+        let version_w = r.measure(MONO, 11.5, 400, version);
+        r.text(right_x - version_w, y, version, MONO, 11.5, 400, t.text3, version_w + 2.0);
         right_x -= version_w + 14.0;
         if self.vim {
-            let keys = Rect::new(right_x - 46.0, bar.y + 3.0, 46.0, 16.0);
+            let keys = Rect::new(right_x - 50.0, bar.y + 4.0, 50.0, 18.0);
             r.frame(keys, 2.0, t.bg, t.border2);
-            r.text(keys.x + 5.0, r.center(keys, MONO, 10.0), "? keys", MONO, 10.0, 400, t.text2, 46.0);
+            r.text(keys.x + 5.0, r.center(keys, MONO, 11.0), "? keys", MONO, 11.0, 400, t.text2, 50.0);
             if self.hit(r, keys) {
                 self.help = !self.help;
             }
             right_x = keys.x - 12.0;
             if self.pending_g {
-                r.text(right_x - 10.0, y, "g", MONO, 10.5, 400, t.text2, 20.0);
+                r.text(right_x - 10.0, y, "g", MONO, 11.5, 400, t.text2, 20.0);
                 right_x -= 22.0;
             }
         }
-        let rw = r.measure(MONO, 10.5, 400, &right);
+        let rw = r.measure(MONO, 11.5, 400, &right);
         r.text(right_x - rw, y, &right, MONO, 10.5, 400, if lost { t.del } else { t.text3 }, rw + 2.0);
     }
 
