@@ -208,10 +208,10 @@ impl App {
         self.actions.extend(acts);
     }
 
-    /// The scheme menu under its title-bar button: the eight schemes, then the vim keys switch.
+    /// The scheme menu under its title-bar button: the eight schemes, then the preference switches.
     pub fn draw_menu(&mut self, r: &mut Renderer, t: &Theme) {
         let b = self.scheme_btn;
-        let menu = Rect::new(b.x + b.w - 232.0, b.y + b.h + 6.0, 232.0, 12.0 + 2.0 * 24.0 + 8.0 * 30.0 + 13.0 + 30.0);
+        let menu = Rect::new(b.x + b.w - 232.0, b.y + b.h + 6.0, 232.0, 12.0 + 2.0 * 24.0 + 8.0 * 30.0 + 13.0 + 2.0 * 30.0);
         r.rect(Rect::new(menu.x - 1.0, menu.y + 3.0, menu.w + 2.0, menu.h + 2.0), 8.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
         r.frame(menu, 6.0, t.bg, t.border2);
         r.target(menu, Cursor::Arrow);
@@ -246,16 +246,22 @@ impl App {
         }
         r.rect(Rect::new(menu.x + 8.0, y + 6.0, menu.w - 16.0, 1.0), 0.0, t.border);
         y += 13.0;
-        let row = Rect::new(menu.x + 6.0, y, menu.w - 12.0, 30.0);
-        r.text(row.x + 8.0, r.center(row, UI, 12.5), "Vim keys", UI, 12.5, 400, t.text, 120.0);
-        let track = Rect::new(row.x + row.w - 34.0, row.y + 8.0, 26.0, 14.0);
-        let state = if self.vim { "on" } else { "off" };
-        let sw = r.measure(MONO, 10.5, 400, state);
-        r.text(track.x - 8.0 - sw, r.center(row, MONO, 10.5), state, MONO, 10.5, 400, t.text3, sw + 2.0);
-        r.rect(track, 7.0, if self.vim { t.work } else { t.border2 });
-        r.rect(Rect::new(track.x + if self.vim { 14.0 } else { 2.0 }, track.y + 2.0, 10.0, 10.0), 5.0, if self.vim { t.on_accent } else { t.text3 });
-        if self.hit(r, row) {
-            acts.push(Action::ToggleVim);
+        for (label, enabled, action) in [
+            ("Vim keys", self.vim, Action::ToggleVim),
+            ("Ding sound", !self.ding_muted, Action::ToggleDing),
+        ] {
+            let row = Rect::new(menu.x + 6.0, y, menu.w - 12.0, 30.0);
+            r.text(row.x + 8.0, r.center(row, UI, 12.5), label, UI, 12.5, 400, t.text, 120.0);
+            let track = Rect::new(row.x + row.w - 34.0, row.y + 8.0, 26.0, 14.0);
+            let state = if enabled { "on" } else { "off" };
+            let sw = r.measure(MONO, 10.5, 400, state);
+            r.text(track.x - 8.0 - sw, r.center(row, MONO, 10.5), state, MONO, 10.5, 400, t.text3, sw + 2.0);
+            r.rect(track, 7.0, if enabled { t.work } else { t.border2 });
+            r.rect(Rect::new(track.x + if enabled { 14.0 } else { 2.0 }, track.y + 2.0, 10.0, 10.0), 5.0, if enabled { t.on_accent } else { t.text3 });
+            if self.hit(r, row) {
+                acts.push(action);
+            }
+            y += 30.0;
         }
         // A click anywhere else closes it.
         if self.click.is_some_and(|p| !menu.contains(p) && !b.contains(p)) {

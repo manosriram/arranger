@@ -44,7 +44,7 @@ On Linux use Ctrl+Shift in place of ⌘.
 
 Each agent runs in its own terminal, drawn as-is and sized to the pane. When it asks for permission or a choice, answer in its own menu: ↑/↓ and ↵, or with Vim keys on, normal mode switches on by itself and j/k/↵ work the menu.
 
-A soft ding plays when an agent finishes or needs your help. On Linux, sound requires `paplay` (PulseAudio/PipeWire) or `aplay` (ALSA).
+A soft ding plays when an agent finishes or needs your help. Toggle **Ding sound** in the scheme menu (top right) to turn it off or on; your preference is saved. On Linux, sound requires `paplay` (PulseAudio/PipeWire) or `aplay` (ALSA).
 
 Each task gets its own worktree on a new branch, `arranger/<id>`, made from the base branch you pick when you start it (the current branch by default). The base branch only changes when you merge into it from Review.
 
