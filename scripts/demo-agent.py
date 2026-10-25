@@ -4,7 +4,8 @@
 import json, os, subprocess, sys, time
 
 kind = os.path.basename(sys.argv[0])
-prompt = sys.argv[-1] if len(sys.argv) > 1 and not sys.argv[-1].startswith("-") else ""
+prompt = sys.argv[-1] if len(sys.argv) > 1 else ""
+prompt = prompt.removeprefix("--prompt-interactive=") if prompt.startswith("--prompt-interactive=") or not prompt.startswith("-") else ""  # gemini's form
 hook_bin, cwd = os.environ.get("ARRANGER_BIN", "arranger"), os.getcwd()
 
 def hook(payload):
