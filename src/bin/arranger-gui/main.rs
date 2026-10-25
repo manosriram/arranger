@@ -1707,6 +1707,10 @@ impl App {
             self.menu = false;
             return;
         }
+        if self.dialog.is_some() && ev.logical_key == Key::Named(NamedKey::Tab) {
+            self.actions.push(if m.control_key() || m.shift_key() { Action::PickModel(usize::MAX) } else { Action::PickAgent(usize::MAX) });
+            return;
+        }
         if app_mod(m) {
             match &ev.logical_key {
                 Key::Character(c) => match c.to_lowercase().as_str() {
@@ -1767,10 +1771,6 @@ impl App {
             let order = [Focus::HostSsh, Focus::HostName, Focus::HostRepo];
             let i = order.iter().position(|f| *f == self.focus).map_or(0, |i| (i + 1) % order.len());
             self.actions.push(Action::Focus(order[i]));
-            return;
-        }
-        if self.dialog.is_some() && ev.logical_key == Key::Named(NamedKey::Tab) {
-            self.actions.push(if m.shift_key() { Action::PickModel(usize::MAX) } else { Action::PickAgent(usize::MAX) });
             return;
         }
         // Forward both presses: an agent with its own Vim mode may consume the first Esc
