@@ -623,6 +623,11 @@ impl ApplicationHandler<Msg> for App {
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_NEWTASK").is_some() {
                         self.open_dialog();
                     }
+                    if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_DELETE").is_some() {
+                        self.vim = true;
+                        self.focus = Focus::Normal;
+                        self.confirm_delete = self.current().map(|t| (t.machine, t.id));
+                    }
                 }
                 self.sync_session();
             }
@@ -1417,13 +1422,6 @@ impl App {
                 _ => {}
             }
         }
-        // `d` asked to delete a task: `y` does, any other key doesn't.
-        if let Some(task) = self.confirm_delete.take() {
-            if key == "y" {
-                self.actions.push(Action::Delete(task));
-            }
-            return;
-        }
         let files = self.review.as_ref().and_then(|rv| rv.data.as_ref()).map_or(0, |d| d.files.len());
         let file = self.review.as_ref().map(|rv| rv.file);
         match key.as_str() {
@@ -1460,7 +1458,7 @@ impl App {
 
     /// The sidebar's or review rail's divider under `p`, which a press starts dragging.
     fn divider_at(&self, p: (f32, f32)) -> Option<Divider> {
-        if self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || p.1 < TITLE_H {
+        if self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || p.1 < TITLE_H {
             return None;
         }
         match &self.review {
@@ -1471,6 +1469,7 @@ impl App {
 
     /// Scrolls whatever is under the mouse by `dy` pixels (positive = towards the top).
     fn scroll_by(&mut self, dy: f32) {
+        if self.confirm_delete.is_some() { return; }
         if self.machine_tasks.is_some() {
             self.mt_scroll = (self.mt_scroll - dy).max(0.0);
         } else if let Some(rv) = self.review.as_mut().filter(|_| self.mouse.1 > TITLE_H + review::STRIP_H) {
@@ -1727,6 +1726,17 @@ impl App {
 
     fn key(&mut self, ev: &KeyEvent) {
         let m = self.mods;
+        // Consume confirmation keys before shortcuts or terminal input can handle them.
+        if let Some(task) = self.confirm_delete.take() {
+            if !ev.repeat && !app_mod(m) && !m.control_key()
+                && matches!(&ev.logical_key, Key::Character(c) if c == "y")
+            {
+                self.actions.push(Action::Delete(task));
+            } else if ev.repeat {
+                self.confirm_delete = Some(task);
+            }
+            return;
+        }
         if self.welcome {
             // Nothing else to drive yet: ⌘O opens a folder, ⌘N starts a new project, Esc goes back.
             if ev.logical_key == Key::Named(NamedKey::Escape) && welcome::project_root(&self.repo).is_some() {
@@ -2262,7 +2272,7 @@ impl App {
         }
         self.stale.set(false);
         self.icons.borrow_mut().clear();
-        self.layered = !(self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || (self.help && self.vim) || self.menu);
+        self.layered = !(self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || (self.help && self.vim) || self.menu);
         let dpi = gfx.window.scale_factor() as f32 * self.zoom;
         let (w, h) = (size.width as f32 / dpi, size.height as f32 / dpi);
         let r = &mut gfx.r;
@@ -2270,7 +2280,7 @@ impl App {
 
         self.probe_changes();
         // Under an open dialog or popup nothing reacts: the views below draw without the click.
-        let modal_click = (self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some()).then(|| self.click.take());
+        let modal_click = (self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some()).then(|| self.click.take());
         self.draw_title(r, t, w);
         if self.welcome {
             self.draw_welcome(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H));
@@ -2304,6 +2314,9 @@ impl App {
         }
         if self.menu {
             self.draw_menu(r, t);
+        }
+        if self.confirm_delete.is_some() {
+            self.draw_delete_confirmation(r, t, w, h);
         }
         let cursor = r.finish(self.mouse);
         self.draw_icons(r, t);
@@ -2872,13 +2885,7 @@ impl App {
                 x += r.text(x, y, "j/k choose · ↵ answer · esc leave", MONO, 11.5, 500, t.needs, 300.0) + 14.0;
             }
         }
-        let confirm = self.confirm_delete.filter(|_| self.focus == Focus::Normal).and_then(|k| self.task(k)).map(title);
-        if let Some(name) = &confirm {
-            // In place of the counts: the question `d` asked.
-            let qw = r.text(x, y, &format!("Delete task “{name}” and its worktree?"), MONO, 11.5, 500, t.del, (w / 2.0 - x).max(80.0));
-            r.text(x + qw + 10.0, y, "y / n", MONO, 11.5, 400, t.text2, 60.0);
-        }
-        for (i, (sym, label)) in [("■", "need you"), ("●", "running"), ("○", "queued"), ("✓", "done")].iter().enumerate().filter(|_| confirm.is_none()) {
+        for (i, (sym, label)) in [("■", "need you"), ("●", "running"), ("○", "queued"), ("✓", "done")].iter().enumerate() {
             let c = [t.needs, t.work, t.text3, t.done][i];
             x += r.text(x, y, &format!("{sym} {} {label}", counts[i]), MONO, 11.5, 400, c, 200.0) + 14.0;
         }
