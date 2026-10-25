@@ -1249,7 +1249,8 @@ impl App {
     fn sections(&self) -> Vec<Section<'_>> {
         let f = self.filter.to_lowercase();
         let shown = |t: &&TaskInfo| {
-            f.is_empty() || format!("{} {} {} {}", title(t), t.agent, t.branch, self.hosts[t.machine].name()).to_lowercase().contains(&f)
+            t.shipped != "merged"
+                && (f.is_empty() || format!("{} {} {} {}", title(t), t.agent, t.branch, self.hosts[t.machine].name()).to_lowercase().contains(&f))
         };
         let sort = |v: &mut Vec<&TaskInfo>| v.sort_by_key(|t| (group(&t.state), std::cmp::Reverse(last_event(t)), std::cmp::Reverse(t.id)));
         let mut needs: Vec<&TaskInfo> = self.all_tasks().filter(shown).filter(|t| group(&t.state) == 0).collect();
