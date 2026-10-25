@@ -1606,7 +1606,7 @@ impl App {
 
     /// The sidebar's or review rail's divider under `p`, which a press starts dragging.
     fn divider_at(&self, p: (f32, f32)) -> Option<Divider> {
-        if self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || p.1 < TITLE_H {
+        if self.review.as_ref().is_some_and(|r| r.check_output.is_some()) || self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || p.1 < TITLE_H {
             return None;
         }
         match &self.review {
@@ -2576,7 +2576,7 @@ impl App {
         self.stale.set(false);
         self.icons.borrow_mut().clear();
         self.task_regions.borrow_mut().clear();
-        self.layered = !(self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || (self.help && self.vim) || self.menu || self.task_menu.is_some());
+        self.layered = !(self.review.as_ref().is_some_and(|r| r.check_output.is_some()) || self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || (self.help && self.vim) || self.menu || self.task_menu.is_some());
         let dpi = gfx.window.scale_factor() as f32 * self.zoom;
         let (w, h) = (size.width as f32 / dpi, size.height as f32 / dpi);
         let r = &mut gfx.r;
