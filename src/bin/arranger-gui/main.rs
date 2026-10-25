@@ -1408,16 +1408,22 @@ impl App {
         self.actions.push(Action::Focus(Focus::Term));
     }
 
-    /// Steps Workspace → Review → Terminal; Review needs something to review, Terminal a worktree.
-    fn cycle_view(&mut self) {
+    /// Moves through Workspace → Review → Terminal without wrapping, skipping unavailable tabs.
+    fn move_view(&mut self, forward: bool) {
         if self.review.is_some() {
-            self.actions.push(if self.shellable() { Action::Shell(true) } else { Action::Review(ReviewAction::Close) });
+            if !forward || self.shellable() {
+                self.actions.push(Action::Shell(forward));
+            }
         } else if self.shell {
-            self.actions.push(Action::Shell(false));
-        } else if self.reviewable() {
-            self.actions.push(Action::OpenReview);
-        } else if self.shellable() {
-            self.actions.push(Action::Shell(true));
+            if !forward {
+                self.actions.push(if self.reviewable() { Action::OpenReview } else { Action::Shell(false) });
+            }
+        } else if forward {
+            if self.reviewable() {
+                self.actions.push(Action::OpenReview);
+            } else if self.shellable() {
+                self.actions.push(Action::Shell(true));
+            }
         }
     }
 
@@ -1480,7 +1486,7 @@ impl App {
                 self.review = None;
                 self.actions.push(Action::Focus(Focus::Term));
             }
-            "h" | "l" if self.machine_tasks.is_none() => self.cycle_view(),
+            "h" | "l" if self.machine_tasks.is_none() => self.move_view(key == "l"),
             "o" if self.machine_tasks.is_some() => self.open_from_popup(),
             "o" if self.review.is_none() && self.current().is_some() => self.actions.push(Action::Focus(Focus::Term)),
             "d" if self.review.is_none() && self.machine_tasks.is_none() => self.confirm_delete = self.current().map(|t| (t.machine, t.id)),
