@@ -35,6 +35,7 @@ That's it: it starts the daemon if needed and opens the window. Closing the wind
 | Key | Action |
 |-----|--------|
 | ⌘N | New task: pick an agent and its model, write the prompt |
+| ⌘D | Clone the selected task, including its chat and edits |
 | ⌘J / ⌘K | Next / previous agent |
 | ⌘I | Type into the selected agent's terminal |
 | ⌘R | Review the diff: revert hunks, comment, then merge (or commit, or open a PR). Greyed out while there's nothing to review |
@@ -42,6 +43,8 @@ That's it: it starts the daemon if needed and opens the window. Closing the wind
 | ⌘T | Switch between dark and light |
 
 On Linux use Ctrl+Shift in place of ⌘.
+
+In the new-task dialog, Tab cycles agents and Ctrl+Tab cycles models. Click the agent, model, machine or base-branch controls to choose them directly; Enter starts the task.
 
 In the new-task prompt, type `@` to find repository files. Use ↑/↓ to choose, Enter or Tab to insert a reference, and Esc to dismiss the picker. Files come from the selected machine’s repository; ignored files are excluded.
 
@@ -59,6 +62,8 @@ If merging hits a conflict, `main` is left alone: the conflict lands in the agen
 
 **Clone** in the task's header (⌘D, or `c` with Vim keys on) clones the selected task: a new task on its own worktree and branch, made from the task's current state (uncommitted edits too), whose agent carries on from a fork of the same chat. The new-task box opens showing what the task was asked so far and asks what the clone should do differently; leave it empty to just fork, and pick another model if you like. Cloning works for Claude Code and Codex.
 
+In the clone dialog, the source agent, machine and branch are fixed and shown as disabled controls. Tab cycles models, ↑ recalls the source task's prompts, and Enter creates the clone.
+
 An agent that has ended can be revived: it resumes its last session in the same worktree, with a new prompt if you give one (also how Review hands a conflict to an agent that has already exited).
 
 Agents waiting on a permission show it as a card at the top of the sidebar, with Allow once and Deny right there. **See all** on a machine's header opens every task on it, ended ones too, grouped by state with one action per row: Approve, Answer, Review, Open or Revive.
@@ -66,6 +71,8 @@ Agents waiting on a permission show it as a card at the top of the sidebar, with
 Eight colour schemes are in the menu at the top right: Gruvbox, Ink, Moss and Ember (dark), Gruvbox Light, Snow, Paper and Linen (light).
 
 Prefer vim keys? Turn on **Vim keys** in the scheme menu (top right). The bindings are in [vim.json](vim.json), and `?` shows them in the app.
+
+In normal mode, `h` moves left and `l` moves right through **Workspace → Review → Terminal**, skipping unavailable tabs and stopping at either end. Press `d` on a task in Workspace to open a confirmation dialog before deleting the thread and its worktree; `y` confirms and `n` or Esc cancels.
 
 Everything also works from the terminal:
 
