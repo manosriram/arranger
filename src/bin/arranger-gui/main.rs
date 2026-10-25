@@ -192,7 +192,7 @@ enum Action {
     Answering,
     PickAgent(usize),
     PickModel(usize),
-    Start(bool),
+    Start,
     CloseDialog,
     OpenReview,
     Review(ReviewAction),
@@ -1647,8 +1647,8 @@ impl App {
         }
     }
 
-    /// Starts the dialog's task and switches to it; `attach` puts keys straight into its terminal.
-    fn start(&mut self, attach: bool) {
+    /// Starts the dialog's task and switches to it, using normal mode when Vim mode is enabled.
+    fn start(&mut self) {
         let sock = self.dialog.as_ref().and_then(|d| self.sock(d.host));
         let Some(d) = &mut self.dialog else { return };
         let m = d.host;
@@ -1673,7 +1673,7 @@ impl App {
                     self.save_settings();
                 }
                 self.dialog = None;
-                self.focus = if self.vim && !attach { Focus::Normal } else { Focus::Term };
+                self.focus = if self.vim { Focus::Normal } else { Focus::Term };
                 // Fetch the list now: the watch push may not have the new task yet, and selection
                 // would fall back to the first row.
                 if let Ok(Reply::Tasks(tasks)) = request_at(sock.as_deref(), &Request::List { files: false }) {
@@ -1754,7 +1754,7 @@ impl App {
                 }
                 Key::Named(NamedKey::ArrowDown) => self.move_selection(1),
                 Key::Named(NamedKey::ArrowUp) => self.move_selection(-1),
-                Key::Named(NamedKey::Enter) if self.dialog.is_some() => self.actions.push(Action::Start(true)),
+                Key::Named(NamedKey::Enter) if self.dialog.is_some() => self.actions.push(Action::Start),
                 Key::Named(NamedKey::Enter) if self.review.is_some() => {
                     let note = self.review.as_ref().and_then(|rv| rv.editing).filter(|_| self.focus == Focus::Note);
                     self.actions.push(Action::Review(note.map_or(ReviewAction::Commit(Ship::Merge), ReviewAction::SendNote)));
@@ -1885,7 +1885,7 @@ impl App {
             Key::Named(NamedKey::Enter) => match focus {
                 Focus::Note => self.actions.push(Action::Review(ReviewAction::SaveNote)),
                 Focus::CommitMsg => self.actions.push(Action::Review(ReviewAction::Commit(Ship::Commit))),
-                Focus::Prompt | Focus::Base | Focus::Repo => self.actions.push(Action::Start(false)),
+                Focus::Prompt | Focus::Base | Focus::Repo => self.actions.push(Action::Start),
                 Focus::HostSsh | Focus::HostName | Focus::HostRepo => self.actions.push(Action::AddHost),
                 _ => self.focus = self.rest(),
             },
@@ -2090,7 +2090,7 @@ impl App {
                         d.model = if i == usize::MAX { (d.model + 1) % models(AGENTS[d.agent]).len() } else { i };
                     }
                 }
-                Action::Start(attach) => self.start(attach),
+                Action::Start => self.start(),
                 Action::OpenReview => {
                     if self.dialog.is_none() && (self.review.is_some() || self.reviewable()) {
                         self.open_review();
@@ -3049,7 +3049,7 @@ impl App {
             y += recent_h;
         }
 
-        // Footer: keys on the left, Start & attach and Start on the right.
+        // Footer: keys on the left, Start agent on the right.
         let foot = Rect::new(dlg.x + 1.0, y, dlg.w - 2.0, dlg.y + dlg.h - y - 1.0);
         r.rect(Rect::new(foot.x, foot.y, foot.w, 1.0), 0.0, t.border);
         let sb = Rect::new(foot.x + foot.w - pad + 1.0, foot.y + 12.0, 0.0, 34.0);
@@ -3059,22 +3059,14 @@ impl App {
         let ready = !prompt.trim().is_empty();
         r.rect(start, 0.0, if ready { t.primary_bg } else { alpha(t.primary_bg, 0x80) });
         r.text(start.x + 14.0, r.center(start, UI, 13.0), start_label, UI, 13.0, 600, t.primary_fg, sw);
-        let attach_label = "Start & attach";
-        let aw = r.measure(UI, 13.0, 500, attach_label) + 28.0;
-        let attach = Rect::new(start.x - 8.0 - aw, sb.y, aw, sb.h);
-        r.frame(attach, 0.0, t.dialog, t.border2);
-        r.text(attach.x + 14.0, r.center(attach, UI, 13.0), attach_label, UI, 13.0, 500, t.text, aw);
         if self.hit(r, start) {
-            self.actions.push(Action::Start(false));
+            self.actions.push(Action::Start);
         }
-        if self.hit(r, attach) {
-            self.actions.push(Action::Start(true));
-        }
-        let room = attach.x - foot.x - pad - 12.0;
+        let room = start.x - foot.x - pad - 12.0;
         if error.is_empty() {
             // As many key hints as fit.
             let mut hx = foot.x + pad - 1.0;
-            for (key, what) in [("↵", "start"), (mod_label("↵").as_str(), "start & attach"), ("tab", "agent"), ("esc", "close")] {
+            for (key, what) in [("↵", "start"), ("tab", "agent"), ("esc", "close")] {
                 let kw = r.measure(MONO, 12.0, 500, key);
                 let ww = r.measure(UI, 12.0, 400, what);
                 if hx + kw + 6.0 + ww > foot.x + pad + room {
