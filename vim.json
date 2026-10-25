@@ -12,8 +12,8 @@
     "J": "Next agent that needs you",
     "K": "Previous agent that needs you",
     "H": "See all tasks on the selected agent's machine",
-    "h": "Previous view (Workspace ← Overview ← Review)",
-    "l": "Next view (Workspace → Overview → Review)",
+    "h": "Previous view (Workspace ← Review)",
+    "l": "Next view (Workspace → Review)",
     "/": "Filter agents"
   },
   "act": {

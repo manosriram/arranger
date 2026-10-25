@@ -39,7 +39,6 @@ That's it: it starts the daemon if needed and opens the window. Closing the wind
 | ⌘J / ⌘K | Next / previous agent |
 | ⌘I | Type into the selected agent's terminal |
 | ⌘R | Review the diff: revert hunks, comment, then merge (or commit, or open a PR). Greyed out while there's nothing to review |
-| ⌘E | Terminal: a shell in the selected task's worktree, kept running like the agents |
 | ⌘T | Switch between dark and light |
 
 On Linux use Ctrl+Shift in place of ⌘.
@@ -48,15 +47,13 @@ In the new-task dialog, Tab cycles agents, Ctrl+Tab cycles models and Alt+Tab cy
 
 In the new-task prompt, type `@` to find repository files. Use ↑/↓ to choose, Enter or Tab to insert a reference, and Esc to dismiss the picker. Files come from the selected machine’s repository; ignored files are excluded.
 
-Claude Code and Codex tasks run in a chat by default: arranger drives the agent over its own protocol (claude's stream-json, `codex app-server`) and draws the conversation itself, with streaming replies, tool calls and their diffs, the plan, and what the agent asks you pinned above the message box. Enter sends, Shift+Enter starts a new line, Esc stops the turn. A slash command only the agent's terminal has (claude's `/permissions`, `/rewind`…) opens the Terminal tab with it typed instead. pi and Gemini can run in a chat too (turn it on in the dialog); their parity with the interactive agents isn't checked yet.
+Claude Code and Codex tasks run in a chat by default: arranger drives the agent over its own protocol (claude's stream-json, `codex app-server`) and draws the conversation itself, with streaming replies, tool calls and their diffs, the plan, and what the agent asks you pinned above the message box. Enter sends, Shift+Enter starts a new line, Esc stops the turn. A slash command only the agent's terminal has (claude's `/permissions`, `/rewind`…) opens a shell with it typed instead. pi and Gemini can run in a chat too (turn it on in the dialog); their parity with the interactive agents isn't checked yet.
 
 A task started in a terminal runs the agent there, drawn as-is and sized to the pane. When it asks for permission or a choice, answer in its own menu: ↑/↓ and ↵, or with Vim keys on, normal mode switches on by itself and j/k/↵ work the menu.
 
 A soft ding plays when an agent finishes or needs your help. Toggle **Ding sound** in the scheme menu (top right) to turn it off or on; your preference is saved. On Linux, sound requires `paplay` (PulseAudio/PipeWire) or `aplay` (ALSA).
 
 Each task gets its own worktree on a new branch, `arranger/<id>`, made from the base branch you pick when you start it (the current branch by default). The base branch only changes when you merge into it from Review.
-
-The **Terminal** tab is a shell in the selected task's worktree, for running the app or tests before merging. It keeps running when you switch tasks or close the window. A `cd` out of the worktree steps back in, and on macOS a sandbox also hides the main checkout and the other worktrees and allows writes only in the worktree, its git dir, temp dirs and `~/.*` (tool caches, history).
 
 **Run in worktree** in Review opens a terminal in the task’s checkout (over SSH for remote tasks). Run your app or tests there before merging; uncommitted edits are included. From the CLI, `arranger run <id>` opens a shell, or `arranger run <id> <command> [args…]` runs a command with its original exit status.
 
@@ -74,7 +71,7 @@ Eight colour schemes are in the menu at the top right: Gruvbox, Ink, Moss and Em
 
 Prefer vim keys? Turn on **Vim keys** in the scheme menu (top right). The bindings are in [vim.json](vim.json), and `?` shows them in the app.
 
-In normal mode, `h` moves left and `l` moves right through **Workspace → Review → Terminal**, skipping unavailable tabs and stopping at either end. Press `H` (Shift+H) to open **See all** for the selected task's machine. Press `d` on a task in Workspace to open a confirmation dialog before deleting the thread and its worktree; `y` confirms and `n` or Esc cancels.
+In normal mode, `h` moves left and `l` moves right through **Workspace → Review**, skipping unavailable tabs and stopping at either end. Press `H` (Shift+H) to open **See all** for the selected task's machine. Press `d` on a task in Workspace to open a confirmation dialog before deleting the thread and its worktree; `y` confirms and `n` or Esc cancels.
 
 Everything also works from the terminal:
 
