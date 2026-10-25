@@ -1506,22 +1506,16 @@ impl App {
         self.actions.push(Action::Focus(Focus::Term));
     }
 
-    /// Moves through Workspace → Review → Terminal without wrapping, skipping unavailable tabs.
+    /// Moves between Workspace and Review without wrapping.
     fn move_view(&mut self, forward: bool) {
         if self.review.is_some() {
-            if !forward || self.shellable() {
-                self.actions.push(Action::Shell(forward));
-            }
-        } else if self.shell {
             if !forward {
-                self.actions.push(if self.reviewable() { Action::OpenReview } else { Action::Shell(false) });
+                self.actions.push(Action::Shell(false));
             }
-        } else if forward {
-            if self.reviewable() {
-                self.actions.push(Action::OpenReview);
-            } else if self.shellable() {
-                self.actions.push(Action::Shell(true));
-            }
+        } else if forward && self.reviewable() {
+            self.actions.push(Action::OpenReview);
+        } else if !forward && self.shell {
+            self.actions.push(Action::Shell(false));
         }
     }
 
@@ -2008,7 +2002,6 @@ impl App {
                     "n" => self.actions.push(Action::NewTask),
                     "r" => self.actions.push(Action::OpenReview),
                     "d" if self.review.is_none() && self.machine_tasks.is_none() && self.dialog.is_none() && self.add_host.is_none() => self.clone_selected(),
-                    "e" => self.actions.push(Action::Shell(!self.shell || self.review.is_some())),
                     "j" | "k" if self.review.is_some() => {
                         let files = self.review.as_ref().and_then(|rv| rv.data.as_ref()).map_or(0, |d| d.files.len());
                         let cur = self.review.as_ref().map_or(0, |rv| rv.file);
@@ -2694,10 +2687,10 @@ impl App {
             self.actions.push(Action::Welcome);
         }
 
-        // Views: Workspace | Review | Terminal.
+        // Views: Workspace | Review.
         let mut nx = x + 26.0 + rw;
         let review = self.review.is_some();
-        let tabs = [("Workspace", !review && !self.shell), ("Review", review), ("Terminal", !review && self.shell)];
+        let tabs = [("Workspace", !review && !self.shell), ("Review", review)];
         for (label, on) in tabs.into_iter().filter(|_| !self.welcome) {
             let tw = r.measure(UI, 13.0, 500, label) + 24.0;
             let tab = Rect::new(nx, (TITLE_H - 30.0) / 2.0, tw, 30.0);
@@ -2706,14 +2699,12 @@ impl App {
             }
             let off = !on && match label {
                 "Review" => !self.reviewable(),
-                "Terminal" => !self.shellable(),
                 _ => false,
             };
             r.text(tab.x + 12.0, r.center(tab, UI, 13.0), label, UI, 13.0, 500, if on { t.text } else if off { alpha(t.text3, 90) } else { t.text3 }, tw);
             if self.hit(r, tab) && !on && !off {
                 self.actions.push(match label {
                     "Review" => Action::OpenReview,
-                    "Terminal" => Action::Shell(true),
                     _ if review => Action::Review(ReviewAction::Close),
                     _ => Action::Shell(false),
                 });
