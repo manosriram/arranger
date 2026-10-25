@@ -336,6 +336,8 @@ struct App {
     mt_group: Option<usize>,
     mt_filter: String,
     mt_scroll: f32,
+    /// Keyboard target to reveal on the next popup layout.
+    mt_reveal: Option<TaskKey>,
     /// How many of its rows the popup has loaded so far.
     mt_shown: usize,
     /// ⌘= / ⌘- / ⌘0: scales the whole window on top of the display's own scale.
@@ -460,6 +462,7 @@ fn run() -> io::Result<()> {
         mt_group: None,
         mt_filter: String::new(),
         mt_scroll: 0.0,
+        mt_reveal: None,
         mt_shown: overlays::MT_PAGE,
         zoom: 1.0,
         focus: Focus::Term,
@@ -1308,11 +1311,11 @@ impl App {
         v
     }
 
-    /// Sidebar order (or the machine popup's loaded rows), for keyboard switching: rows of folded
+    /// Sidebar order (or all matching machine popup rows), for keyboard switching: rows of folded
     /// sections are skipped.
     fn order(&self) -> Vec<TaskKey> {
         if self.machine_tasks.is_some() {
-            return self.mt_tasks().iter().take(self.mt_shown).map(|t| (t.machine, t.id)).collect();
+            return self.mt_tasks().iter().map(|t| (t.machine, t.id)).collect();
         }
         let sections = self.sections();
         let open = sections.iter().filter(|s| !self.collapsed.contains(&s.key));
@@ -1755,6 +1758,7 @@ impl App {
         }
         let i = self.selected.and_then(|id| order.iter().position(|&x| x == id)).unwrap_or(0) as i32;
         if let Some(&id) = order.get((i + d).clamp(0, order.len() as i32 - 1) as usize) {
+            if self.machine_tasks.is_some() { self.mt_reveal = Some(id); }
             if let Some(tasks) = self.multi_select.as_mut() {
                 self.selected = Some(id);
                 if !tasks.contains(&id) { tasks.push(id); }
@@ -2283,12 +2287,14 @@ impl App {
                 }
                 Action::MachineTasks(m) => {
                     self.machine_tasks = m;
+                    self.mt_reveal = None;
                     (self.mt_group, self.mt_scroll, self.mt_shown) = (None, 0.0, overlays::MT_PAGE);
                     self.mt_filter.clear();
                     // Typing goes to its filter at once; vim keeps normal mode, for j/k.
                     self.focus = if m.is_some() && !self.vim { Focus::TasksFilter } else { self.rest() };
                 }
                 Action::MtGroup(g) => {
+                    self.mt_reveal = None;
                     (self.mt_group, self.mt_scroll, self.mt_shown) = (g, 0.0, overlays::MT_PAGE);
                 }
                 Action::MtMore => {

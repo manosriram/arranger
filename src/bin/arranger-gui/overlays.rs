@@ -158,9 +158,26 @@ impl App {
         let list = Rect::new(pop.x + 1.0, bar.y + bar.h, pop.w - 2.0, foot.y - bar.y - bar.h);
         r.set_clip(Some(list));
         let clicked = |p: Option<(f32, f32)>| p.is_some_and(|p| list.contains(p));
+        let reveal = self.mt_reveal.take();
         let tasks = self.mt_tasks();
-        let shown = tasks.len().min(self.mt_shown);
-        let mut y = list.y - self.mt_scroll;
+        let mut shown = tasks.len().min(self.mt_shown);
+        let mut scroll = self.mt_scroll;
+        if let Some(index) = reveal.and_then(|key| tasks.iter().position(|t| (t.machine, t.id) == key)) {
+            shown = shown.max(index + 1);
+            let mut top = 0.0;
+            let mut previous_group = None;
+            for task in &tasks[..=index] {
+                let g = group(&task.state);
+                if previous_group != Some(g) { top += GROUP_ROW_H; }
+                previous_group = Some(g);
+                top += ROW_H;
+            }
+            let bottom = top;
+            top -= ROW_H;
+            if top < scroll { scroll = top; }
+            if bottom > scroll + list.h { scroll = bottom - list.h; }
+        }
+        let mut y = list.y - scroll;
         if tasks.is_empty() {
             let note = if total == 0 { format!("No tasks on {} yet", host.name()) } else { "No matches".into() };
             r.text(pop.x + 50.0, y + 18.0, &note, UI, 13.0, 400, t.text3, pop.w - 100.0);
@@ -252,8 +269,9 @@ impl App {
         }
         let matched = tasks.len();
         drop(tasks);
-        let content_h = y + self.mt_scroll - list.y;
-        self.mt_scroll = self.mt_scroll.min((content_h - list.h + 8.0).max(0.0));
+        self.mt_shown = self.mt_shown.max(shown);
+        let content_h = y + scroll - list.y;
+        self.mt_scroll = scroll.min((content_h - list.h + 8.0).max(0.0));
         // Near the end of what's loaded: load the next page.
         if shown < matched && y < list.y + list.h + 4.0 * ROW_H {
             acts.push(Action::MtMore);
