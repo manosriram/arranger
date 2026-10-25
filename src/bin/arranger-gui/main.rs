@@ -1487,6 +1487,11 @@ impl App {
             "G" => self.move_selection(1 << 20),
             "J" => self.jump_needs(true),
             "K" => self.jump_needs(false),
+            "H" => {
+                if let Some((machine, _)) = self.selected {
+                    self.actions.push(Action::MachineTasks(Some(machine)));
+                }
+            }
             "/" => self.actions.push(Action::Focus(Focus::Filter)),
             // Insert: the selected agent's terminal, from whichever view.
             "i" if self.current().is_some() => {

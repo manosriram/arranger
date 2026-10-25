@@ -303,7 +303,7 @@ impl App {
     /// Vim's keybinding sheet, above the status bar on the right.
     pub fn draw_help(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
         const SECTIONS: [(&str, &[(&str, &str)]); 3] = [
-            ("MOVE", &[("j / k", "next / prev agent"), ("gg  G", "first / last"), ("J / K", "next / prev needing you"), ("h / l", "prev / next view"), ("/", "filter agents")]),
+            ("MOVE", &[("j / k", "next / prev agent"), ("gg  G", "first / last"), ("J / K", "next / prev needing you"), ("h / l", "prev / next view"), ("H", "see all on machine"), ("/", "filter agents")]),
             ("ACT", &[("o  ↵", "type into agent"), ("j / k", "its menu, when it asks"), ("↵", "pick from the menu"), ("r", "review diff"), ("d", "delete task"), ("c", "clone task"), ("n", "new task"), ("m", "add machine")]),
             ("MODE", &[("i", "type into agent"), ("esc", "normal mode"), ("esc esc", "stop the agent"), ("?", "this sheet")]),
         ];

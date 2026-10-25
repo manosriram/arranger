@@ -72,7 +72,7 @@ Eight colour schemes are in the menu at the top right: Gruvbox, Ink, Moss and Em
 
 Prefer vim keys? Turn on **Vim keys** in the scheme menu (top right). The bindings are in [vim.json](vim.json), and `?` shows them in the app.
 
-In normal mode, `h` moves left and `l` moves right through **Workspace → Review → Terminal**, skipping unavailable tabs and stopping at either end. Press `d` on a task in Workspace to open a confirmation dialog before deleting the thread and its worktree; `y` confirms and `n` or Esc cancels.
+In normal mode, `h` moves left and `l` moves right through **Workspace → Review → Terminal**, skipping unavailable tabs and stopping at either end. Press `H` (Shift+H) to open **See all** for the selected task's machine. Press `d` on a task in Workspace to open a confirmation dialog before deleting the thread and its worktree; `y` confirms and `n` or Esc cancels.
 
 Everything also works from the terminal:
 
