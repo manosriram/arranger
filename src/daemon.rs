@@ -454,7 +454,7 @@ impl Daemon {
                 Ok(()) => Reply::Ok,
                 Err(e) => Reply::Error(e),
             },
-            Request::Clone { id } => match self.clone_task(id) {
+            Request::Clone { id, prompt, model } => match self.clone_task(id, &prompt, model.as_deref()) {
                 Ok(id) => Reply::Created { id, state: self.state(id) },
                 Err(e) => Reply::Error(e),
             },
@@ -986,7 +986,8 @@ impl Daemon {
 
     /// A new task on its own worktree and branch, made from task `src`'s HEAD plus its
     /// uncommitted edits, whose agent carries on from a copy of `src`'s session.
-    fn clone_task(&mut self, src: u64) -> Result<u64, String> {
+    /// Its first message is `prompt` if not empty, and it's named after it; `model` None keeps `src`'s.
+    fn clone_task(&mut self, src: u64, ask: &str, new_model: Option<&str>) -> Result<u64, String> {
         let row: Option<(String, String, String, String, String, String, String, String, String)> = self
             .db
             .query_row(
@@ -997,6 +998,9 @@ impl Daemon {
             .optional()
             .map_err(e2s)?;
         let (agent, repo, from, base, base_commit, reviewed, title, prompt, model) = row.ok_or(format!("no task {src}"))?;
+        let ask = ask.trim();
+        let title = if ask.is_empty() { title } else { ask.to_string() };
+        let model = new_model.map_or(model, str::to_string);
         let from = PathBuf::from(from);
         if !from.exists() {
             return Err(format!("task {src} has no worktree"));
@@ -1033,7 +1037,7 @@ impl Daemon {
             .map_err(e2s)?;
         self.dirty = true;
         // Left ended if it can't start: Revive tries again.
-        self.spawn(id, Some(""), true)?;
+        self.spawn(id, Some(ask), true)?;
         Ok(id)
     }
 
@@ -1121,7 +1125,7 @@ impl Daemon {
         let mut stmt =
             self.db.prepare(
                 "SELECT id, agent, branch, worktree, state, title, created, summary, shipped,
-                 MAX(created, updated, COALESCE((SELECT MAX(ts) FROM events WHERE task = tasks.id) / 1000, 0))
+                 MAX(created, updated, COALESCE((SELECT MAX(ts) FROM events WHERE task = tasks.id) / 1000, 0)), model
                  FROM tasks ORDER BY id",
             ).map_err(e2s)?;
         let rows = stmt.query_map([], |r| {
@@ -1141,6 +1145,7 @@ impl Daemon {
                 summary: r.get(7)?,
                 shipped: r.get(8)?,
                 updated: r.get(9)?,
+                model: r.get(10)?,
                 machine: 0,
             })
         });

@@ -173,6 +173,33 @@ struct Dialog {
     /// The branch list is open, and where it was drawn last frame.
     list: Option<Rect>,
     error: String,
+    /// Cloning this task rather than starting a new one: agent, machine and branch are its.
+    clone: Option<CloneFrom>,
+}
+
+impl Dialog {
+    fn agent(&self) -> &str {
+        self.clone.as_ref().map_or(AGENTS[self.agent], |c| c.agent.as_str())
+    }
+}
+
+/// The task the new-task dialog clones, for showing where the clone picks up.
+struct CloneFrom {
+    key: TaskKey,
+    agent: String,
+    branch: String,
+    /// Its first prompt, and the last one sent ("" until the events arrive, or if it's the first).
+    first: String,
+    last: String,
+    /// Its `--model`, kept until another is picked (it may not be one the dialog lists).
+    model: Option<String>,
+}
+
+impl CloneFrom {
+    /// Prompts ↑ steps back through: the last one, then the first.
+    fn earlier(&self) -> Vec<String> {
+        [&self.first, &self.last].into_iter().filter(|p| !p.is_empty()).cloned().collect()
+    }
 }
 
 /// Add-machine dialog.
@@ -231,7 +258,7 @@ enum Action {
     Revive(TaskKey, String),
     /// Stop the task's agent and remove it: its worktree, log and history.
     Delete(TaskKey),
-    /// A new task on its own worktree, carrying on from this one's chat and edits.
+    /// Open the new-task dialog to clone this task: its chat and edits, on a new worktree.
     Clone(TaskKey),
 }
 
@@ -264,8 +291,6 @@ struct App {
     pending_g: bool,
     /// `d` was pressed on this task and waits for `y` (delete it) or `n`.
     confirm_delete: Option<TaskKey>,
-    /// `c` was pressed on this task: the clone popup is up, with why the last try failed.
-    cloning: Option<(TaskKey, String)>,
     /// When Esc was last pressed in vim mode: a second one forwards both to the agent.
     last_esc: Option<Instant>,
     /// The selected agent's ask (task, its `since`) that switched vim keys to normal mode, where
@@ -397,7 +422,6 @@ fn run() -> io::Result<()> {
         scheme_btn: Rect::new(0.0, 0.0, 0.0, 0.0),
         help: false,
         confirm_delete: None,
-        cloning: None,
         pending_g: false,
         last_esc: None,
         answering: None,
@@ -620,13 +644,16 @@ impl ApplicationHandler<Msg> for App {
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_TERMINAL").is_some() {
                         self.shell = true;
                     }
-                    // `ARRANGER_POPUP` snapshots this machine's "See all" popup instead, and
-                    // `ARRANGER_NEWTASK` the new-task box.
+                    // `ARRANGER_POPUP` snapshots this machine's "See all" popup instead,
+                    // `ARRANGER_NEWTASK` the new-task box, and `ARRANGER_CLONE` it cloning the task.
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_POPUP").is_some() {
                         self.machine_tasks = Some(m);
                     }
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_NEWTASK").is_some() {
                         self.open_dialog();
+                    }
+                    if let Some(key) = self.selected.filter(|_| std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_CLONE").is_some()) {
+                        self.open_clone(key);
                     }
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_DELETE").is_some() {
                         self.vim = true;
@@ -1410,15 +1437,6 @@ impl App {
             _ => return,
         };
         let g = std::mem::take(&mut self.pending_g);
-        // The clone popup is up: ↵ or `y` clones, Esc or `n` closes it.
-        if let Some((task, _)) = self.cloning {
-            match key.as_str() {
-                "o" | "y" => self.actions.push(Action::Clone(task)),
-                "esc" | "n" => (self.cloning, self.last_esc) = (None, None), // a quick second Esc isn't for the agent
-                _ => {}
-            }
-            return;
-        }
         // The agent's menu is up: j/k move through it and ↵ picks, back in its terminal; Esc or i
         // leave it be.
         if self.answering.is_some() && self.machine_tasks.is_none() && self.review.is_none() {
@@ -1460,7 +1478,9 @@ impl App {
             "o" if self.review.is_none() && self.current().is_some() => self.actions.push(Action::Focus(Focus::Term)),
             "d" if self.review.is_none() && self.machine_tasks.is_none() => self.confirm_delete = self.current().map(|t| (t.machine, t.id)),
             "c" if self.review.is_none() && self.machine_tasks.is_none() => {
-                self.cloning = self.current().filter(|t| t.state != "queued" && !t.worktree.is_empty()).map(|t| ((t.machine, t.id), String::new()));
+                if let Some(t) = self.current() {
+                    self.actions.push(Action::Clone((t.machine, t.id)));
+                }
             }
             "r" => self.actions.push(Action::OpenReview),
             "n" => self.actions.push(Action::NewTask),
@@ -1475,7 +1495,7 @@ impl App {
 
     /// The sidebar's or review rail's divider under `p`, which a press starts dragging.
     fn divider_at(&self, p: (f32, f32)) -> Option<Divider> {
-        if self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || self.cloning.is_some() || p.1 < TITLE_H {
+        if self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || p.1 < TITLE_H {
             return None;
         }
         match &self.review {
@@ -1665,10 +1685,23 @@ impl App {
     fn open_dialog(&mut self) {
         // Starts on the selected task's machine.
         let host = self.current().map_or(0, |t| t.machine);
-        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), agent: 0, model: 0, host: 0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new() });
+        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), agent: 0, model: 0, host: 0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: None });
         self.pick_host(host);
         self.focus = Focus::Prompt;
         self.anchor = None;
+    }
+
+    /// The new-task dialog, cloning task `key`: what it was asked shown above an empty prompt for
+    /// what the clone should do differently.
+    fn open_clone(&mut self, key: TaskKey) {
+        let Some(t) = self.task(key).filter(|t| t.state != "queued" && !t.worktree.is_empty()) else { return };
+        let agent = adapter::kind(&t.agent).to_string();
+        let model = models(&agent).iter().position(|m| m.1 == t.model).unwrap_or(0);
+        let clone = CloneFrom { key, agent, branch: t.branch.clone(), first: t.title.clone(), last: String::new(), model: Some(t.model.clone()) };
+        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), agent: 0, model, host: key.0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: Some(clone) });
+        self.focus = Focus::Prompt;
+        self.anchor = None;
+        self.spawn_request(key.0, Tag::LastPrompt(key), Request::Events { id: key.1 });
     }
 
     /// Points the new-task dialog at machine `m`: its default repo, and here the current branch.
@@ -1706,16 +1739,24 @@ impl App {
         let sock = self.dialog.as_ref().and_then(|d| self.sock(d.host));
         let Some(d) = &mut self.dialog else { return };
         let m = d.host;
-        if d.repo.trim().is_empty() {
-            d.error = "Which repo on that machine? Type its path.".into();
-            return;
-        }
-        let req = Request::New {
-            agent: AGENTS[d.agent].into(),
-            repo: d.repo.trim().into(),
-            base: Some(d.base.trim().to_string()).filter(|b| !b.is_empty()),
-            prompt: Some(d.prompt.trim().to_string()).filter(|p| !p.is_empty()),
-            model: Some(models(AGENTS[d.agent])[d.model].1.to_string()).filter(|m| !m.is_empty()),
+        let req = match &d.clone {
+            // An empty prompt is a plain fork, carrying on where it left off.
+            Some(c) => Request::Clone {
+                id: c.key.1,
+                prompt: d.prompt.trim().to_string(),
+                model: c.model.is_none().then(|| models(&c.agent)[d.model].1.to_string()),
+            },
+            None if d.repo.trim().is_empty() => {
+                d.error = "Which repo on that machine? Type its path.".into();
+                return;
+            }
+            None => Request::New {
+                agent: AGENTS[d.agent].into(),
+                repo: d.repo.trim().into(),
+                base: Some(d.base.trim().to_string()).filter(|b| !b.is_empty()),
+                prompt: Some(d.prompt.trim().to_string()).filter(|p| !p.is_empty()),
+                model: Some(models(AGENTS[d.agent])[d.model].1.to_string()).filter(|m| !m.is_empty()),
+            },
         };
         match request_at(sock.as_deref(), &req) {
             Ok(Reply::Created { id, .. }) => {
@@ -1775,8 +1816,10 @@ impl App {
         if !app_mod(m) && !m.control_key() && !m.shift_key() && self.completion_key(&ev.logical_key) {
             return;
         }
-        if self.dialog.is_some() && ev.logical_key == Key::Named(NamedKey::Tab) {
-            self.actions.push(if m.control_key() || m.shift_key() { Action::PickModel(usize::MAX) } else { Action::PickAgent(usize::MAX) });
+        if let Some(d) = self.dialog.as_ref().filter(|_| ev.logical_key == Key::Named(NamedKey::Tab)) {
+            // A clone's agent is its source's, so Tab picks the model there.
+            let model = m.control_key() || m.shift_key() || d.clone.is_some();
+            self.actions.push(if model { Action::PickModel(usize::MAX) } else { Action::PickAgent(usize::MAX) });
             return;
         }
         if app_mod(m) {
@@ -1911,6 +1954,11 @@ impl App {
         if let Key::Named(k @ (NamedKey::ArrowUp | NamedKey::ArrowDown)) = &ev.logical_key {
             let up = *k == NamedKey::ArrowUp;
             let recalled = match (focus, &mut self.dialog) {
+                // A clone's own prompts: the last one sent, then the first.
+                (Focus::Prompt, Some(d)) if d.clone.is_some() => {
+                    let earlier = d.clone.as_ref().unwrap().earlier();
+                    recall(&earlier, &mut d.hist, &mut d.prompt, up)
+                }
                 (Focus::Prompt, Some(d)) => recall(&self.prompts, &mut d.hist, &mut d.prompt, up),
                 _ => false,
             };
@@ -2080,7 +2128,7 @@ impl App {
                     (self.answering, self.answered) = (None, self.ask());
                 }
                 Action::Focus(f) => {
-                    (self.confirm_delete, self.cloning) = (None, None);
+                    self.confirm_delete = None;
                     if self.focus != f {
                         self.anchor = None;
                     }
@@ -2143,23 +2191,7 @@ impl App {
                         Err(e) => self.revive_error = Some((key, e.to_string())),
                     }
                 }
-                Action::Clone(key @ (m, id)) => {
-                    let sock = self.sock(m);
-                    match request_at(sock.as_deref(), &Request::Clone { id }) {
-                        Ok(Reply::Created { id, .. }) => {
-                            self.cloning = None;
-                            // As for a new task: the watch push may not have it yet.
-                            if let Ok(Reply::Tasks(tasks)) = request_at(sock.as_deref(), &Request::List { files: false }) {
-                                self.user_event_tasks(m, tasks);
-                            }
-                            self.selected = Some((m, id));
-                            self.focus = self.rest();
-                            self.sync_session();
-                        }
-                        Ok(r) => self.cloning = Some((key, format!("unexpected reply: {r:?}"))),
-                        Err(e) => self.cloning = Some((key, e.to_string())),
-                    }
-                }
+                Action::Clone(key) => self.open_clone(key),
                 Action::Delete(key @ (m, id)) => {
                     self.spawn_request(m, Tag::Delete, Request::Kill { id });
                     self.stats.remove(&key);
@@ -2174,7 +2206,7 @@ impl App {
                     self.focus = if self.answering.is_some() { Focus::Normal } else { Focus::Term };
                 }
                 Action::PickAgent(i) => {
-                    if let Some(d) = &mut self.dialog {
+                    if let Some(d) = self.dialog.as_mut().filter(|d| d.clone.is_none()) {
                         let agent = if i == usize::MAX { (d.agent + 1) % AGENTS.len() } else { i };
                         if agent != d.agent {
                             (d.agent, d.model) = (agent, 0); // models are per agent
@@ -2183,7 +2215,11 @@ impl App {
                 }
                 Action::PickModel(i) => {
                     if let Some(d) = &mut self.dialog {
-                        d.model = if i == usize::MAX { (d.model + 1) % models(AGENTS[d.agent]).len() } else { i };
+                        let n = models(d.agent()).len();
+                        d.model = if i == usize::MAX { (d.model + 1) % n } else { i };
+                        if let Some(c) = &mut d.clone {
+                            c.model = None; // the picked one, from now on
+                        }
                     }
                 }
                 Action::Start => self.start(),
@@ -2323,7 +2359,7 @@ impl App {
         }
         self.stale.set(false);
         self.icons.borrow_mut().clear();
-        self.layered = !(self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || self.cloning.is_some() || (self.help && self.vim) || self.menu);
+        self.layered = !(self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || (self.help && self.vim) || self.menu);
         let dpi = gfx.window.scale_factor() as f32 * self.zoom;
         let (w, h) = (size.width as f32 / dpi, size.height as f32 / dpi);
         let r = &mut gfx.r;
@@ -2331,7 +2367,7 @@ impl App {
 
         self.probe_changes();
         // Under an open dialog or popup nothing reacts: the views below draw without the click.
-        let modal_click = (self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || self.cloning.is_some()).then(|| self.click.take());
+        let modal_click = (self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some()).then(|| self.click.take());
         self.draw_title(r, t, w);
         if self.welcome {
             self.draw_welcome(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H));
@@ -2359,9 +2395,6 @@ impl App {
         }
         if self.add_host.is_some() {
             self.draw_add_host(r, t, w, h);
-        }
-        if self.cloning.is_some() {
-            self.draw_clone(r, t, w, h);
         }
         if self.help && self.vim {
             self.draw_help(r, t, w, h);
@@ -2988,49 +3021,6 @@ impl App {
         self.hit_as(r, b, Cursor::Text)
     }
 
-    /// The popup `c` opens: clone the task onto a new worktree, its chat and edits carried over.
-    fn draw_clone(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
-        let Some((key, error)) = self.cloning.clone() else { return };
-        let Some(task) = self.task(key) else {
-            self.cloning = None;
-            return;
-        };
-        let (name, agent, branch) = (title(task), adapter::kind(&task.agent).to_string(), task.branch.clone());
-        r.rect(Rect::new(0.0, 0.0, w, h), 0.0, t.scrim);
-        r.target(Rect::new(0.0, 0.0, w, h), Cursor::Arrow);
-        let dw = (w - 32.0).min(480.0);
-        let dlg = Rect::new((w - dw) / 2.0, 140.0, dw, 196.0);
-        r.frame(dlg, 8.0, t.dialog, t.border2);
-        r.rect(Rect::new(dlg.x + 1.0, dlg.y + 1.0, dlg.w - 2.0, 2.0), 1.0, t.work);
-        let x = dlg.x + 18.0;
-        let fw = dlg.w - 36.0;
-        r.text(x, dlg.y + 16.0, "CLONE TASK", UI, 11.0, 500, t.text3, 200.0);
-        let esc = Rect::new(dlg.x + dlg.w - 48.0, dlg.y + 14.0, 30.0, 16.0);
-        r.frame(esc, 3.0, t.dialog, t.border2);
-        r.text(esc.x + 6.0, r.center(esc, MONO, 10.0), "Esc", MONO, 10.0, 400, t.text3, 30.0);
-        r.text(x, dlg.y + 46.0, &name, UI, 14.0, 500, t.text, fw);
-        r.text(x, dlg.y + 70.0, &format!("{agent} · {branch}"), MONO, 11.5, 400, t.text3, fw);
-        let (note, color) = if error.is_empty() {
-            (format!("A new task on its own worktree and branch, with {agent}'s chat and every edit so far (uncommitted too)."), t.text2)
-        } else {
-            (format!("Couldn't clone: {error}"), t.del)
-        };
-        r.text(x, dlg.y + 96.0, &note, UI, 12.0, 400, color, fw);
-
-        let foot = Rect::new(dlg.x + 1.0, dlg.y + dlg.h - 58.0, dlg.w - 2.0, 57.0);
-        r.rect(Rect::new(foot.x, foot.y, foot.w, 1.0), 0.0, t.border);
-        let label = "Clone ↵";
-        let bw = r.measure(UI, 13.0, 500, label) + 32.0;
-        let clone = Rect::new(foot.x + foot.w - 14.0 - bw, foot.y + 12.0, bw, 34.0);
-        r.rect(clone, 4.0, t.work);
-        r.text(clone.x + 16.0, r.center(clone, UI, 13.0), label, UI, 13.0, 500, t.on_accent, bw);
-        if self.hit(r, clone) {
-            self.actions.push(Action::Clone(key));
-        } else if self.hit(r, esc) {
-            self.cloning = None;
-        }
-    }
-
     fn draw_add_host(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
         let Some(a) = &self.add_host else { return };
         let (ssh, name, repo, test, testing) = (a.ssh.clone(), a.name.clone(), a.repo.clone(), a.test.clone(), a.testing);
@@ -3115,6 +3105,8 @@ impl App {
         let Some(d) = &self.dialog else { return };
         let (prompt, agent_i, model_i, base, error) = (d.prompt.clone(), d.agent, d.model, d.base.clone(), d.error.clone());
         let (branches, list) = (d.branches.clone(), d.list);
+        // Cloning: (task id, agent, branch, first prompt, last prompt, its model until another's picked).
+        let clone = d.clone.as_ref().map(|c| (c.key.1, c.agent.clone(), c.branch.clone(), c.first.clone(), c.last.clone(), c.model.clone()));
         // A click on the open branch list is the list's alone, whatever lies under it.
         let list_click = self.click.filter(|p| list.is_some_and(|l| l.contains(*p)));
         if list_click.is_some() {
@@ -3124,9 +3116,9 @@ impl App {
         let hosts: Vec<(usize, String, bool)> =
             self.hosts.iter().enumerate().filter(|(_, h)| !h.removed).map(|(i, h)| (i, h.name().to_string(), matches!(h.link, Link::Up(_)))).collect();
         // Another machine has no local branches to list; its repo path is typed.
-        let remote = self.hosts[host_i].cfg.is_some();
-        let agent = AGENTS[agent_i];
-        let recent: Vec<String> = self.prompts.iter().rev().filter(|p| **p != prompt).take(3).cloned().collect();
+        let remote = self.hosts[host_i].cfg.is_some() && clone.is_none();
+        let agent = clone.as_ref().map_or(AGENTS[agent_i], |c| c.1.as_str());
+        let recent: Vec<String> = if clone.is_some() { Vec::new() } else { self.prompts.iter().rev().filter(|p| **p != prompt).take(3).cloned().collect() };
         r.rect(Rect::new(0.0, 0.0, w, h), 0.0, t.scrim);
         r.target(Rect::new(0.0, 0.0, w, h), Cursor::Arrow); // nothing under the scrim reacts
         let dw = (w - 32.0).min(680.0);
@@ -3135,15 +3127,50 @@ impl App {
         let text_h = (prompt_lines.len().max(3) as f32) * 26.0;
         let repo_h = if remote { 44.0 } else { 0.0 };
         let recent_h = if recent.is_empty() { 0.0 } else { 36.0 + recent.len() as f32 * 36.0 };
-        let dh = 20.0 + text_h + 16.0 + 32.0 + 18.0 + repo_h + recent_h + 58.0;
+        // A clone's prompts so far, quoted, two lines each: what it picks up from.
+        let quotes: Vec<(&str, Vec<String>)> = clone.as_ref().map_or_else(Vec::new, |c| {
+            [("STARTED FROM", &c.3), ("LAST FROM YOU", &c.4)]
+                .into_iter()
+                .filter(|(_, p)| !p.trim().is_empty())
+                .map(|(label, p)| {
+                    let mut lines = wrap(r, p.trim(), UI, 13.0, dw - 2.0 * pad - 14.0);
+                    if lines.len() > 2 {
+                        lines.truncate(2);
+                        lines[1].push('…');
+                    }
+                    (label, lines)
+                })
+                .collect()
+        });
+        let clone_h = if clone.is_some() { 30.0 + quotes.iter().map(|q| 22.0 + q.1.len() as f32 * 20.0 + 12.0).sum::<f32>() + 24.0 } else { 0.0 };
+        let dh = 20.0 + clone_h + text_h + 16.0 + 32.0 + 18.0 + repo_h + recent_h + 58.0;
         let dlg = Rect::new((w - dw) / 2.0, 104.0, dw, dh);
         r.rect(Rect::new(dlg.x - 1.0, dlg.y + 6.0, dlg.w + 2.0, dlg.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x1C }));
         r.frame(dlg, 0.0, t.dialog, t.border2);
 
+        // Cloning: which task, what it was asked, and the question the prompt answers.
+        if let Some((id, ..)) = &clone {
+            let mut y = dlg.y + 20.0;
+            r.text(dlg.x + pad, y, &format!("CLONE TASK #{id}"), UI, 11.5, 600, t.text3, dlg.w - 2.0 * pad);
+            y += 30.0;
+            for (label, lines) in &quotes {
+                r.text(dlg.x + pad, y, label, UI, 11.5, 600, t.text3, dlg.w - 2.0 * pad);
+                y += 22.0;
+                r.rect(Rect::new(dlg.x + pad, y, 2.0, lines.len() as f32 * 20.0 - 2.0), 0.0, t.border2);
+                for line in lines {
+                    r.text(dlg.x + pad + 14.0, y, line, UI, 13.0, 400, t.text2, dlg.w - 2.0 * pad - 14.0);
+                    y += 20.0;
+                }
+                y += 12.0;
+            }
+            let qw = r.text(dlg.x + pad, y, "What should the clone do differently?", UI, 13.0, 500, t.text, dlg.w - 2.0 * pad);
+            r.text(dlg.x + pad + qw + 6.0, y, "(optional)", UI, 13.0, 400, t.text3, dlg.w - 2.0 * pad - qw - 6.0);
+        }
+
         // Prompt.
-        let ty = dlg.y + 20.0;
+        let ty = dlg.y + 20.0 + clone_h;
         let prompt_focus = self.focus == Focus::Prompt;
-        if prompt.is_empty() {
+        if prompt.is_empty() && clone.is_none() {
             r.text(dlg.x + pad, ty, "What should the agent do? (@ to reference files)", UI, 16.0, 400, t.faint, dlg.w - 2.0 * pad);
         }
         let caret = self.caret_for(Focus::Prompt, &prompt).map(|at| caret_line(&prompt, &prompt_lines, at));
@@ -3151,7 +3178,7 @@ impl App {
             let at = caret.filter(|c| c.0 == i).map(|c| c.1);
             self.field_text(r, t, dlg.x + pad, ty + i as f32 * 26.0, line, UI, 16.0, dlg.w - 2.0 * pad, (Focus::Prompt, start), prompt_focus, at, t.work);
         }
-        if self.hit_as(r, Rect::new(dlg.x, dlg.y, dlg.w, text_h + 32.0), Cursor::Text) {
+        if self.hit_as(r, Rect::new(dlg.x, ty - 20.0, dlg.w, text_h + 32.0), Cursor::Text) {
             self.actions.push(Action::Focus(Focus::Prompt));
         }
 
@@ -3172,17 +3199,22 @@ impl App {
             cx += b.w + 8.0;
             b
         };
+        // A clone's agent, machine and branch are its source's: shown, not picked.
         let b = chip(r, "agent", agent, Some(accent(agent)), 0.0);
-        if self.hit(r, b) {
+        if clone.is_none() && self.hit(r, b) {
             self.actions.push(Action::PickAgent(usize::MAX));
         }
-        let b = chip(r, "model", models(agent)[model_i].0, None, 0.0);
+        let model = match clone.as_ref().and_then(|c| c.5.as_deref()) {
+            Some("") | None => models(agent)[model_i].0,
+            Some(kept) => models(agent).iter().find(|m| m.1 == kept).map_or(kept, |m| m.0),
+        };
+        let b = chip(r, "model", model, None, 0.0);
         if self.hit(r, b) {
             self.actions.push(Action::PickModel(usize::MAX));
         }
         if hosts.len() > 1 {
             let b = chip(r, "on", self.hosts[host_i].name(), None, 0.0);
-            if self.hit(r, b) {
+            if clone.is_none() && self.hit(r, b) {
                 let at = hosts.iter().position(|h| h.0 == host_i).unwrap_or(0);
                 // The next machine that's up, after this one.
                 if let Some(next) = (1..hosts.len()).map(|k| &hosts[(at + k) % hosts.len()]).find(|h| h.2) {
@@ -3190,10 +3222,15 @@ impl App {
                 }
             }
         }
-        // The base branch: a list of local branches, or typed in on another machine.
-        let base_focus = self.focus == Focus::Base;
-        let pick = !branches.is_empty();
-        let shown = if base.is_empty() && !base_focus { "current branch".to_string() } else { base.clone() };
+        // The base branch: a list of local branches, or typed in on another machine; a clone's is
+        // the task's own branch, as it is now.
+        let base_focus = self.focus == Focus::Base && clone.is_none();
+        let pick = !branches.is_empty(); // none for a clone
+        let shown = match &clone {
+            Some(c) => c.2.clone(),
+            None if base.is_empty() && !base_focus => "current branch".to_string(),
+            None => base.clone(),
+        };
         let bfield = chip(r, "from", &shown, None, if pick { 22.0 } else { 10.0 });
         if base_focus {
             // Typed over the chip's value while it has focus.
@@ -3207,7 +3244,7 @@ impl App {
                 let d = self.dialog.as_mut().unwrap();
                 d.list = if list.is_some() { None } else { Some(Rect::default()) };
             }
-        } else if self.hit_as(r, bfield, Cursor::Text) {
+        } else if clone.is_none() && self.hit_as(r, bfield, Cursor::Text) {
             self.actions.push(Action::Focus(Focus::Base));
         }
 
@@ -3242,10 +3279,10 @@ impl App {
         let foot = Rect::new(dlg.x + 1.0, y, dlg.w - 2.0, dlg.y + dlg.h - y - 1.0);
         r.rect(Rect::new(foot.x, foot.y, foot.w, 1.0), 0.0, t.border);
         let sb = Rect::new(foot.x + foot.w - pad + 1.0, foot.y + 12.0, 0.0, 34.0);
-        let start_label = "Start agent";
+        let start_label = if clone.is_some() { "Clone" } else { "Start agent" };
         let sw = r.measure(UI, 13.0, 600, start_label) + 28.0;
         let start = Rect::new(sb.x - sw, sb.y, sw, sb.h);
-        let ready = !prompt.trim().is_empty();
+        let ready = clone.is_some() || !prompt.trim().is_empty();
         r.rect(start, 0.0, if ready { t.primary_bg } else { alpha(t.primary_bg, 0x80) });
         r.text(start.x + 14.0, r.center(start, UI, 13.0), start_label, UI, 13.0, 600, t.primary_fg, sw);
         if self.hit(r, start) {
@@ -3255,7 +3292,12 @@ impl App {
         if error.is_empty() {
             // As many key hints as fit.
             let mut hx = foot.x + pad - 1.0;
-            for (key, what) in [("↵", "start"), ("tab", "agent"), ("ctrl+tab", "model"), ("esc", "close")] {
+            let hints: &[(&str, &str)] = if clone.is_some() {
+                &[("↵", "clone"), ("↑", "its prompts"), ("tab", "model"), ("esc", "close")]
+            } else {
+                &[("↵", "start"), ("tab", "agent"), ("ctrl+tab", "model"), ("esc", "close")]
+            };
+            for &(key, what) in hints {
                 let kw = r.measure(MONO, 12.0, 500, key);
                 let ww = r.measure(UI, 12.0, 400, what);
                 if hx + kw + 6.0 + ww > foot.x + pad + room {

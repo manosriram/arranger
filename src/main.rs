@@ -15,7 +15,7 @@ use std::{env, thread};
 const USAGE: &str = "usage: arranger            open the workspace window
        arranger [ls [--files] | new <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
                  | approve <id> | deny <id> [reason] | events <id> | diff <id> | revert <id> <path> <hunk#>
-                 | run <id> [command ...] | send <id> <text> | revive <id> [prompt] | clone <id> | commit <id> [--merge|--pr] [message] | ping | stop | serve | hook <adapter>
+                 | run <id> [command ...] | send <id> <text> | revive <id> [prompt] | clone <id> [--model <m>] [prompt] | commit <id> [--merge|--pr] [message] | ping | stop | serve | hook <adapter>
                  | machine [ls | add <name> <user@host> [repo] | rm <name>] | endpoint]";
 /// Ctrl-\, raw and in kitty keyboard encoding.
 const DETACH: &[&[u8]] = &[b"\x1c", b"\x1b[92;5u"];
@@ -66,10 +66,8 @@ fn main() {
         ["new", agent, ref prompt @ ..] => new(agent, None, prompt),
         ["run", id, ref command @ ..] => parse_id(id).and_then(|id| run(id, command)),
         ["attach", id] => parse_id(id).and_then(attach),
-        ["clone", id] => parse_id(id).and_then(|id| match request(&Request::Clone { id })? {
-            Reply::Created { id, state } => Ok(println!("{id} {state}")),
-            reply => Err(unexpected(reply)),
-        }),
+        ["clone", id, "--model", model, ref text @ ..] => parse_id(id).and_then(|id| clone(id, Some(model), text)),
+        ["clone", id, ref text @ ..] => parse_id(id).and_then(|id| clone(id, None, text)),
         ["kill", id] => parse_id(id).and_then(|id| request(&Request::Kill { id }).map(drop)),
         _ => {
             eprintln!("{USAGE}");
@@ -256,6 +254,13 @@ fn new(agent: &str, base: Option<&str>, prompt: &[&str]) -> io::Result<()> {
     let prompt = Some(prompt.join(" ")).filter(|p| !p.is_empty());
     let req = Request::New { agent: agent.into(), repo: env::current_dir()?, base: base.map(Into::into), prompt, model: None };
     match request(&req)? {
+        Reply::Created { id, state } => Ok(println!("{id} {state}")),
+        reply => Err(unexpected(reply)),
+    }
+}
+
+fn clone(id: u64, model: Option<&str>, prompt: &[&str]) -> io::Result<()> {
+    match request(&Request::Clone { id, prompt: prompt.join(" "), model: model.map(Into::into) })? {
         Reply::Created { id, state } => Ok(println!("{id} {state}")),
         reply => Err(unexpected(reply)),
     }

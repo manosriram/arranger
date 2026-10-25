@@ -201,7 +201,7 @@ fn clone_task() {
 
     assert!(home.arranger(&repo, &["new", claude.to_str().unwrap(), "go"]).0);
     home.wait_state(&repo, &["exited"]);
-    let (ok, out) = home.arranger(&repo, &["clone", "1"]);
+    let (ok, out) = home.arranger(&repo, &["clone", "1", "--model", "claude-haiku-5-5", "try", "it", "faster"]);
     assert!(ok, "{out}");
     assert_eq!(out.split_whitespace().next(), Some("2"));
     home.wait_task(&repo, 2, &["exited"]);
@@ -211,7 +211,7 @@ fn clone_task() {
     assert!(ok, "{out}");
     assert_eq!(out, "hello\nhi\nchanged\narranger/2\n");
     let args = std::fs::read_to_string(home.0.join("args-2")).unwrap();
-    assert!(args.contains("--continue --fork-session"), "{args}");
+    assert!(args.contains("--continue --fork-session") && args.contains("--model claude-haiku-5-5") && args.ends_with("try it faster\n"), "{args}");
     let wt = std::fs::canonicalize(home.0.join("worktrees/repo/2")).unwrap();
     let name: String = wt.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
     assert!(home.0.join("claude/projects").join(name).join("s1.jsonl").exists());

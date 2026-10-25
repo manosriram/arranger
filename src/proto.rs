@@ -9,7 +9,7 @@ use std::path::PathBuf;
 const MAX_FRAME: usize = 64 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 13;
+pub const VERSION: u32 = 14;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -55,8 +55,9 @@ pub enum Request {
     /// Repository paths for the new-task prompt’s @ picker.
     Paths { repo: PathBuf },
     /// A new task on its own worktree, made from task `id`'s current state (uncommitted edits
-    /// too), whose agent carries on from a copy of `id`'s session. Replied to with Created.
-    Clone { id: u64 },
+    /// too), whose agent carries on from a copy of `id`'s session, sent `prompt` if not empty.
+    /// `model`: None keeps `id`'s. Replied to with Created.
+    Clone { id: u64, prompt: String, model: Option<String> },
 }
 
 /// What happens after the commit.
@@ -115,6 +116,9 @@ pub struct TaskInfo {
     pub shipped: String,
     /// Unix seconds of its last event, state change or ship.
     pub updated: u64,
+    /// Its `--model` ("" for the agent's default).
+    #[serde(default)]
+    pub model: String,
     /// Which machine the GUI got this task from (an index into its machine list); not sent.
     #[serde(skip)]
     pub machine: usize,

@@ -95,6 +95,8 @@ pub enum Tag {
     Message,
     /// Deleting a task from vim's `d`.
     Delete,
+    /// A task's events, for the last prompt it was sent: the clone dialog shows it.
+    LastPrompt(crate::TaskKey),
 }
 
 fn key(path: &str, header: &str) -> String {
@@ -259,6 +261,18 @@ impl App {
                 _ => {
                     self.stats.remove(&key);
                 }
+            }
+            return;
+        }
+        if let Tag::LastPrompt(key) = tag {
+            let clone = self.dialog.as_mut().and_then(|d| d.clone.as_mut()).filter(|c| c.key == key);
+            if let (Some(c), Ok(Reply::Events(events))) = (clone, reply) {
+                let last = events.into_iter().rev().find_map(|(_, e)| match e {
+                    Event::Prompt { text } => Some(text),
+                    _ => None,
+                });
+                // Its first prompt is shown already.
+                c.last = last.filter(|l| l.trim() != c.first.trim()).unwrap_or_default();
             }
             return;
         }
