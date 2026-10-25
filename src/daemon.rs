@@ -385,6 +385,21 @@ impl Daemon {
         let attached = self.conns.get(&t).and_then(|c| c.attached);
         let on_shell = self.conns.get(&t).is_some_and(|c| c.shell);
         let reply = match req {
+            Request::Paths { repo } => {
+                let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+                let repo = repo.strip_prefix("~").map_or(repo.clone(), |rest| home.join(rest));
+                match git_in(&repo).args(["ls-files", "--cached", "--others", "--exclude-standard", "-z"]).output() {
+                    Ok(out) if out.status.success() => {
+                        let mut paths: Vec<String> = out.stdout.split(|b| *b == 0).filter(|p| !p.is_empty())
+                            .map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+                        paths.sort();
+                        paths.dedup();
+                        Reply::Paths(paths)
+                    }
+                    Ok(out) => Reply::Error(String::from_utf8_lossy(&out.stderr).trim().into()),
+                    Err(e) => Reply::Error(format!("git: {e}")),
+                }
+            },
             Request::Ping => Reply::Pong,
             Request::Version => Reply::Version(proto::VERSION),
             Request::List { files } => match self.list(files) {

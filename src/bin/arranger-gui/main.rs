@@ -3,6 +3,7 @@
 //! that triggered it. Redraws happen only on input or daemon pushes, so idle CPU is zero.
 
 mod overlays;
+mod completion;
 mod sound;
 mod render;
 mod review;
@@ -77,6 +78,7 @@ pub enum Msg {
     Reply(Tag, Result<Reply, String>),
     /// The add-machine dialog's connection test.
     Tested(Result<String, String>),
+    Paths(usize, String, Result<Reply, String>),
 }
 
 /// How a machine's daemon is reachable.
@@ -155,6 +157,7 @@ enum Focus {
 }
 
 struct Dialog {
+    completion: completion::Completion,
     prompt: String,
     agent: usize,
     /// Index into the agent's `models`; 0 is its default.
@@ -591,6 +594,15 @@ impl ApplicationHandler<Msg> for App {
 
     fn user_event(&mut self, _: &ActiveEventLoop, msg: Msg) {
         match msg {
+            Msg::Paths(host, repo, reply) => {
+                if let Some(d) = &mut self.dialog {
+                    if d.host == host && d.repo == repo {
+                        if let Ok(Reply::Paths(paths)) = reply {
+                            d.completion.files = paths;
+                        }
+                    }
+                }
+            }
             Msg::Tasks(m, tasks) => {
                 self.user_event_tasks(m, tasks);
                 if self.selected.is_none_or(|k| self.task(k).is_none()) {
@@ -1637,7 +1649,7 @@ impl App {
     fn open_dialog(&mut self) {
         // Starts on the selected task's machine.
         let host = self.current().map_or(0, |t| t.machine);
-        self.dialog = Some(Dialog { prompt: String::new(), agent: 0, model: 0, host: 0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new() });
+        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), agent: 0, model: 0, host: 0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new() });
         self.pick_host(host);
         self.focus = Focus::Prompt;
         self.anchor = None;
@@ -1731,6 +1743,9 @@ impl App {
         }
         if self.menu && ev.logical_key == Key::Named(NamedKey::Escape) {
             self.menu = false;
+            return;
+        }
+        if !app_mod(m) && !m.control_key() && !m.shift_key() && self.completion_key(&ev.logical_key) {
             return;
         }
         if self.dialog.is_some() && ev.logical_key == Key::Named(NamedKey::Tab) {
@@ -2989,6 +3004,10 @@ impl App {
     /// The new-task box: the prompt first, then what runs it (agent, model, machine, base branch)
     /// as buttons that cycle or open a list, recent prompts to reuse, and Start.
     fn draw_dialog(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
+        self.refresh_completion();
+        let completion_click = self.dialog.as_ref().and_then(|d| d.completion.bounds)
+            .and_then(|b| self.click.filter(|p| b.contains(*p)));
+        if completion_click.is_some() { self.click = None; }
         let Some(d) = &self.dialog else { return };
         let (prompt, agent_i, model_i, base, error) = (d.prompt.clone(), d.agent, d.model, d.base.clone(), d.error.clone());
         let (branches, list) = (d.branches.clone(), d.list);
@@ -3021,7 +3040,7 @@ impl App {
         let ty = dlg.y + 20.0;
         let prompt_focus = self.focus == Focus::Prompt;
         if prompt.is_empty() {
-            r.text(dlg.x + pad, ty, "What should the agent do?", UI, 16.0, 400, t.faint, dlg.w - 2.0 * pad);
+            r.text(dlg.x + pad, ty, "What should the agent do? (@ to reference files)", UI, 16.0, 400, t.faint, dlg.w - 2.0 * pad);
         }
         let caret = self.caret_for(Focus::Prompt, &prompt).map(|at| caret_line(&prompt, &prompt_lines, at));
         for (i, (line, start)) in prompt_lines.iter().zip(line_starts(&prompt, &prompt_lines)).enumerate() {
@@ -3146,6 +3165,7 @@ impl App {
             r.text(foot.x + pad - 1.0, r.center(start, UI, 12.5), &error, UI, 12.5, 400, t.del, room);
         }
 
+        self.draw_completion(r, t, Rect::new(dlg.x + pad, ty + text_h + 4.0, dlg.w - 2.0 * pad, (h - ty - text_h - 20.0).max(32.0)), completion_click);
         let Some(d) = self.dialog.as_mut() else { return };
         if let Some(p) = reuse {
             (d.prompt, d.hist) = (p, None);

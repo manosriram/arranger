@@ -43,6 +43,8 @@ That's it: it starts the daemon if needed and opens the window. Closing the wind
 
 On Linux use Ctrl+Shift in place of ⌘.
 
+In the new-task prompt, type `@` to find repository files. Use ↑/↓ to choose, Enter or Tab to insert a reference, and Esc to dismiss the picker. Files come from the selected machine’s repository; ignored files are excluded.
+
 Each agent runs in its own terminal, drawn as-is and sized to the pane. When it asks for permission or a choice, answer in its own menu: ↑/↓ and ↵, or with Vim keys on, normal mode switches on by itself and j/k/↵ work the menu.
 
 A soft ding plays when an agent finishes or needs your help. Toggle **Ding sound** in the scheme menu (top right) to turn it off or on; your preference is saved. On Linux, sound requires `paplay` (PulseAudio/PipeWire) or `aplay` (ALSA).

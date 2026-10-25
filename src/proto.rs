@@ -9,7 +9,7 @@ use std::path::PathBuf;
 const MAX_FRAME: usize = 64 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 11;
+pub const VERSION: u32 = 12;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -52,6 +52,8 @@ pub enum Request {
     AbortMerge { id: u64 },
     /// Settle every conflict with one side: the task's branch (`ours`) or its base.
     TakeSide { id: u64, ours: bool },
+    /// Repository paths for the new-task prompt’s @ picker.
+    Paths { repo: PathBuf },
 }
 
 /// What happens after the commit.
@@ -81,6 +83,7 @@ pub enum Reply {
     Review(Review),
     JobDone { ok: bool, output: String },
     Log(Vec<u8>),
+    Paths(Vec<String>),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
