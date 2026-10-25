@@ -1399,6 +1399,11 @@ impl App {
         self.current().is_some_and(|t| t.state != "queued" && !t.worktree.is_empty())
     }
 
+    /// Opens the clone popup on the selected task, if it has a worktree to clone.
+    fn open_clone(&mut self) {
+        self.cloning = self.current().filter(|t| t.state != "queued" && !t.worktree.is_empty()).map(|t| ((t.machine, t.id), String::new()));
+    }
+
     /// Vim's normal mode: one key, one command (`gg` takes two).
     fn normal_key(&mut self, ev: &KeyEvent) {
         let key = match &ev.logical_key {
@@ -1459,9 +1464,7 @@ impl App {
             "o" if self.machine_tasks.is_some() => self.open_from_popup(),
             "o" if self.review.is_none() && self.current().is_some() => self.actions.push(Action::Focus(Focus::Term)),
             "d" if self.review.is_none() && self.machine_tasks.is_none() => self.confirm_delete = self.current().map(|t| (t.machine, t.id)),
-            "c" if self.review.is_none() && self.machine_tasks.is_none() => {
-                self.cloning = self.current().filter(|t| t.state != "queued" && !t.worktree.is_empty()).map(|t| ((t.machine, t.id), String::new()));
-            }
+            "c" if self.review.is_none() && self.machine_tasks.is_none() => self.open_clone(),
             "r" => self.actions.push(Action::OpenReview),
             "n" => self.actions.push(Action::NewTask),
             "m" if self.review.is_none() && self.machine_tasks.is_none() => self.actions.push(Action::OpenAddHost),
@@ -1754,6 +1757,16 @@ impl App {
             }
             return;
         }
+        // The clone popup is up: ↵ clones, Esc closes it; vim's normal mode also takes `y` / `n`.
+        if let Some((task, _)) = self.cloning {
+            match &ev.logical_key {
+                Key::Named(NamedKey::Enter) => self.actions.push(Action::Clone(task)),
+                Key::Named(NamedKey::Escape) => (self.cloning, self.last_esc) = (None, None), // a quick second Esc isn't for the agent
+                _ if self.focus == Focus::Normal => self.normal_key(ev),
+                _ => {}
+            }
+            return;
+        }
         if self.welcome {
             // Nothing else to drive yet: ⌘O opens a folder, ⌘N starts a new project, Esc goes back.
             if ev.logical_key == Key::Named(NamedKey::Escape) && welcome::project_root(&self.repo).is_some() {
@@ -1784,6 +1797,7 @@ impl App {
                 Key::Character(c) => match c.to_lowercase().as_str() {
                     "n" => self.actions.push(Action::NewTask),
                     "r" => self.actions.push(Action::OpenReview),
+                    "d" if self.review.is_none() && self.machine_tasks.is_none() && self.dialog.is_none() && self.add_host.is_none() => self.open_clone(),
                     "e" => self.actions.push(Action::Shell(!self.shell || self.review.is_some())),
                     "j" | "k" if self.review.is_some() => {
                         let files = self.review.as_ref().and_then(|rv| rv.data.as_ref()).map_or(0, |d| d.files.len());
@@ -2772,8 +2786,22 @@ impl App {
         if can && self.hit(r, review) {
             self.actions.push(Action::OpenReview);
         }
+        // Clone, beside it: what vim's `c` does, for everyone.
+        let mut right = review.x;
+        if task.state != "queued" && !task.worktree.is_empty() {
+            let (label, key) = ("Clone", mod_label("D"));
+            let cw = r.measure(UI, 12.0, 500, label) + r.measure(MONO, 10.5, 400, &key) + 30.0;
+            let clone = Rect::new(review.x - 8.0 - cw, top.y, cw, 28.0);
+            r.frame(clone, 4.0, t.bg, t.border2);
+            let lw = r.text(clone.x + 12.0, r.center(clone, UI, 12.0), label, UI, 12.0, 500, t.text, cw);
+            r.text(clone.x + 18.0 + lw, r.center(clone, MONO, 10.5), &key, MONO, 10.5, 400, t.text3, 60.0);
+            if self.hit(r, clone) {
+                self.cloning = Some(((task.machine, task.id), String::new()));
+            }
+            right = clone.x;
+        }
         let tx = pill.x + pw + 8.0 + ship_badge(r, t, &task.shipped, pill.x + pw + 8.0, pill.y + pill.h / 2.0) + 4.0;
-        r.text(tx, r.center(top, UI, 15.0), &title(&task), UI, 15.0, 600, t.text, (review.x - tx - 16.0).max(40.0));
+        r.text(tx, r.center(top, UI, 15.0), &title(&task), UI, 15.0, 600, t.text, (right - tx - 16.0).max(40.0));
 
         // Details: label over value, as many as fit.
         let stats = self.stats.get(&(task.machine, task.id)).filter(|_| self.changes.get(&(task.machine, task.id)).is_some_and(|c| c.1.is_some()));

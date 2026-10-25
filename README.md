@@ -57,7 +57,7 @@ The **Terminal** tab is a shell in the selected task's worktree, for running the
 
 If merging hits a conflict, `main` is left alone: the conflict lands in the agent's worktree, and Review offers to have the agent resolve it (or take one side) before merging again.
 
-With Vim keys on, `c` clones the selected task: a new task on its own worktree and branch, made from the task's current state (uncommitted edits too), whose agent carries on from a fork of the same chat. Cloning works for Claude Code and Codex.
+**Clone** in the task's header (⌘D, or `c` with Vim keys on) clones the selected task: a new task on its own worktree and branch, made from the task's current state (uncommitted edits too), whose agent carries on from a fork of the same chat. Cloning works for Claude Code and Codex.
 
 An agent that has ended can be revived: it resumes its last session in the same worktree, with a new prompt if you give one (also how Review hands a conflict to an agent that has already exited).
 
