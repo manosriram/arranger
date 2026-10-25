@@ -893,9 +893,10 @@ impl App {
         let state = if editing { "draft" } else { "saved" };
         r.text(hx + 32.0 + yw, r.center(badge, UI, 12.0), &format!("· line {}{side} · {state}", note.line), UI, 12.0, 400, t.text3, b.w - 90.0);
         let lines = wrap(r, &note.text, UI, 13.0, b.w - 28.0);
-        let caret = self.caret_for(Focus::Note, &note.text).filter(|_| editing).map(|at| caret_line(&note.text, &lines, at));
+        let starts = line_starts(&note.text, &lines);
+        let caret = self.caret_for(Focus::Note, &note.text).filter(|_| editing).map(|at| caret_line_at(&lines, &starts, at));
         let mut y = b.y + 38.0;
-        for (k, (line, start)) in lines.iter().zip(line_starts(&note.text, &lines)).enumerate() {
+        for (k, (line, &start)) in lines.iter().zip(&starts).enumerate() {
             if editing {
                 let at = caret.filter(|c| c.0 == k).map(|c| c.1);
                 self.field_text(r, t, hx, y, line, UI, 13.0, b.w - 28.0, (Focus::Note, start), self.focus == Focus::Note, at, t.work);
