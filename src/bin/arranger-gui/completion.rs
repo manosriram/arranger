@@ -1,6 +1,36 @@
 //! Repository file references in the new-task prompt.
 use super::*;
 
+/// Byte ranges for file references, including quoted paths inserted by completion.
+pub(super) fn reference_ranges(prompt: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut chars = prompt.char_indices().peekable();
+    let mut boundary = true;
+    while let Some((start, ch)) = chars.next() {
+        if ch == '@' && boundary {
+            let quoted = chars.peek().is_some_and(|(_, c)| *c == '"');
+            let mut end = start + 1;
+            let mut escaped = false;
+            if quoted {
+                chars.next();
+                end += 1;
+            }
+            while let Some(&(i, c)) = chars.peek() {
+                if !quoted && c.is_whitespace() { break; }
+                chars.next();
+                end = i + c.len_utf8();
+                if quoted && c == '"' && !escaped { break; }
+                escaped = c == '\\' && !escaped;
+            }
+            ranges.push(start..end);
+            boundary = false;
+        } else {
+            boundary = ch.is_whitespace();
+        }
+    }
+    ranges
+}
+
 #[derive(Default)]
 pub(super) struct Completion {
     source: Option<(usize, String)>,

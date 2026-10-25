@@ -2200,7 +2200,24 @@ impl App {
     /// caret. `s` is field `src.0` from byte `src.1` on (all of it, or one wrapped line): a mouse
     /// press or drag over it puts the caret there. Returns the width.
     fn field_text(&self, r: &mut Renderer, t: &Theme, x: f32, y: f32, s: &str, font: usize, size: f32, max_w: f32, src: (Focus, usize), focused: bool, caret: Option<usize>, color: Rgba) -> f32 {
-        let w = r.text(x, y, s, font, size, 400, t.text, max_w);
+        let w = if src.0 == Focus::Prompt {
+            let ranges = self.dialog.as_ref().map(|d| completion::reference_ranges(&d.prompt)).unwrap_or_default();
+            let mut width = 0.0;
+            let mut start = 0;
+            while start < s.len() && width < max_w {
+                let at = src.1 + start;
+                let reference = ranges.iter().find(|range| range.contains(&at));
+                let end = reference.map(|range| range.end)
+                    .unwrap_or_else(|| ranges.iter().find(|range| range.start > at).map_or(src.1 + s.len(), |range| range.start))
+                    .min(src.1 + s.len()) - src.1;
+                let ink = if reference.is_some() { if t.dark { [96, 165, 250, 255] } else { [37, 99, 235, 255] } } else { t.text };
+                width += r.text(x + width, y, &s[start..end], font, size, 400, ink, max_w - width);
+                start = end;
+            }
+            width
+        } else {
+            r.text(x, y, s, font, size, 400, t.text, max_w)
+        };
         let (top, h) = (y - size * 0.15, size * 1.35);
         let (field, base) = src;
         let band = (y - size * 0.35, y + size * 1.4);
