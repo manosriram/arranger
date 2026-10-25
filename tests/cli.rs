@@ -45,6 +45,19 @@ fn git(dir: &Path, args: &[&str]) -> String {
 /// The Terminal tab's shell on task 1: a `cd` out of the worktree steps back in, and on macOS
 /// the main checkout can't be read nor anything written beside the worktree. Exiting ends it.
 fn shell_stays_in_worktree(home: &Home, repo: &Path) {
+    if cfg!(target_os = "macos") {
+        // An inherited sandbox can forbid sandbox_apply entirely. Probe separately so
+        // that restriction doesn't hide regressions in our actual sandbox profile.
+        let probe = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+            .output().unwrap();
+        let stderr = String::from_utf8_lossy(&probe.stderr);
+        if !probe.status.success() && stderr.contains("sandbox_apply: Operation not permitted") {
+            eprintln!("skipping shell confinement check: this environment forbids applying a macOS sandbox: {stderr}");
+            return;
+        }
+        assert!(probe.status.success(), "sandbox availability probe failed: {stderr}");
+    }
     use arranger::proto::{Reply, Request, frame, unframe};
     use std::io::{Read, Write};
     let mut sock = std::os::unix::net::UnixStream::connect(home.0.join("arranger.sock")).unwrap();
