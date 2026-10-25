@@ -13,12 +13,43 @@ pub const MT_PAGE: usize = 50;
 const GROUPS: [&str; 5] = ["Needs you", "Running", "Queued", "Done", "Ended"];
 
 impl App {
+    pub fn draw_task_checkbox(&self, r: &mut Renderer, t: &Theme, key: TaskKey, row: Rect) -> Rect {
+        self.task_regions.borrow_mut().push((key, row));
+        if let Some(tasks) = &self.multi_select {
+            let checked = tasks.contains(&key);
+            r.text(row.x + 4.0, r.center(row, UI, 14.0), if checked { "☑" } else { "☐" }, UI, 14.0, 500, t.text, 22.0);
+            Rect::new(row.x + 24.0, row.y, row.w - 24.0, row.h)
+        } else { row }
+    }
+
+    pub fn draw_task_selection(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
+        if self.confirm_delete.is_some() { return; }
+        if let Some(tasks) = &self.multi_select {
+            let bar = Rect::new(8.0, h - 66.0, (self.sidebar_w - 16.0).min(w - 16.0), 36.0);
+            r.frame(bar, 4.0, t.dialog, t.border2);
+            let label = format!("Delete {} · d", tasks.len());
+            let delete = Rect::new(bar.x + 8.0, bar.y, bar.w - 80.0, bar.h);
+            let cancel = Rect::new(bar.x + bar.w - 68.0, bar.y, 64.0, bar.h);
+            r.text(delete.x, r.center(delete, UI, 12.0), &label, UI, 12.0, 500, t.del, delete.w);
+            r.text(cancel.x, r.center(cancel, UI, 12.0), "Esc · exit", UI, 12.0, 400, t.text, cancel.w);
+            if self.hit(r, delete) { self.confirm_bulk_delete(); self.actions.clear(); }
+            if self.hit(r, cancel) { self.multi_select = None; self.actions.clear(); }
+        }
+        if let Some((key, (x, y))) = self.task_menu {
+            let menu = Rect::new(x.min(w - 172.0).max(0.0), y.min(h - 42.0).max(0.0), 172.0, 38.0);
+            r.frame(menu, 4.0, t.dialog, t.border2);
+            r.text(menu.x + 12.0, r.center(menu, UI, 13.0), "Select task", UI, 13.0, 500, t.text, 148.0);
+            if self.hit(r, menu) {
+                self.multi_select = Some(vec![key]);
+                self.answering = None;
+                self.task_menu = None;
+            } else if self.click.is_some() { self.task_menu = None; }
+        }
+    }
+
     pub fn draw_delete_confirmation(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
-        let Some(task) = self.confirm_delete else { return };
-        let Some(name) = self.task(task).map(title) else {
-            self.confirm_delete = None;
-            return;
-        };
+        let Some(tasks) = self.confirm_delete.clone() else { return };
+        let name = if tasks.len() == 1 { self.task(tasks[0]).map(title).unwrap_or_default() } else { format!("{} tasks selected", tasks.len()) };
         let bounds = Rect::new(0.0, 0.0, w, h);
         r.rect(bounds, 0.0, t.scrim);
         r.target(bounds, Cursor::Arrow);
@@ -26,9 +57,9 @@ impl App {
         let pop = Rect::new((w - pw) / 2.0, (h - 202.0) / 2.0, pw, 202.0);
         r.frame(pop, 8.0, t.dialog, t.border2);
         r.target(pop, Cursor::Arrow);
-        r.text(pop.x + 24.0, pop.y + 22.0, "Delete thread?", UI, 17.0, 600, t.text, pw - 48.0);
+        r.text(pop.x + 24.0, pop.y + 22.0, "Delete selected tasks?", UI, 17.0, 600, t.text, pw - 48.0);
         r.text(pop.x + 24.0, pop.y + 58.0, &name, UI, 13.0, 500, t.text, pw - 48.0);
-        r.text(pop.x + 24.0, pop.y + 84.0, "The thread and its worktree will be deleted.", UI, 13.0, 400, t.text2, pw - 48.0);
+        r.text(pop.x + 24.0, pop.y + 84.0, "Selected tasks and their worktrees will be deleted.", UI, 13.0, 400, t.text2, pw - 48.0);
         let delete = Rect::new(pop.x + pw - 136.0, pop.y + 140.0, 112.0, 38.0);
         let cancel = Rect::new(delete.x - 122.0, delete.y, 112.0, 38.0);
         r.frame(cancel, 4.0, t.dialog, t.border2);
@@ -37,7 +68,8 @@ impl App {
         r.text(delete.x + 14.0, r.center(delete, UI, 13.0), "Delete · y", UI, 13.0, 600, readable(t.on_accent, t.del), 90.0);
         if self.hit(r, delete) {
             self.confirm_delete = None;
-            self.actions.push(Action::Delete(task));
+            self.actions.extend(tasks.into_iter().map(Action::Delete));
+            self.multi_select = None;
         } else if self.hit(r, cancel) || self.click.is_some_and(|p| !pop.contains(p)) {
             self.confirm_delete = None;
         }
@@ -162,7 +194,10 @@ impl App {
             if self.hit(r, row) && clicked(self.click) {
                 acts.push(Action::Select(key));
             }
-            self.icon(r, t, task, col_x[0], row.y + row.h / 2.0);
+            self.draw_task_checkbox(r, t, key, row);
+            if self.multi_select.is_none() {
+                self.icon(r, t, task, col_x[0], row.y + row.h / 2.0);
+            }
             let (x, w) = col("task");
             let bw = if task.shipped.is_empty() { 0.0 } else { r.measure(UI, 11.0, 500, &format!("✓ {}", task.shipped)) + 16.0 };
             let tc = if g == 4 { t.text2 } else if on { t.tc_on } else { t.text };
@@ -189,6 +224,7 @@ impl App {
             let tw = r.measure(MONO, 12.0, 400, &time);
             r.text(x + w - tw, r.center(row, MONO, 12.0), &time, MONO, 12.0, 400, t.text3, tw + 2.0);
 
+            if self.multi_select.is_some() { continue; }
             // The one thing to do next.
             let approve = g == 0 && task.asking && matches!(task.need, Some(Event::PermissionRequest { .. }));
             let (label, fill, fg) = match g {
@@ -304,7 +340,7 @@ impl App {
     pub fn draw_help(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
         const SECTIONS: [(&str, &[(&str, &str)]); 3] = [
             ("MOVE", &[("j / k", "next / prev agent"), ("gg  G", "first / last"), ("J / K", "next / prev needing you"), ("h / l", "prev / next view"), ("H", "see all on machine"), ("/", "filter agents")]),
-            ("ACT", &[("o  ↵", "type into agent"), ("j / k", "its menu, when it asks"), ("↵", "pick from the menu"), ("r", "review diff"), ("d", "delete task"), ("c", "clone task"), ("n", "new task"), ("m", "add machine")]),
+            ("ACT", &[("o  ↵", "type into agent"), ("j / k", "its menu, when it asks"), ("↵", "pick from the menu"), ("r", "review diff"), ("V", "Select multiple tasks"), ("d", "delete selected tasks"), ("c", "clone task"), ("n", "new task"), ("m", "add machine")]),
             ("MODE", &[("i", "type into agent"), ("esc", "normal mode"), ("esc esc", "stop the agent"), ("?", "this sheet")]),
         ];
         let sw = 720.0_f32.min(w - 24.0);

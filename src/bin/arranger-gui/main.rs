@@ -309,7 +309,10 @@ struct App {
     /// `g` was pressed and waits for a second `g`.
     pending_g: bool,
     /// `d` was pressed on this task and waits for `y` (delete it) or `n`.
-    confirm_delete: Option<TaskKey>,
+    confirm_delete: Option<Vec<TaskKey>>,
+    multi_select: Option<Vec<TaskKey>>,
+    task_menu: Option<(TaskKey, (f32, f32))>,
+    task_regions: std::cell::RefCell<Vec<(TaskKey, Rect)>>,
     /// When Esc was last pressed in vim mode: a second one forwards both to the agent.
     last_esc: Option<Instant>,
     /// The selected agent's ask (task, its `since`) that switched vim keys to normal mode, where
@@ -441,6 +444,9 @@ fn run() -> io::Result<()> {
         scheme_btn: Rect::new(0.0, 0.0, 0.0, 0.0),
         help: false,
         confirm_delete: None,
+        multi_select: None,
+        task_menu: None,
+        task_regions: std::cell::RefCell::new(Vec::new()),
         pending_g: false,
         last_esc: None,
         answering: None,
@@ -682,7 +688,7 @@ impl ApplicationHandler<Msg> for App {
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_DELETE").is_some() {
                         self.vim = true;
                         self.focus = Focus::Normal;
-                        self.confirm_delete = self.current().map(|t| (t.machine, t.id));
+                        self.confirm_delete = self.current().map(|t| vec![(t.machine, t.id)]);
                     }
                 }
                 self.sync_session();
@@ -780,6 +786,13 @@ impl ApplicationHandler<Msg> for App {
             WindowEvent::CursorLeft { .. } => {
                 self.mouse = (-1.0, -1.0);
                 self.hover_changed();
+            }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
+                if self.dialog.is_none() && self.confirm_delete.is_none() && self.review.is_none() {
+                    self.task_menu = self.task_regions.borrow().iter().rev()
+                        .find(|(_, rect)| rect.contains(self.mouse)).map(|(key, _)| (*key, self.mouse));
+                    self.redraw();
+                }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 self.chat_drag = false;
@@ -1480,6 +1493,11 @@ impl App {
             _ => return,
         };
         let g = std::mem::take(&mut self.pending_g);
+        if key == "V" && self.review.is_none() {
+            self.multi_select = Some(self.selected.into_iter().collect());
+            self.answering = None;
+            return;
+        }
         // The agent's menu is up: j/k move through it and ↵ picks, back in its terminal; Esc or i
         // leave it be.
         if self.answering.is_some() && self.machine_tasks.is_none() && self.review.is_none() {
@@ -1524,7 +1542,7 @@ impl App {
             "h" | "l" if self.machine_tasks.is_none() => self.move_view(key == "l"),
             "o" if self.machine_tasks.is_some() => self.open_from_popup(),
             "o" if self.review.is_none() && self.current().is_some() => self.actions.push(Action::Focus(Focus::Term)),
-            "d" if self.review.is_none() && self.machine_tasks.is_none() => self.confirm_delete = self.current().map(|t| (t.machine, t.id)),
+            "d" if self.review.is_none() && self.machine_tasks.is_none() => self.confirm_delete = self.current().map(|t| vec![(t.machine, t.id)]),
             "c" if self.review.is_none() && self.machine_tasks.is_none() => self.clone_selected(),
             "r" => self.actions.push(Action::OpenReview),
             "n" => self.actions.push(Action::NewTask),
@@ -1728,7 +1746,10 @@ impl App {
         }
         let i = self.selected.and_then(|id| order.iter().position(|&x| x == id)).unwrap_or(0) as i32;
         if let Some(&id) = order.get((i + d).clamp(0, order.len() as i32 - 1) as usize) {
-            self.actions.push(Action::Select(id));
+            if let Some(tasks) = self.multi_select.as_mut() {
+                self.selected = Some(id);
+                if !tasks.contains(&id) { tasks.push(id); }
+            } else { self.actions.push(Action::Select(id)); }
         }
     }
 
@@ -1839,9 +1860,33 @@ impl App {
             if !ev.repeat && !app_mod(m) && !m.control_key()
                 && matches!(&ev.logical_key, Key::Character(c) if c == "y")
             {
-                self.actions.push(Action::Delete(task));
+                self.actions.extend(task.into_iter().map(Action::Delete));
+                self.multi_select = None;
             } else if ev.repeat {
                 self.confirm_delete = Some(task);
+            }
+            return;
+        }
+        if self.task_menu.is_some() && ev.logical_key == Key::Named(NamedKey::Escape) {
+            self.task_menu = None;
+            return;
+        }
+        if self.multi_select.is_some() {
+            if ev.repeat || app_mod(m) || m.control_key() || m.alt_key() { return; }
+            match &ev.logical_key {
+                Key::Named(NamedKey::Escape) => { self.multi_select = None; self.focus = self.rest(); }
+                Key::Character(c) if c == "d" => self.confirm_bulk_delete(),
+                Key::Character(c) if c == "j" => self.move_selection(1),
+                Key::Character(c) if c == "k" => self.move_selection(-1),
+                Key::Named(NamedKey::ArrowDown) => self.move_selection(1),
+                Key::Named(NamedKey::ArrowUp) => self.move_selection(-1),
+                Key::Character(c) if c == "V" || c == " " => {
+                    if let Some(key) = self.selected { self.toggle_task_selection(key); }
+                }
+                Key::Named(NamedKey::Space) => {
+                    if let Some(key) = self.selected { self.toggle_task_selection(key); }
+                }
+                _ => {}
             }
             return;
         }
@@ -2164,10 +2209,28 @@ impl App {
         self.anchor = None;
     }
 
+    fn toggle_task_selection(&mut self, key: TaskKey) {
+        if let Some(tasks) = self.multi_select.as_mut() {
+            if tasks.contains(&key) { tasks.retain(|k| *k != key); }
+            else { tasks.push(key); }
+        }
+    }
+
+    fn confirm_bulk_delete(&mut self) {
+        if let Some(tasks) = &self.multi_select {
+            let tasks: Vec<_> = tasks.iter().copied().filter(|k| self.task(*k).is_some()).collect();
+            if !tasks.is_empty() { self.confirm_delete = Some(tasks); }
+        }
+    }
+
     fn apply(&mut self) {
         for action in std::mem::take(&mut self.actions) {
             match action {
                 Action::Select(id) => {
+                    if self.multi_select.is_some() {
+                        self.toggle_task_selection(id);
+                        continue;
+                    }
                     self.selected = Some(id);
                     (self.wheel, self.ticks, self.glide) = (0.0, 0.0, 0.0);
                     // An open dialog keeps its field until it's closed.
@@ -2410,7 +2473,8 @@ impl App {
         }
         self.stale.set(false);
         self.icons.borrow_mut().clear();
-        self.layered = !(self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || (self.help && self.vim) || self.menu);
+        self.task_regions.borrow_mut().clear();
+        self.layered = !(self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || (self.help && self.vim) || self.menu || self.task_menu.is_some());
         let dpi = gfx.window.scale_factor() as f32 * self.zoom;
         let (w, h) = (size.width as f32 / dpi, size.height as f32 / dpi);
         let r = &mut gfx.r;
@@ -2418,7 +2482,7 @@ impl App {
 
         self.probe_changes();
         // Under an open dialog or popup nothing reacts: the views below draw without the click.
-        let modal_click = (self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some()).then(|| self.click.take());
+        let modal_click = (self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || self.task_menu.is_some()).then(|| self.click.take());
         self.draw_title(r, t, w);
         if self.welcome {
             self.draw_welcome(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H));
@@ -2438,9 +2502,12 @@ impl App {
         if let Some(click) = modal_click {
             self.click = click;
         }
+        let context_click = self.task_menu.is_some().then(|| self.click.take());
         if self.machine_tasks.is_some() {
+            self.task_regions.borrow_mut().clear();
             self.draw_machine_tasks(r, t, w, h);
         }
+        if let Some(click) = context_click { self.click = click; }
         if self.dialog.is_some() {
             self.draw_dialog(r, t, w, h);
         }
@@ -2453,6 +2520,7 @@ impl App {
         if self.menu {
             self.draw_menu(r, t);
         }
+        self.draw_task_selection(r, t, w, h);
         if self.confirm_delete.is_some() {
             self.draw_delete_confirmation(r, t, w, h);
         }
@@ -2738,6 +2806,8 @@ impl App {
     /// One task row: state icon, title and agent, and under them what it's doing. Dense, it's one
     /// line, with what it's doing on the right in place of the agent. Returns whether it was clicked.
     fn draw_row(&self, r: &mut Renderer, t: &Theme, task: &TaskInfo, row: Rect, dense: bool) -> bool {
+        let hit_row = row;
+        let row = self.draw_task_checkbox(r, t, (task.machine, task.id), row);
         let g = group(&task.state);
         let queue_pos = self.hosts[task.machine].tasks.iter().filter(|x| x.state == "queued" && x.id <= task.id).count();
         let line = status_line(task, queue_pos).replace('\n', " ");
@@ -2765,7 +2835,7 @@ impl App {
             let sub = Rect::new(text_x, top.y + top.h, row.w - 38.0, 18.0);
             r.text(sub.x, r.center(sub, UI, 12.0), &line, UI, 12.0, 400, sc, sub.w);
         }
-        self.hit(r, row)
+        self.hit(r, hit_row)
     }
 
     /// A needs-you card: what the agent is waiting on, with the answer right there. A permission
@@ -2773,9 +2843,11 @@ impl App {
     /// an ask showing in the agent's own terminal) gets Answer, which opens that terminal on its menu.
     fn draw_needs_card(&self, r: &mut Renderer, t: &Theme, task: &TaskInfo, card: Rect, machine: Option<&str>, live: bool) -> Vec<Action> {
         let key = (task.machine, task.id);
+        let hit_card = card;
+        let card = self.draw_task_checkbox(r, t, key, card);
         let mut acts = Vec::new();
         r.frame(card, 0.0, t.needs_bg, if self.selected == Some(key) { t.needs } else { t.needs_line });
-        if self.hit(r, card) && live {
+        if self.hit(r, hit_card) && live {
             acts.push(Action::Select(key));
         }
         let top = Rect::new(card.x, card.y + 10.0, card.w, 22.0);
@@ -2788,7 +2860,7 @@ impl App {
         let ask = Rect::new(text_x, top.y + top.h, card.w - 48.0, 20.0);
         r.text(ask.x, r.center(ask, UI, 12.5), &status_line(task, 0).replace('\n', " "), UI, 12.5, 400, t.needs, ask.w);
 
-        let buttons: Vec<(&str, bool, Vec<Action>)> = if task.asking {
+        let buttons: Vec<(&str, bool, Vec<Action>)> = if self.multi_select.is_some() { vec![] } else if task.asking {
             vec![("Allow once", true, vec![Action::Answer(key, true)]), ("Deny", false, vec![Action::Answer(key, false)])]
         } else {
             vec![("Answer", true, vec![Action::Select(key), Action::Answering])]
