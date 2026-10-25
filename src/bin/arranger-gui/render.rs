@@ -11,8 +11,10 @@ use swash::{FontRef, NormalizedCoord};
 
 pub const UI: usize = 0;
 pub const MONO: usize = 1;
-const BUNDLED: [&[u8]; 2] = [include_bytes!("../../../assets/fonts/Geist.ttf"), include_bytes!("../../../assets/fonts/GeistMono.ttf")];
-/// System fonts tried, in order, for glyphs Geist lacks (❯ ⏺ ⎿ ✳ …). Missing files are skipped.
+/// IBM Plex Mono (variable weight) for everything: the UI and the terminal share one face.
+const PLEX: &[u8] = include_bytes!("../../../assets/fonts/IBMPlexMono.ttf");
+const BUNDLED: [&[u8]; 2] = [PLEX, PLEX];
+/// System fonts tried, in order, for glyphs Plex lacks (❯ ⏺ ⎿ ✳ …). Missing files are skipped.
 const FALLBACKS: &[&str] = &[
     "/System/Library/Fonts/Menlo.ttc",
     "/System/Library/Fonts/Apple Symbols.ttf",
@@ -134,18 +136,13 @@ pub struct Renderer {
     vmetrics: RefCell<HashMap<(usize, u32), (f32, f32)>>,
     /// This frame's click targets in draw order, with the clip they were drawn under.
     targets: Vec<(Rect, Option<Rect>, Cursor)>,
-    /// This frame's buttons are square (the welcome screen): so is their hover tint.
-    pub sharp: bool,
     /// Offscreen copy of the last full frame (framebuffer, its texture, size), so an animation
     /// tick can copy it back and draw only what moved. None if the driver can't make one.
     layer: Option<(glow::Framebuffer, glow::Texture, (u32, u32))>,
 }
 
-/// Added to every requested weight: Geist at its nominal weights reads too thin on screen.
-const WEIGHT_BOOST: f32 = 100.0;
-
 fn coords(font: &FontRef, weight: u16) -> Vec<NormalizedCoord> {
-    font.variations().normalized_coords([("wght", weight as f32 + WEIGHT_BOOST)]).collect()
+    font.variations().normalized_coords([("wght", weight as f32)]).collect()
 }
 
 fn fonts() -> &'static [&'static [u8]] {
@@ -235,7 +232,6 @@ impl Renderer {
                 advances: RefCell::default(),
                 vmetrics: RefCell::default(),
                 targets: Vec::new(),
-                sharp: false,
                 layer: None,
             })
         }
@@ -246,7 +242,6 @@ impl Renderer {
         self.size = (width.max(1), height.max(1));
         self.dpi = dpi;
         self.targets.clear();
-        self.sharp = false;
         unsafe {
             if self.layer.is_none_or(|l| l.2 != self.size) {
                 self.make_layer();
@@ -265,7 +260,7 @@ impl Renderer {
         if let Some((r, clip, Cursor::Pointer)) = hot {
             self.set_clip(clip);
             // Mid grey: lightens dark buttons and darkens light ones, in either theme.
-            self.rect(r, if self.sharp { 0.0 } else { 3.0 }, [128, 128, 128, 0x24]);
+            self.rect(r, 0.0, [128, 128, 128, 0x24]);
         }
         self.set_clip(None);
         self.present();
@@ -419,13 +414,13 @@ impl Renderer {
         self.verts.extend([a, b, c, b, d, c]);
     }
 
-    /// Filled rect with corner radius.
-    pub fn rect(&mut self, r: Rect, radius: f32, color: Rgba) {
+    /// Filled rect. Corners are square throughout the app, so `_radius` is not drawn.
+    pub fn rect(&mut self, r: Rect, _radius: f32, color: Rgba) {
         let d = self.dpi;
         // Round both edges, not the size, so neighbouring rects (terminal cell backgrounds) meet without seams.
         let (x, y) = ((r.x * d).round(), (r.y * d).round());
         let (w, h) = (((r.x + r.w) * d).round() - x, ((r.y + r.h) * d).round() - y);
-        self.quad(x, y, w, h, [0.0; 4], (radius * d).min(w / 2.0).min(h / 2.0).max(0.0), color);
+        self.quad(x, y, w, h, [0.0; 4], 0.0, color);
     }
 
     /// Rect with a 1px border of `line` (drawn as an outer rect behind an inset fill).

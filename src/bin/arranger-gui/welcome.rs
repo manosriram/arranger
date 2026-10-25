@@ -7,7 +7,6 @@ use std::path::Path;
 impl App {
     pub fn draw_welcome(&mut self, r: &mut Renderer, t: &Theme, area: Rect) {
         let mut acts = Vec::new();
-        r.sharp = true;
         let side_w = 400.0f32.min(area.w * 0.4);
 
         // Left: what this is, and the ways in.

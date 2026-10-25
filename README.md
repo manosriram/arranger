@@ -54,9 +54,9 @@ If merging hits a conflict, `main` is left alone: the conflict lands in the agen
 
 An agent that has ended can be revived: it resumes its last session in the same worktree, with a new prompt if you give one (also how Review hands a conflict to an agent that has already exited).
 
-The **Overview** tab lists every agent on every machine in one table, grouped by state, with one action per row: Approve, Answer, Review or Open. Ended agents live there too; click "N ended" under a machine to see that machine's.
+Agents waiting on a permission show it as a card at the top of the sidebar, with Allow once and Deny right there. **See all** on a machine's header opens every task on it, ended ones too, grouped by state with one action per row: Approve, Answer, Review, Open or Revive.
 
-Eight colour schemes (four dark, four light) are in the menu at the top right.
+Eight colour schemes are in the menu at the top right: Gruvbox, Ink, Moss and Ember (dark), Gruvbox Light, Snow, Paper and Linen (light).
 
 Prefer vim keys? Turn on **Vim keys** in the scheme menu (top right). The bindings are in [vim.json](vim.json), and `?` shows them in the app.
 

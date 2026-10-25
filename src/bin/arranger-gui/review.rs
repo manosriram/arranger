@@ -139,6 +139,9 @@ pub fn plain(line: &str) -> String {
     spans(line).into_iter().map(|s| s.0).collect()
 }
 
+/// Line height of the summary's prose: roomy enough to read at a glance in Plex Mono.
+const SUMMARY_LINE_H: f32 = 22.0;
+
 /// Draws an agent's markdown (headings, bullets, code blocks, bold and `code` runs) wrapped to `w`
 /// from `y`; returns the y below it.
 fn draw_markdown(r: &mut Renderer, t: &Theme, text: &str, x: f32, mut y: f32, w: f32) -> f32 {
@@ -155,7 +158,7 @@ fn draw_markdown(r: &mut Renderer, t: &Theme, text: &str, x: f32, mut y: f32, w:
             continue;
         }
         if trimmed.is_empty() {
-            y += 8.0;
+            y += 10.0;
             continue;
         }
         let heading = trimmed.starts_with('#');
@@ -182,7 +185,7 @@ fn draw_markdown(r: &mut Renderer, t: &Theme, text: &str, x: f32, mut y: f32, w:
             for (i, word) in run.split(' ').enumerate() {
                 let ww = r.measure(font, size, weight, word);
                 if cx + ww > right && cx > x + indent {
-                    (cx, y) = (x + indent, y + 20.0);
+                    (cx, y) = (x + indent, y + SUMMARY_LINE_H);
                 }
                 let dy = if code { 1.0 } else { 0.0 };
                 cx += r.text(cx, y + dy, word, font, size, weight, color, right - cx);
@@ -191,7 +194,7 @@ fn draw_markdown(r: &mut Renderer, t: &Theme, text: &str, x: f32, mut y: f32, w:
                 }
             }
         }
-        y += if heading { 24.0 } else { 20.0 };
+        y += if heading { SUMMARY_LINE_H + 4.0 } else { SUMMARY_LINE_H };
     }
     y
 }

@@ -2,7 +2,7 @@
 //! Immediate mode: every redraw lays out and draws everything, and resolves the click
 //! that triggered it. Redraws happen only on input or daemon pushes, so idle CPU is zero.
 
-mod overview;
+mod overlays;
 mod sound;
 mod render;
 mod review;
@@ -38,9 +38,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use review::{ReviewAction, ReviewView, Tag};
-use theme::{AGENTS, Rgba, THEMES, Theme, accent, accent_deep, alpha, blend, models, readable};
+use theme::{AGENTS, Rgba, THEMES, Theme, accent, alpha, blend, models, readable};
 #[cfg(test)]
-use theme::{GRAPHITE, PAPER};
+use theme::{INK, PAPER};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
@@ -50,13 +50,16 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::macos::WindowAttributesExtMacOS;
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
-const TITLE_H: f32 = 36.0;
+const TITLE_H: f32 = 44.0;
 const STATUS_H: f32 = 22.0;
-const SIDEBAR_W: f32 = 272.0;
+const SIDEBAR_W: f32 = 340.0;
 const HEADER_H: f32 = 80.0;
 const ROW_H: f32 = 28.0;
 /// A row with its second line (what the agent is doing / did).
-const ROW2_H: f32 = 42.0;
+const ROW2_H: f32 = 48.0;
+/// A one-line row, when the sidebar is dense.
+const DENSE_ROW_H: f32 = 32.0;
+const NEEDS_CARD_H: f32 = 100.0;
 const GROUP_H: f32 = 24.0;
 const TERM_SIZE: f32 = 12.0;
 const LINE_H: f32 = 18.0;
@@ -137,6 +140,8 @@ enum Focus {
     /// Vim keys' normal mode: keys move and act instead of typing.
     Normal,
     Filter,
+    /// The machine popup's own filter.
+    TasksFilter,
     Prompt,
     Base,
     Repo,
@@ -202,10 +207,12 @@ enum Action {
     PickTheme(usize),
     ToggleMenu,
     ToggleVim,
-    /// Shows (true) or leaves the Overview table.
-    Overview(bool),
-    OvGroup(Option<usize>),
-    OvHost(Option<usize>),
+    /// Opens the popup of every task on this machine, or closes it (None).
+    MachineTasks(Option<usize>),
+    /// Filters that popup to one state group (None: all).
+    MtGroup(Option<usize>),
+    /// Loads the popup's next page of rows.
+    MtMore,
     /// Open this folder as the project, or pick one first (None).
     OpenProject(Option<PathBuf>),
     /// Pick a name and place for a new project folder, and open it.
@@ -263,12 +270,14 @@ struct App {
     welcome_error: String,
     /// Why the last Revive of a task failed, shown in its Revive bar.
     revive_error: Option<(TaskKey, String)>,
-    /// The Overview table is showing, filtered to one state group (None: all).
-    overview: bool,
-    ov_group: Option<usize>,
-    /// ...and to one machine, from its header's "N ended" link.
-    ov_host: Option<usize>,
-    ov_scroll: f32,
+    /// The machine whose every task shows in a popup (its sidebar header's "See all"), filtered to
+    /// one state group (None: all) and by its own filter text.
+    machine_tasks: Option<usize>,
+    mt_group: Option<usize>,
+    mt_filter: String,
+    mt_scroll: f32,
+    /// How many of its rows the popup has loaded so far.
+    mt_shown: usize,
     /// ⌘= / ⌘- / ⌘0: scales the whole window on top of the display's own scale.
     zoom: f32,
     focus: Focus,
@@ -381,10 +390,11 @@ fn run() -> io::Result<()> {
         welcome: false,
         recent: Vec::new(),
         welcome_error: String::new(),
-        overview: false,
-        ov_group: None,
-        ov_host: None,
-        ov_scroll: 0.0,
+        machine_tasks: None,
+        mt_group: None,
+        mt_filter: String::new(),
+        mt_scroll: 0.0,
+        mt_shown: overlays::MT_PAGE,
         zoom: 1.0,
         focus: Focus::Term,
         filter: String::new(),
@@ -427,7 +437,7 @@ fn run() -> io::Result<()> {
         stats: Default::default(),
     };
     let settings = Settings::load();
-    app.theme = THEMES.iter().position(|t| t.name == settings.theme).unwrap_or(0);
+    app.theme = theme::by_name(&settings.theme);
     app.vim = settings.vim;
     app.prompts = settings.prompts;
     app.recent = settings.recent;
@@ -578,6 +588,14 @@ impl ApplicationHandler<Msg> for App {
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_REVIEW").is_some() {
                         self.open_review();
                     }
+                    // `ARRANGER_POPUP` snapshots this machine's "See all" popup instead, and
+                    // `ARRANGER_NEWTASK` the new-task box.
+                    if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_POPUP").is_some() {
+                        self.machine_tasks = Some(m);
+                    }
+                    if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_NEWTASK").is_some() {
+                        self.open_dialog();
+                    }
                 }
                 self.sync_session();
             }
@@ -724,9 +742,16 @@ struct Section<'a> {
     key: String,
     host: Option<usize>,
     tasks: Vec<&'a TaskInfo>,
-    /// Tasks whose agent has ended; left out of `tasks` (Overview lists them) unless filtering or selected.
+    /// Tasks whose agent has ended; left out of `tasks` (the machine popup lists them) unless filtering or selected.
     ended: usize,
+    /// Rows past `DENSE_CAP` left out while the sidebar is dense; "+N more" opens the machine popup.
+    more: usize,
 }
+
+/// Past this many running or queued agents the sidebar goes dense: one line per row, and each
+/// machine lists `DENSE_CAP` of them (plus the selected one) with the rest behind "+N more".
+const DENSE_AT: usize = 6;
+const DENSE_CAP: usize = 4;
 
 /// Automatic reconnect attempts after a machine's link fails; then it waits for Reconnect.
 const AUTO_RETRIES: u32 = 3;
@@ -1122,37 +1147,56 @@ impl App {
         let sort = |v: &mut Vec<&TaskInfo>| v.sort_by_key(|t| (group(&t.state), std::cmp::Reverse(last_event(t)), std::cmp::Reverse(t.id)));
         let mut needs: Vec<&TaskInfo> = self.all_tasks().filter(shown).filter(|t| group(&t.state) == 0).collect();
         sort(&mut needs);
-        let mut out = vec![Section { key: "needs".into(), host: None, tasks: needs, ended: 0 }];
+        let mut out = vec![Section { key: "needs".into(), host: None, tasks: needs, ended: 0, more: 0 }];
+        let dense = self.dense();
         for (i, h) in self.hosts.iter().enumerate().filter(|(_, h)| !h.removed) {
             let mut tasks: Vec<&TaskInfo> = h.tasks.iter().filter(shown).filter(|t| group(&t.state) != 0).collect();
             sort(&mut tasks);
             let ended = tasks.iter().filter(|t| group(&t.state) == 4).count();
+            let mut more = 0;
             if f.is_empty() {
                 tasks.retain(|t| group(&t.state) != 4 || self.selected == Some((t.machine, t.id)));
+                if dense {
+                    let all = tasks.len();
+                    let mut k = 0;
+                    tasks.retain(|t| {
+                        k += 1;
+                        k <= DENSE_CAP || self.selected == Some((t.machine, t.id))
+                    });
+                    more = all - tasks.len();
+                }
             }
-            out.push(Section { key: format!("host:{i}"), host: Some(i), tasks, ended });
+            out.push(Section { key: format!("host:{i}"), host: Some(i), tasks, ended, more });
         }
         // Unreachable machines sink to the bottom; the sort is stable, so order is otherwise kept.
         out.sort_by_key(|s| s.host.is_some_and(|m| matches!(self.hosts[m].link, Link::Down(_))));
         out
     }
 
-    /// The Overview's rows: by state, most recently active first, through the filter and the state tabs.
-    fn ov_tasks(&self) -> Vec<&TaskInfo> {
-        let f = self.filter.to_lowercase();
-        let mut v: Vec<&TaskInfo> = self
-            .all_tasks()
-            .filter(|t| self.ov_group.is_none_or(|g| group(&t.state) == g) && self.ov_host.is_none_or(|m| t.machine == m))
-            .filter(|t| f.is_empty() || format!("{} {} {} {}", title(t), t.agent, t.branch, self.hosts[t.machine].name()).to_lowercase().contains(&f))
+    /// More than `DENSE_AT` agents are running or queued: the sidebar packs its rows.
+    fn dense(&self) -> bool {
+        self.all_tasks().filter(|t| matches!(group(&t.state), 1 | 2)).count() > DENSE_AT
+    }
+
+    /// The machine popup's rows: by state, most recently active first, through its filter and state tabs.
+    fn mt_tasks(&self) -> Vec<&TaskInfo> {
+        let Some(h) = self.machine_tasks.and_then(|m| self.hosts.get(m)) else { return Vec::new() };
+        let f = self.mt_filter.to_lowercase();
+        let mut v: Vec<&TaskInfo> = h
+            .tasks
+            .iter()
+            .filter(|t| self.mt_group.is_none_or(|g| group(&t.state) == g))
+            .filter(|t| f.is_empty() || format!("{} {} {}", title(t), t.agent, t.branch).to_lowercase().contains(&f))
             .collect();
-        v.sort_by_key(|t| (group(&t.state), std::cmp::Reverse(last_event(t)), t.machine, std::cmp::Reverse(t.id)));
+        v.sort_by_key(|t| (group(&t.state), std::cmp::Reverse(last_event(t)), std::cmp::Reverse(t.id)));
         v
     }
 
-    /// Sidebar order (or the Overview's), for keyboard switching: rows of folded sections are skipped.
+    /// Sidebar order (or the machine popup's loaded rows), for keyboard switching: rows of folded
+    /// sections are skipped.
     fn order(&self) -> Vec<TaskKey> {
-        if self.overview {
-            return self.ov_tasks().iter().map(|t| (t.machine, t.id)).collect();
+        if self.machine_tasks.is_some() {
+            return self.mt_tasks().iter().take(self.mt_shown).map(|t| (t.machine, t.id)).collect();
         }
         let sections = self.sections();
         let open = sections.iter().filter(|s| !self.collapsed.contains(&s.key));
@@ -1212,7 +1256,7 @@ impl App {
                 self.focus = Focus::Term;
             }
         }
-        let on_screen = !self.overview && self.review.is_none() && self.dialog.is_none() && self.add_host.is_none();
+        let on_screen = self.machine_tasks.is_none() && self.review.is_none() && self.dialog.is_none() && self.add_host.is_none();
         let attached = self.session.as_ref().map(|s| s.task) == ask.map(|a| a.0);
         if self.vim && ask.is_some() && ask != self.answered && on_screen && attached && matches!(self.focus, Focus::Term | Focus::Normal) {
             (self.answering, self.answered) = (ask, ask);
@@ -1294,25 +1338,19 @@ impl App {
         }
     }
 
-    /// Opens the selected task's terminal from the Overview, typing into it (insert mode).
-    fn open_from_overview(&mut self) {
-        self.actions.push(Action::Overview(false));
+    /// Closes the machine popup onto the selected task's terminal, typing into it (insert mode).
+    fn open_from_popup(&mut self) {
+        self.actions.push(Action::MachineTasks(None));
         self.actions.push(Action::Focus(Focus::Term));
     }
 
-    /// Steps Workspace → Overview → Review → Workspace (or back). Review needs a selected task,
-    /// so without one it's passed over.
-    fn cycle_view(&mut self, forward: bool) {
-        let cur = if self.review.is_some() { 2 } else if self.overview { 1 } else { 0 };
-        let mut next = if forward { (cur + 1) % 3 } else { (cur + 2) % 3 };
-        if next == 2 && !self.reviewable() {
-            next = if forward { 0 } else { 1 };
+    /// Switches between Workspace and Review; Review needs something to review.
+    fn cycle_view(&mut self) {
+        if self.review.is_some() {
+            self.actions.push(Action::Review(ReviewAction::Close));
+        } else if self.reviewable() {
+            self.actions.push(Action::OpenReview);
         }
-        self.actions.push(match next {
-            0 => Action::Overview(false),
-            1 => Action::Overview(true),
-            _ => Action::OpenReview,
-        });
     }
 
     /// Vim's normal mode: one key, one command (`gg` takes two).
@@ -1328,7 +1366,7 @@ impl App {
         let g = std::mem::take(&mut self.pending_g);
         // The agent's menu is up: j/k move through it and ↵ picks, back in its terminal; Esc or i
         // leave it be.
-        if self.answering.is_some() && !self.overview && self.review.is_none() {
+        if self.answering.is_some() && self.machine_tasks.is_none() && self.review.is_none() {
             let app_cursor = self.session.as_ref().is_some_and(|s| s.screen.mode().contains(TermMode::APP_CURSOR));
             let arrow = |c: char| if app_cursor { format!("\x1bO{c}") } else { format!("\x1b[{c}") }.into_bytes();
             match key.as_str() {
@@ -1365,35 +1403,31 @@ impl App {
             "/" => self.actions.push(Action::Focus(Focus::Filter)),
             // Insert: the selected agent's terminal, from whichever view.
             "i" if self.current().is_some() => {
-                self.overview = false;
+                self.machine_tasks = None;
                 self.review = None;
                 self.actions.push(Action::Focus(Focus::Term));
             }
-            "h" | "l" => self.cycle_view(key == "l"),
-            "o" if self.overview => self.open_from_overview(),
-            "o" if self.review.is_none() && self.current().is_some() => {
-                self.overview = false;
-                self.actions.push(Action::Focus(Focus::Term));
-            }
-            "d" if self.review.is_none() && !self.overview => self.confirm_delete = self.current().map(|t| (t.machine, t.id)),
+            "h" | "l" if self.machine_tasks.is_none() => self.cycle_view(),
+            "o" if self.machine_tasks.is_some() => self.open_from_popup(),
+            "o" if self.review.is_none() && self.current().is_some() => self.actions.push(Action::Focus(Focus::Term)),
+            "d" if self.review.is_none() && self.machine_tasks.is_none() => self.confirm_delete = self.current().map(|t| (t.machine, t.id)),
             "r" => self.actions.push(Action::OpenReview),
             "n" => self.actions.push(Action::NewTask),
-            "m" if self.review.is_none() && !self.overview => self.actions.push(Action::OpenAddHost),
+            "m" if self.review.is_none() && self.machine_tasks.is_none() => self.actions.push(Action::OpenAddHost),
             "?" => self.help = !self.help,
             "esc" if self.help => self.help = false,
+            "esc" if self.machine_tasks.is_some() => self.actions.push(Action::MachineTasks(None)),
             "esc" if self.review.is_some() => self.actions.push(Action::Review(ReviewAction::Close)),
-            "esc" if self.overview => self.actions.push(Action::Overview(false)),
             _ => {}
         }
     }
 
     /// The sidebar's or review rail's divider under `p`, which a press starts dragging.
     fn divider_at(&self, p: (f32, f32)) -> Option<Divider> {
-        if self.dialog.is_some() || self.add_host.is_some() || p.1 < TITLE_H {
+        if self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || p.1 < TITLE_H {
             return None;
         }
         match &self.review {
-            None if self.overview => None,
             None => ((p.0 - self.sidebar_w).abs() <= 4.0).then_some(Divider::Sidebar),
             Some(_) => ((p.0 - self.rail_w).abs() <= 4.0 && p.1 > TITLE_H + review::STRIP_H).then_some(Divider::Rail),
         }
@@ -1401,11 +1435,11 @@ impl App {
 
     /// Scrolls whatever is under the mouse by `dy` pixels (positive = towards the top).
     fn scroll_by(&mut self, dy: f32) {
-        if let Some(rv) = self.review.as_mut().filter(|_| self.mouse.1 > TITLE_H + review::STRIP_H) {
+        if self.machine_tasks.is_some() {
+            self.mt_scroll = (self.mt_scroll - dy).max(0.0);
+        } else if let Some(rv) = self.review.as_mut().filter(|_| self.mouse.1 > TITLE_H + review::STRIP_H) {
             let s = if self.mouse.0 < self.rail_w { &mut rv.rail_scroll } else { &mut rv.scroll };
             *s = (*s - dy).max(0.0);
-        } else if self.overview {
-            self.ov_scroll = (self.ov_scroll - dy).max(0.0);
         } else if self.mouse.0 < self.sidebar_w {
             self.scroll = (self.scroll - dy).max(0.0);
         } else if self.review.is_none() && !self.welcome {
@@ -1744,7 +1778,7 @@ impl App {
         if self.vim && ev.logical_key == Key::Named(NamedKey::Escape) && !ev.repeat {
             let double = self.last_esc.is_some_and(|at| at.elapsed() < Duration::from_millis(400));
             self.last_esc = (!double).then(Instant::now);
-            if double && self.review.is_none() && !self.overview && self.dialog.is_none() && self.add_host.is_none() && self.session.is_some() {
+            if double && self.review.is_none() && self.machine_tasks.is_none() && self.dialog.is_none() && self.add_host.is_none() && self.session.is_some() {
                 self.send_input(b"\x1b\x1b".to_vec());
                 self.focus = Focus::Normal;
                 return;
@@ -1766,16 +1800,17 @@ impl App {
             self.normal_key(ev);
             return;
         }
-        if self.focus == Focus::Term && self.overview && self.dialog.is_none() {
-            // The table has no terminal: arrows move, ↵ opens the task, Esc goes back.
+        if matches!(self.focus, Focus::Term | Focus::TasksFilter) && self.machine_tasks.is_some() && self.dialog.is_none() {
+            // The popup has no terminal: arrows move, ↵ opens the task, Esc closes it; anything
+            // else types into its filter.
             match &ev.logical_key {
-                Key::Named(NamedKey::ArrowDown) => self.move_selection(1),
-                Key::Named(NamedKey::ArrowUp) => self.move_selection(-1),
-                Key::Named(NamedKey::Enter) => self.open_from_overview(),
-                Key::Named(NamedKey::Escape) => self.actions.push(Action::Overview(false)),
+                Key::Named(NamedKey::ArrowDown) => return self.move_selection(1),
+                Key::Named(NamedKey::ArrowUp) => return self.move_selection(-1),
+                Key::Named(NamedKey::Enter) => return self.open_from_popup(),
+                Key::Named(NamedKey::Escape) => return self.actions.push(Action::MachineTasks(None)),
+                _ if self.focus == Focus::Term => return,
                 _ => {}
             }
-            return;
         }
         if self.focus == Focus::Term && self.review.is_some() && self.dialog.is_none() {
             if ev.logical_key == Key::Named(NamedKey::Escape) {
@@ -1898,6 +1933,7 @@ impl App {
             (Focus::Base, Some(d)) => &mut d.base,
             (Focus::Repo, Some(d)) => &mut d.repo,
             (Focus::Filter, _) => &mut self.filter,
+            (Focus::TasksFilter, _) => &mut self.mt_filter,
             _ => &mut self.spare,
         }
     }
@@ -1995,22 +2031,24 @@ impl App {
                     }
                     self.save_settings();
                 }
-                Action::Overview(on) => {
-                    self.overview = on;
-                    self.review = None;
-                    if !on {
-                        self.ov_host = None;
-                        self.focus = self.rest();
-                    }
+                Action::MachineTasks(m) => {
+                    self.machine_tasks = m;
+                    (self.mt_group, self.mt_scroll, self.mt_shown) = (None, 0.0, overlays::MT_PAGE);
+                    self.mt_filter.clear();
+                    // Typing goes to its filter at once; vim keeps normal mode, for j/k.
+                    self.focus = if m.is_some() && !self.vim { Focus::TasksFilter } else { self.rest() };
                 }
-                Action::OvGroup(g) => {
-                    self.ov_group = g;
-                    self.ov_scroll = 0.0;
+                Action::MtGroup(g) => {
+                    (self.mt_group, self.mt_scroll, self.mt_shown) = (g, 0.0, overlays::MT_PAGE);
+                }
+                Action::MtMore => {
+                    self.mt_shown += overlays::MT_PAGE;
+                    self.redraw();
                 }
                 Action::OpenProject(path) => self.open_project(path, false),
                 Action::NewProject => self.open_project(None, true),
                 Action::Welcome => {
-                    (self.welcome, self.review, self.overview) = (true, None, false);
+                    (self.welcome, self.review, self.machine_tasks) = (true, None, None);
                     self.welcome_error.clear();
                 }
                 Action::Revive(key @ (m, id), prompt) => {
@@ -2019,7 +2057,7 @@ impl App {
                         Ok(Reply::Ok) => {
                             // Its chat attaches by itself once the task shows as running.
                             self.revive_error = None;
-                            (self.review, self.overview, self.selected) = (None, false, Some(key));
+                            (self.review, self.machine_tasks, self.selected) = (None, None, Some(key));
                             self.focus = self.rest();
                         }
                         Ok(r) => self.revive_error = Some((key, format!("unexpected reply: {r:?}"))),
@@ -2031,15 +2069,11 @@ impl App {
                     self.stats.remove(&key);
                     self.changes.remove(&key);
                 }
-                Action::OvHost(m) => {
-                    self.ov_host = m;
-                    self.ov_scroll = 0.0;
-                }
                 Action::Answer((m, id), allow) => {
                     let _ = request_at(self.sock(m).as_deref(), &Request::Answer { id, allow, message: String::new() });
                 }
                 Action::Answering => {
-                    (self.overview, self.review) = (false, None);
+                    (self.machine_tasks, self.review) = (None, None);
                     self.answering = self.ask().filter(|_| self.vim);
                     self.focus = if self.answering.is_some() { Focus::Normal } else { Focus::Term };
                 }
@@ -2169,27 +2203,25 @@ impl App {
         }
         self.stale.set(false);
         self.icons.borrow_mut().clear();
-        self.layered = !(self.dialog.is_some() || self.add_host.is_some() || (self.help && self.vim) || self.menu);
+        self.layered = !(self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || (self.help && self.vim) || self.menu);
         let dpi = gfx.window.scale_factor() as f32 * self.zoom;
         let (w, h) = (size.width as f32 / dpi, size.height as f32 / dpi);
         let r = &mut gfx.r;
         r.begin(size.width, size.height, dpi, t.bg);
 
         self.probe_changes();
-        // Under an open dialog nothing reacts: the views below draw without the click.
-        let modal_click = (self.dialog.is_some() || self.add_host.is_some()).then(|| self.click.take());
+        // Under an open dialog or popup nothing reacts: the views below draw without the click.
+        let modal_click = (self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some()).then(|| self.click.take());
         self.draw_title(r, t, w);
         if self.welcome {
             self.draw_welcome(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H));
         } else if self.review.is_some() {
             self.draw_review(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H - STATUS_H));
-        } else if self.overview {
-            self.draw_overview(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H - STATUS_H));
         } else {
             self.draw_sidebar(r, t, h);
             self.draw_main(r, t, Rect::new(self.sidebar_w, TITLE_H, w - self.sidebar_w, h - TITLE_H - STATUS_H));
         }
-        if !self.welcome && (self.review.is_some() || !self.overview) {
+        if !self.welcome {
             let (x, top) = if self.review.is_some() { (self.rail_w, TITLE_H + review::STRIP_H) } else { (self.sidebar_w, TITLE_H) };
             r.target(Rect::new(x - 4.0, top, 8.0, h - top - STATUS_H), Cursor::Resize);
         }
@@ -2198,6 +2230,9 @@ impl App {
         }
         if let Some(click) = modal_click {
             self.click = click;
+        }
+        if self.machine_tasks.is_some() {
+            self.draw_machine_tasks(r, t, w, h);
         }
         if self.dialog.is_some() {
             self.draw_dialog(r, t, w, h);
@@ -2255,9 +2290,9 @@ impl App {
 
     fn draw_title(&mut self, r: &mut Renderer, t: &Theme, w: f32) {
         r.rect(Rect::new(0.0, TITLE_H - 1.0, w, 1.0), 0.0, t.border);
-        logo(r, 12.0, 10.0, 16.0, t.text, t.needs);
+        logo(r, 14.0, 11.0, 22.0, t.text, t.needs);
         let bar = Rect::new(0.0, 0.0, w, TITLE_H);
-        let x = 33.0 + r.text(33.0, r.center(bar, UI, 13.0), "arranger", UI, 13.0, 600, t.text, 200.0);
+        let x = 44.0 + r.text(44.0, r.center(bar, UI, 14.0), "arranger", UI, 14.0, 600, t.text, 200.0);
         let home = std::env::var("HOME").unwrap_or_default();
         let repo = self.repo.display().to_string();
         let repo = repo.strip_prefix(&home).map_or(repo.clone(), |rest| format!("~{rest}"));
@@ -2267,36 +2302,31 @@ impl App {
         let x = x + 14.0;
         let rw = if self.welcome { 0.0 } else { r.text(x + 10.0, r.center(bar, MONO, 11.0), &repo, MONO, 11.0, 400, t.text2, 400.0) };
         // The project path: click it to switch projects.
-        if !self.welcome && self.hit(r, Rect::new(x + 4.0, 7.0, rw + 12.0, 22.0)) {
+        if !self.welcome && self.hit(r, Rect::new(x + 4.0, (TITLE_H - 22.0) / 2.0, rw + 12.0, 22.0)) {
             self.actions.push(Action::Welcome);
         }
 
-        // Views: Workspace | Overview | Review.
+        // Views: Workspace | Review.
         let mut nx = x + 26.0 + rw;
-        let (review, overview) = (self.review.is_some(), self.overview && self.review.is_none());
-        let tabs = [("Workspace", !review && !overview), ("Overview", overview), ("Review", review)];
+        let review = self.review.is_some();
+        let tabs = [("Workspace", !review), ("Review", review)];
         for (label, on) in tabs.into_iter().filter(|_| !self.welcome) {
-            let tw = r.measure(UI, 12.0, if on { 500 } else { 400 }, label) + 20.0;
-            let tab = Rect::new(nx, 0.0, tw, TITLE_H);
+            let tw = r.measure(UI, 13.0, 500, label) + 24.0;
+            let tab = Rect::new(nx, (TITLE_H - 30.0) / 2.0, tw, 30.0);
             if on {
-                r.rect(Rect::new(tab.x + 10.0, TITLE_H - 2.0, tw - 20.0, 2.0), 0.0, t.text);
+                r.rect(tab, 0.0, t.raised);
             }
             let off = label == "Review" && !on && !self.reviewable();
-            r.text(tab.x + 10.0, r.center(tab, UI, 12.0), label, UI, 12.0, if on { 500 } else { 400 }, if on { t.text } else if off { alpha(t.text3, 90) } else { t.text2 }, tw);
+            r.text(tab.x + 12.0, r.center(tab, UI, 13.0), label, UI, 13.0, 500, if on { t.text } else if off { alpha(t.text3, 90) } else { t.text3 }, tw);
             if self.hit(r, tab) && !on && !off {
-                self.actions.push(match label {
-                    "Review" => Action::OpenReview,
-                    "Overview" => Action::Overview(true),
-                    _ if review => Action::Review(ReviewAction::Close),
-                    _ => Action::Overview(false),
-                });
+                self.actions.push(if label == "Review" { Action::OpenReview } else { Action::Review(ReviewAction::Close) });
             }
-            nx += tw;
+            nx += tw + 4.0;
         }
 
         // Scheme menu button: [swatch] Graphite ˅
         let label_w = r.measure(UI, 12.0, 400, t.name);
-        let b = Rect::new(w - 10.0 - (label_w + 51.0), 5.0, label_w + 51.0, 26.0);
+        let b = Rect::new(w - 10.0 - (label_w + 51.0), (TITLE_H - 28.0) / 2.0, label_w + 51.0, 28.0);
         self.scheme_btn = b;
         r.frame(b, 3.0, t.bg, t.border);
         r.rect(Rect::new(b.x + 7.0, b.y + 6.0, 14.0, 14.0), 3.0, t.border2);
@@ -2350,6 +2380,7 @@ impl App {
         let clicked = |p: Option<(f32, f32)>| p.is_some_and(|p| list.contains(p));
         let mut y = list.y - self.scroll;
         let mut picks = Vec::new();
+        let dense = self.dense();
         let sections = self.sections();
         for (i, sec) in sections.iter().enumerate() {
             let folded = self.collapsed.contains(&sec.key);
@@ -2361,19 +2392,19 @@ impl App {
             match sec.host {
                 None if sec.tasks.is_empty() => continue,
                 None => {
-                    let head = Rect::new(6.0, y + 4.0, self.sidebar_w - 13.0, GROUP_H - 4.0);
-                    let lw = r.text(14.0, r.center(head, UI, 10.5), "NEEDS YOU", UI, 10.5, 500, t.needs, 150.0);
-                    r.text(20.0 + lw, r.center(head, MONO, 10.5), &sec.tasks.len().to_string(), MONO, 10.5, 400, t.needs, 40.0);
+                    let head = Rect::new(6.0, y + 6.0, self.sidebar_w - 13.0, GROUP_H);
+                    let lw = r.text(16.0, r.center(head, UI, 11.5), "NEEDS YOU", UI, 11.5, 600, t.needs, 150.0);
+                    r.text(24.0 + lw, r.center(head, MONO, 11.5), &sec.tasks.len().to_string(), MONO, 11.5, 600, t.needs, 40.0);
                     if multi {
                         let note = "all machines";
-                        let nw = r.measure(UI, 10.5, 400, note);
-                        r.text(self.sidebar_w - 34.0 - nw, r.center(head, UI, 10.5), note, UI, 10.5, 400, t.text3, nw + 2.0);
+                        let nw = r.measure(UI, 11.5, 400, note);
+                        r.text(self.sidebar_w - 34.0 - nw, r.center(head, UI, 11.5), note, UI, 11.5, 400, t.text3, nw + 2.0);
                     }
                     chevron(r, head.y + head.h / 2.0);
                     if self.hit(r, head) && clicked(self.click) {
                         picks.push(Action::Toggle(sec.key.clone()));
                     }
-                    y += GROUP_H;
+                    y += GROUP_H + 12.0;
                 }
                 Some(m) => {
                     let h = &self.hosts[m];
@@ -2395,37 +2426,30 @@ impl App {
                             (t.del, format!("unreachable · {e}"), t.del)
                         }
                     };
-                    r.rect(Rect::new(head.x + 6.0, head.y + 9.0, 7.0, 7.0), 3.5, dot);
-                    let top = Rect::new(head.x, head.y + 2.0, head.w, 20.0);
-                    let nw = r.text(head.x + 20.0, r.center(top, UI, 12.5), h.name(), UI, 12.5, 600, t.text, 140.0);
-                    let addr = h.cfg.as_ref().map_or("local", |c| c.ssh.as_str());
-                    r.text(head.x + 26.0 + nw, r.center(top, MONO, 10.5), addr, MONO, 10.5, 400, t.text3, head.w - nw - 60.0);
-                    let sub = Rect::new(head.x + 20.0, head.y + 21.0, head.w - 40.0, 15.0);
-                    let sy = r.center(sub, UI, 11.0);
-                    // "N ended" is a link to them in Overview.
-                    let ended = h.tasks.iter().filter(|t| group(&t.state) == 4).count();
-                    let label = format!("{ended} ended");
-                    let mut link = Rect::default();
-                    match status.find(&label).filter(|_| ended > 0 && matches!(h.link, Link::Up(_))) {
-                        Some(at) => {
-                            let x = sub.x + r.text(sub.x, sy, &status[..at], UI, 11.0, 400, sc, sub.w);
-                            let lw = r.text(x, sy, &label, UI, 11.0, 400, t.text2, sub.x + sub.w - x);
-                            r.rect(Rect::new(x, sy + 13.0, lw, 1.0), 0.0, alpha(t.text2, 0x60));
-                            r.text(x + lw, sy, &status[at + label.len()..], UI, 11.0, 400, sc, sub.x + sub.w - x - lw);
-                            link = Rect::new(x - 2.0, sub.y, lw + 4.0, sub.h);
-                            if self.hit(r, link) && clicked(self.click) {
-                                picks.extend([Action::Overview(true), Action::OvGroup(Some(4)), Action::OvHost(Some(m))]);
-                            }
-                        }
-                        None => {
-                            r.text(sub.x, sy, &status, UI, 11.0, 400, sc, sub.w);
+                    r.rect(Rect::new(head.x + 8.0, head.y + 9.0, 8.0, 8.0), 0.0, dot);
+                    let top = Rect::new(head.x, head.y + 2.0, head.w, 22.0);
+                    // "See all N →": every task on the machine, ended ones too, in a popup.
+                    let mut see = Rect::default();
+                    if matches!(h.link, Link::Up(_)) && !h.tasks.is_empty() {
+                        let label = format!("See all {} →", h.tasks.len());
+                        let lw = r.measure(UI, 12.0, 500, &label);
+                        see = Rect::new(self.sidebar_w - 36.0 - lw - 12.0, top.y, lw + 12.0, top.h);
+                        r.text(see.x + 6.0, r.center(see, UI, 12.0), &label, UI, 12.0, 500, t.text2, lw + 2.0);
+                        if self.hit(r, see) && clicked(self.click) {
+                            picks.push(Action::MachineTasks(Some(m)));
                         }
                     }
+                    let room = (if see.w > 0.0 { see.x } else { self.sidebar_w - 36.0 }) - head.x - 30.0;
+                    let nw = r.text(head.x + 24.0, r.center(top, UI, 13.5), h.name(), UI, 13.5, 600, t.text, room.min(160.0));
+                    let addr = h.cfg.as_ref().map_or("local", |c| c.ssh.as_str());
+                    r.text(head.x + 32.0 + nw, r.center(top, MONO, 11.5), addr, MONO, 11.5, 400, t.text3, room - nw - 8.0);
+                    let sub = Rect::new(head.x + 24.0, head.y + 24.0, head.w - 44.0, 16.0);
+                    r.text(sub.x, r.center(sub, UI, 12.0), &status, UI, 12.0, 400, sc, sub.w);
                     chevron(r, top.y + top.h / 2.0);
-                    if self.hit(r, head) && clicked(self.click) && !self.click.is_some_and(|p| link.contains(p)) {
+                    if self.hit(r, head) && clicked(self.click) && !self.click.is_some_and(|p| see.contains(p)) {
                         picks.push(Action::Toggle(sec.key.clone()));
                     }
-                    y += 50.0;
+                    y += 54.0;
                 }
             }
             if let Some(m) = host_down {
@@ -2453,14 +2477,28 @@ impl App {
                 r.text(26.0, y + 2.0, &note, UI, 11.5, 400, t.text3, self.sidebar_w - 40.0);
                 y += 24.0;
             }
-            for k in 0..=sec.tasks.len() {
-                let Some(task) = sec.tasks.get(k) else { break };
-                let row = Rect::new(6.0, y, self.sidebar_w - 13.0, ROW2_H);
-                let chip = (sec.host.is_none() && multi).then(|| self.hosts[task.machine].name());
-                if self.draw_row(r, t, task, row, chip) && clicked(self.click) {
+            for task in &sec.tasks {
+                if sec.host.is_none() {
+                    let card = Rect::new(10.0, y + 2.0, self.sidebar_w - 21.0, NEEDS_CARD_H);
+                    let chip = multi.then(|| self.hosts[task.machine].name());
+                    picks.extend(self.draw_needs_card(r, t, task, card, chip, clicked(self.click)));
+                    y += NEEDS_CARD_H + 10.0;
+                    continue;
+                }
+                let row_h = if dense { DENSE_ROW_H } else { ROW2_H };
+                let row = Rect::new(6.0, y, self.sidebar_w - 13.0, row_h);
+                if self.draw_row(r, t, task, row, dense) && clicked(self.click) {
                     picks.push(Action::Select((task.machine, task.id)));
                 }
-                y += ROW2_H;
+                y += row_h;
+            }
+            if let (Some(m), true) = (sec.host, sec.more > 0) {
+                let row = Rect::new(6.0, y, self.sidebar_w - 13.0, DENSE_ROW_H);
+                r.text(row.x + 30.0, r.center(row, UI, 12.5), &format!("+{} more", sec.more), UI, 12.5, 400, t.text3, row.w - 40.0);
+                if self.hit(r, row) && clicked(self.click) {
+                    picks.push(Action::MachineTasks(Some(m)));
+                }
+                y += DENSE_ROW_H;
             }
         }
         drop(sections);
@@ -2478,45 +2516,81 @@ impl App {
         self.actions.extend(picks);
     }
 
-    /// One task row: state icon, title, agent and age (or the machine, in Needs you), and what
-    /// it's doing. Returns whether it was clicked.
-    fn draw_row(&self, r: &mut Renderer, t: &Theme, task: &TaskInfo, row: Rect, machine: Option<&str>) -> bool {
+    /// One task row: state icon, title and agent, and under them what it's doing. Dense, it's one
+    /// line, with what it's doing on the right in place of the agent. Returns whether it was clicked.
+    fn draw_row(&self, r: &mut Renderer, t: &Theme, task: &TaskInfo, row: Rect, dense: bool) -> bool {
         let g = group(&task.state);
         let queue_pos = self.hosts[task.machine].tasks.iter().filter(|x| x.state == "queued" && x.id <= task.id).count();
-        let line = status_line(task, queue_pos);
-        let top = Rect::new(row.x, row.y + 2.0, row.w, 22.0);
+        let line = status_line(task, queue_pos).replace('\n', " ");
+        let top = if dense { row } else { Rect::new(row.x, row.y + 4.0, row.w, 22.0) };
         let on = self.selected == Some((task.machine, task.id));
-        let bg = if on { t.sel } else { t.panel };
         if on {
-            r.frame(row, 3.0, bg, t.sel_ring);
+            r.rect(row, 0.0, t.sel);
         }
         self.icon(r, t, task, row.x + 8.0, top.y + top.h / 2.0);
-        let text_x = row.x + 28.0;
-        let right_w = if let Some(name) = machine {
-            let cw = r.measure(MONO, 10.0, 400, name) + 10.0;
-            let chip = Rect::new(row.x + row.w - 8.0 - cw, top.y + 4.0, cw, 15.0);
-            r.frame(chip, 3.0, bg, t.border2);
-            r.text(chip.x + 5.0, r.center(chip, MONO, 10.0), name, MONO, 10.0, 400, t.text2, cw);
-            cw
-        } else {
-            let kind = adapter::kind(&task.agent);
-            let kw = r.measure(MONO, 10.5, 400, kind);
-            r.text(row.x + row.w - 8.0 - kw, r.center(top, MONO, 10.5), kind, MONO, 10.5, 400, t.text3, kw + 2.0);
-            kw
-        };
-        let tc = if g == 4 { t.text3 } else if on { t.tc_on } else { t.tc };
-        let room = row.w - 28.0 - right_w - 14.0;
-        let bw = if task.shipped.is_empty() { 0.0 } else { r.measure(UI, 10.5, 500, &format!("✓ {}", task.shipped)) + 16.0 };
-        let tw = r.text(text_x, r.center(top, UI, 12.5), &title(task), UI, 12.5, 400, tc, room - bw);
-        ship_badge(r, t, &task.shipped, text_x + tw + 6.0, top.y + top.h / 2.0);
-        let sub = Rect::new(text_x, top.y + top.h - 3.0, row.w - 36.0, 16.0);
+        let text_x = row.x + 30.0;
         let sc = match g {
             0 => t.needs,
             4 => t.faint,
             _ => t.text3,
         };
-        r.text(sub.x, r.center(sub, UI, 11.5), &line.replace('\n', " "), UI, 11.5, 400, sc, sub.w);
+        let (right, rc, most) = if dense { (line.clone(), sc, row.w * 0.34) } else { (adapter::kind(&task.agent).to_string(), t.text3, 90.0) };
+        let rw = r.measure(MONO, 12.0, 400, &right).min(most);
+        r.text(row.x + row.w - 8.0 - rw, r.center(top, MONO, 12.0), &right, MONO, 12.0, 400, rc, rw);
+        let tc = if g == 4 { t.text3 } else if on { t.tc_on } else { t.tc };
+        let room = row.w - 30.0 - rw - 18.0;
+        let bw = if task.shipped.is_empty() { 0.0 } else { r.measure(UI, 10.5, 500, &format!("✓ {}", task.shipped)) + 16.0 };
+        let tw = r.text(text_x, r.center(top, UI, 13.0), &title(task), UI, 13.0, 500, tc, room - bw);
+        ship_badge(r, t, &task.shipped, text_x + tw + 6.0, top.y + top.h / 2.0);
+        if !dense {
+            let sub = Rect::new(text_x, top.y + top.h, row.w - 38.0, 18.0);
+            r.text(sub.x, r.center(sub, UI, 12.0), &line, UI, 12.0, 400, sc, sub.w);
+        }
         self.hit(r, row)
+    }
+
+    /// A needs-you card: what the agent is waiting on, with the answer right there. A permission
+    /// ask the daemon is holding (`asking`) gets Allow once and Deny; anything else (a question, or
+    /// an ask showing in the agent's own terminal) gets Answer, which opens that terminal on its menu.
+    fn draw_needs_card(&self, r: &mut Renderer, t: &Theme, task: &TaskInfo, card: Rect, machine: Option<&str>, live: bool) -> Vec<Action> {
+        let key = (task.machine, task.id);
+        let mut acts = Vec::new();
+        r.frame(card, 0.0, t.needs_bg, if self.selected == Some(key) { t.needs } else { t.needs_line });
+        if self.hit(r, card) && live {
+            acts.push(Action::Select(key));
+        }
+        let top = Rect::new(card.x, card.y + 10.0, card.w, 22.0);
+        self.icon(r, t, task, card.x + 12.0, top.y + top.h / 2.0);
+        let text_x = card.x + 36.0;
+        let right = machine.map_or_else(|| adapter::kind(&task.agent).to_string(), str::to_string);
+        let rw = r.measure(MONO, 12.0, 400, &right).min(110.0);
+        r.text(card.x + card.w - 12.0 - rw, r.center(top, MONO, 12.0), &right, MONO, 12.0, 400, t.text3, rw);
+        r.text(text_x, r.center(top, UI, 13.0), &title(task), UI, 13.0, 500, t.text, card.w - 36.0 - rw - 24.0);
+        let ask = Rect::new(text_x, top.y + top.h, card.w - 48.0, 20.0);
+        r.text(ask.x, r.center(ask, UI, 12.5), &status_line(task, 0).replace('\n', " "), UI, 12.5, 400, t.needs, ask.w);
+
+        let buttons: Vec<(&str, bool, Vec<Action>)> = if task.asking {
+            vec![("Allow once", true, vec![Action::Answer(key, true)]), ("Deny", false, vec![Action::Answer(key, false)])]
+        } else {
+            vec![("Answer", true, vec![Action::Select(key), Action::Answering])]
+        };
+        let mut bx = text_x;
+        for (label, filled, then) in buttons {
+            let bw = r.measure(UI, 12.5, 500, label) + 24.0;
+            let b = Rect::new(bx, card.y + card.h - 12.0 - 30.0, bw, 30.0);
+            if filled {
+                r.rect(b, 0.0, t.needs);
+            } else {
+                r.frame(b, 0.0, t.needs_bg, t.needs_line);
+            }
+            r.text(b.x + 12.0, r.center(b, UI, 12.5), label, UI, 12.5, 500, if filled { t.on_accent } else { t.text }, bw);
+            if self.hit(r, b) && live {
+                acts.retain(|a| !matches!(a, Action::Select(_)));
+                acts.extend(then);
+            }
+            bx += bw + 8.0;
+        }
+        acts
     }
 
     fn draw_main(&mut self, r: &mut Renderer, t: &Theme, area: Rect) {
@@ -2846,6 +2920,8 @@ impl App {
         self.actions.extend(acts);
     }
 
+    /// The new-task box: the prompt first, then what runs it (agent, model, machine, base branch)
+    /// as buttons that cycle or open a list, recent prompts to reuse, and Start.
     fn draw_dialog(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
         let Some(d) = &self.dialog else { return };
         let (prompt, agent_i, model_i, base, error) = (d.prompt.clone(), d.agent, d.model, d.base.clone(), d.error.clone());
@@ -2856,99 +2932,88 @@ impl App {
             self.click = None;
         }
         let (host_i, repo_path) = (d.host, d.repo.clone());
-        // Machine | Repo row, once there is more than one machine to choose.
         let hosts: Vec<(usize, String, bool)> =
             self.hosts.iter().enumerate().filter(|(_, h)| !h.removed).map(|(i, h)| (i, h.name().to_string(), matches!(h.link, Link::Up(_)))).collect();
-        let host_row = if hosts.len() > 1 { 78.0 } else { 0.0 };
+        // Another machine has no local branches to list; its repo path is typed.
+        let remote = self.hosts[host_i].cfg.is_some();
         let agent = AGENTS[agent_i];
-        let a = accent(agent);
+        let recent: Vec<String> = self.prompts.iter().rev().filter(|p| **p != prompt).take(3).cloned().collect();
         r.rect(Rect::new(0.0, 0.0, w, h), 0.0, t.scrim);
         r.target(Rect::new(0.0, 0.0, w, h), Cursor::Arrow); // nothing under the scrim reacts
         let dw = (w - 32.0).min(680.0);
-        let dx = (w - dw) / 2.0;
-        let prompt_lines = wrap(r, &prompt, UI, 18.0, dw - 36.0);
-        let text_h = (prompt_lines.len().max(3) as f32) * 27.0;
-        let dh = 2.0 + 34.0 + 12.0 + text_h + 16.0 + 78.0 + host_row + 58.0;
-        let dlg = Rect::new(dx, 88.0, dw, dh);
-        r.rect(Rect::new(dlg.x - 1.0, dlg.y - 1.0, dlg.w + 2.0, dlg.h + 2.0), 9.0, alpha(a, 0x33));
-        r.frame(dlg, 8.0, t.dialog, t.border2);
-        r.rect(Rect::new(dlg.x + 1.0, dlg.y + 1.0, dlg.w - 2.0, 2.0), 1.0, a);
-
-        // Header: NEW TASK  ~/repo        [agent]  Esc
-        let hy = dlg.y + 12.0;
-        let head = Rect::new(dlg.x + 18.0, hy, dlg.w - 36.0, 20.0);
-        let lw = r.text(head.x, r.center(head, UI, 11.0), "NEW TASK", UI, 11.0, 500, t.text3, 100.0);
-        let repo_name = std::path::Path::new(repo_path.trim()).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let repo = if hosts.len() > 1 { format!("{} · {repo_name}", self.hosts[host_i].name()) } else { repo_name };
-        r.text(head.x + lw + 10.0, r.center(head, MONO, 11.0), &repo, MONO, 11.0, 400, t.faint, 200.0);
-        let esc = Rect::new(head.x + head.w - 30.0, head.y + 2.0, 30.0, 16.0);
-        r.frame(esc, 3.0, t.dialog, t.border2);
-        r.text(esc.x + 6.0, r.center(esc, MONO, 10.0), "Esc", MONO, 10.0, 400, t.text3, 30.0);
-        if self.hit(r, esc) {
-            self.actions.push(Action::CloseDialog);
-        }
-        let pw = r.measure(MONO, 11.0, 400, agent) + 21.0;
-        let pill = Rect::new(esc.x - 8.0 - pw, head.y, pw, 20.0);
-        r.rect(pill, 3.0, alpha(a, 0x1A));
-        r.rect(Rect::new(pill.x + 7.0, pill.y + 7.0, 6.0, 6.0), 1.0, a);
-        r.text(pill.x + 17.0, r.center(pill, MONO, 11.0), agent, MONO, 11.0, 400, a, pw);
+        let pad = 22.0;
+        let prompt_lines = wrap(r, &prompt, UI, 16.0, dw - 2.0 * pad);
+        let text_h = (prompt_lines.len().max(3) as f32) * 26.0;
+        let repo_h = if remote { 44.0 } else { 0.0 };
+        let recent_h = if recent.is_empty() { 0.0 } else { 36.0 + recent.len() as f32 * 36.0 };
+        let dh = 20.0 + text_h + 16.0 + 32.0 + 18.0 + repo_h + recent_h + 58.0;
+        let dlg = Rect::new((w - dw) / 2.0, 104.0, dw, dh);
+        r.rect(Rect::new(dlg.x - 1.0, dlg.y + 6.0, dlg.w + 2.0, dlg.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x1C }));
+        r.frame(dlg, 0.0, t.dialog, t.border2);
 
         // Prompt.
-        let ty = hy + 20.0 + 14.0;
+        let ty = dlg.y + 20.0;
         let prompt_focus = self.focus == Focus::Prompt;
         if prompt.is_empty() {
-            r.text(dlg.x + 18.0, ty + 4.0, "Describe the task", UI, 18.0, 400, t.faint, dlg.w - 36.0);
+            r.text(dlg.x + pad, ty, "What should the agent do?", UI, 16.0, 400, t.faint, dlg.w - 2.0 * pad);
         }
         let caret = self.caret_for(Focus::Prompt, &prompt).map(|at| caret_line(&prompt, &prompt_lines, at));
         for (i, (line, start)) in prompt_lines.iter().zip(line_starts(&prompt, &prompt_lines)).enumerate() {
-            let y = ty + 4.0 + i as f32 * 27.0;
             let at = caret.filter(|c| c.0 == i).map(|c| c.1);
-            self.field_text(r, t, dlg.x + 18.0, y, line, UI, 18.0, dlg.w - 36.0, (Focus::Prompt, start), prompt_focus, at, a);
+            self.field_text(r, t, dlg.x + pad, ty + i as f32 * 26.0, line, UI, 16.0, dlg.w - 2.0 * pad, (Focus::Prompt, start), prompt_focus, at, t.work);
         }
-        let prompt_area = Rect::new(dlg.x, ty, dlg.w, text_h + 16.0);
-        if self.hit_as(r, prompt_area, Cursor::Text) {
+        if self.hit_as(r, Rect::new(dlg.x, dlg.y, dlg.w, text_h + 32.0), Cursor::Text) {
             self.actions.push(Action::Focus(Focus::Prompt));
         }
 
-        // Agent | Branch.
-        let gy = ty + text_h + 16.0;
-        r.rect(Rect::new(dlg.x + 1.0, gy, dlg.w - 2.0, 1.0), 0.0, t.border);
-        r.rect(Rect::new(dlg.x + dlg.w / 2.0, gy, 1.0, 78.0), 0.0, t.border);
-        r.text(dlg.x + 18.0, gy + 14.0, "Agent", UI, 11.0, 400, t.text3, 100.0);
-        let mut ax = dlg.x + 18.0;
-        for (i, name) in AGENTS.iter().enumerate() {
-            let c = accent(name);
-            let on = i == agent_i;
-            let bw = r.measure(MONO, 12.0, 400, name) + 33.0;
-            let b = Rect::new(ax, gy + 36.0, bw, 28.0);
-            r.frame(b, 4.0, t.dialog, if on { c } else { t.border2 });
-            if on {
-                r.rect(b.inset(1.0), 3.0, alpha(c, 0x1F));
+        // What runs it: [● agent claude] [model opus] [on This Mac] [from main ⌄]
+        let cy = ty + text_h + 16.0;
+        let mut cx = dlg.x + pad - 4.0;
+        let mut chip = |r: &mut Renderer, key: &str, value: &str, dot: Option<Rgba>, wide: f32| {
+            let kw = r.measure(UI, 13.0, 400, key) + 8.0;
+            let lead = if dot.is_some() { 16.0 } else { 0.0 };
+            let vw = r.measure(MONO, 13.0, 500, value);
+            let b = Rect::new(cx, cy, 24.0 + lead + kw + vw + wide, 32.0);
+            r.frame(b, 0.0, t.dialog, t.border2);
+            if let Some(c) = dot {
+                r.rect(Rect::new(b.x + 12.0, b.y + 13.0, 6.0, 6.0), 0.0, c);
             }
-            r.rect(Rect::new(b.x + 10.0, b.y + 11.0, 6.0, 6.0), 1.0, if on { c } else { alpha(c, 140) });
-            r.text(b.x + 23.0, r.center(b, MONO, 12.0), name, MONO, 12.0, 400, if on { c } else { t.tc }, bw);
-            if self.hit(r, b) {
-                self.actions.push(Action::PickAgent(i));
-            }
-            ax += bw + 4.0;
+            r.text(b.x + 12.0 + lead, r.center(b, UI, 13.0), key, UI, 13.0, 400, t.text3, kw);
+            r.text(b.x + 12.0 + lead + kw, r.center(b, MONO, 13.0), value, MONO, 13.0, 500, t.text, vw + 2.0);
+            cx += b.w + 8.0;
+            b
+        };
+        let b = chip(r, "agent", agent, Some(accent(agent)), 0.0);
+        if self.hit(r, b) {
+            self.actions.push(Action::PickAgent(usize::MAX));
         }
-        let bx = dlg.x + dlg.w / 2.0 + 18.0;
-        r.text(bx, gy + 14.0, "Base branch", UI, 11.0, 400, t.text3, 100.0);
-        let row = Rect::new(bx, gy + 36.0, dlg.w / 2.0 - 36.0, 28.0);
+        let b = chip(r, "model", models(agent)[model_i].0, None, 0.0);
+        if self.hit(r, b) {
+            self.actions.push(Action::PickModel(usize::MAX));
+        }
+        if hosts.len() > 1 {
+            let b = chip(r, "on", self.hosts[host_i].name(), None, 0.0);
+            if self.hit(r, b) {
+                let at = hosts.iter().position(|h| h.0 == host_i).unwrap_or(0);
+                // The next machine that's up, after this one.
+                if let Some(next) = (1..hosts.len()).map(|k| &hosts[(at + k) % hosts.len()]).find(|h| h.2) {
+                    self.actions.push(Action::PickHost(next.0));
+                }
+            }
+        }
+        // The base branch: a list of local branches, or typed in on another machine.
         let base_focus = self.focus == Focus::Base;
-        let shown = if base.is_empty() && !base_focus { "current branch" } else { &base };
         let pick = !branches.is_empty();
-        let bfw = (r.measure(MONO, 12.0, 400, shown) + if pick { 38.0 } else { 20.0 }).clamp(90.0, 160.0);
-        let bfield = Rect::new(bx - 8.0, row.y, bfw, row.h);
-        r.frame(bfield, 4.0, t.dialog, if base_focus || list.is_some() { a } else { t.border2 });
-        let fy = r.center(bfield, MONO, 12.0);
+        let shown = if base.is_empty() && !base_focus { "current branch".to_string() } else { base.clone() };
+        let bfield = chip(r, "from", &shown, None, if pick { 22.0 } else { 10.0 });
         if base_focus {
-            self.field_text(r, t, bfield.x + 10.0, fy, &base, MONO, 12.0, bfw - 20.0, (Focus::Base, 0), true, self.caret_for(Focus::Base, &base), a);
-        } else {
-            r.text(bfield.x + 10.0, fy, shown, MONO, 12.0, 400, t.text, bfw - if pick { 38.0 } else { 20.0 });
+            // Typed over the chip's value while it has focus.
+            let vx = bfield.x + 12.0 + r.measure(UI, 13.0, 400, "from") + 8.0;
+            r.rect(Rect::new(vx - 2.0, bfield.y + 1.0, bfield.x + bfield.w - vx + 1.0, bfield.h - 2.0), 0.0, t.dialog);
+            self.field_text(r, t, vx, r.center(bfield, MONO, 13.0), &base, MONO, 13.0, 160.0, (Focus::Base, 0), true, self.caret_for(Focus::Base, &base), t.work);
         }
         if pick {
-            r.path(9, "M18 26L32 40L46 26", Some(6.0), bfield.x + bfw - 22.0, bfield.y + 8.0, 12.0, t.text3);
+            r.path(9, "M18 26L32 40L46 26", Some(6.0), bfield.x + bfield.w - 22.0, bfield.y + 10.0, 12.0, t.text3);
             if self.hit(r, bfield) {
                 let d = self.dialog.as_mut().unwrap();
                 d.list = if list.is_some() { None } else { Some(Rect::default()) };
@@ -2956,88 +3021,81 @@ impl App {
         } else if self.hit_as(r, bfield, Cursor::Text) {
             self.actions.push(Action::Focus(Focus::Base));
         }
-        let bw = bfield.x + bfw - row.x;
-        let arrow_x = row.x + bw + 8.0;
-        r.text(arrow_x, r.center(row, MONO, 12.0), "→", MONO, 12.0, 400, t.faint, 20.0);
-        // ponytail: a guess; the daemon picks the id, so a skipped id or a racing `arranger new` makes it one higher
-        let next = self.hosts[host_i].tasks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
-        let nw = r.text(arrow_x + 18.0, r.center(row, MONO, 12.0), &format!("arranger/{next}"), MONO, 12.0, 400, t.text3, 140.0);
-        let chip = Rect::new(arrow_x + 26.0 + nw, row.y + 6.0, 32.0, 16.0);
-        r.frame(chip, 3.0, t.dialog, t.border2);
-        r.text(chip.x + 5.0, r.center(chip, UI, 10.0), "auto", UI, 10.0, 400, t.text3, 30.0);
 
-        // Machine | Repo.
-        if host_row > 0.0 {
-            let my = gy + 78.0;
-            r.rect(Rect::new(dlg.x + 1.0, my, dlg.w - 2.0, 1.0), 0.0, t.border);
-            r.rect(Rect::new(dlg.x + dlg.w / 2.0, my, 1.0, 78.0), 0.0, t.border);
-            r.text(dlg.x + 18.0, my + 14.0, "Machine", UI, 11.0, 400, t.text3, 100.0);
-            let mut mx = dlg.x + 18.0;
-            for (i, name, up) in &hosts {
-                let on = *i == host_i;
-                let bw = r.measure(UI, 12.0, 400, name) + 30.0;
-                if mx + bw > dlg.x + dlg.w / 2.0 - 10.0 {
-                    break; // ponytail: chips that don't fit are hidden; a dropdown if people add many machines
-                }
-                let b = Rect::new(mx, my + 36.0, bw, 28.0);
-                r.frame(b, 4.0, t.dialog, if on { a } else { t.border2 });
-                if on {
-                    r.rect(b.inset(1.0), 3.0, alpha(a, 0x1F));
-                }
-                r.rect(Rect::new(b.x + 10.0, b.y + 11.0, 6.0, 6.0), 3.0, if *up { t.done } else { t.del });
-                r.text(b.x + 22.0, r.center(b, UI, 12.0), name, UI, 12.0, 400, if on { t.text } else { t.tc }, bw);
-                if self.hit(r, b) {
-                    self.actions.push(Action::PickHost(*i));
-                }
-                mx += bw + 4.0;
-            }
-            let rx = dlg.x + dlg.w / 2.0 + 18.0;
-            r.text(rx, my + 14.0, "Repo on that machine", UI, 11.0, 400, t.text3, 200.0);
-            let field = Rect::new(rx - 8.0, my + 34.0, dlg.w / 2.0 - 20.0, 32.0);
+        // Repo on another machine.
+        let mut y = cy + 32.0 + 18.0;
+        if remote {
+            let lw = r.text(dlg.x + pad, r.center(Rect::new(0.0, y, 0.0, 32.0), UI, 13.0), "repo", UI, 13.0, 400, t.text3, 60.0);
+            let field = Rect::new(dlg.x + pad + lw + 10.0, y, dlg.w - 2.0 * pad - lw - 10.0, 32.0);
             if self.input(r, t, field, &repo_path, "~/path/to/repo", Focus::Repo, MONO) {
                 self.actions.push(Action::Focus(Focus::Repo));
             }
+            y += repo_h;
         }
 
-        // Footer.
-        let fy = gy + 78.0 + host_row;
-        let foot = Rect::new(dlg.x + 1.0, fy, dlg.w - 2.0, dlg.y + dlg.h - fy - 1.0);
-        r.rect(Rect::new(dlg.x + 1.0, fy, dlg.w - 2.0, 1.0), 0.0, t.border);
-        r.rect(Rect::new(foot.x, foot.y + 1.0, foot.w, foot.h - 1.0), 7.0, t.panel);
-        // Start <agent> · <model> ↵ | ⌄ — the chevron (or Shift+Tab) cycles the agent's models.
-        let model = models(agent)[model_i].0;
-        let start_label = if model_i == 0 { format!("Start {agent}") } else { format!("Start {agent} · {model}") };
-        let sw = r.measure(UI, 13.0, 500, &start_label) + 40.0;
-        let cw = 28.0;
-        let chev = Rect::new(foot.x + foot.w - 14.0 - cw, foot.y + 12.0, cw, 34.0);
-        let start = Rect::new(chev.x - sw, chev.y, sw, 34.0);
-        let fill = if t.dark { a } else { accent_deep(agent) };
-        r.rect(Rect::new(start.x, start.y, sw + cw, 34.0), 4.0, fill);
-        r.rect(Rect::new(chev.x, chev.y + 7.0, 1.0, 20.0), 0.0, alpha(t.on_accent, 90));
-        let slw = r.text(start.x + 14.0, r.center(start, UI, 13.0), &start_label, UI, 13.0, 500, t.on_accent, sw);
-        r.text(start.x + 20.0 + slw, r.center(start, MONO, 10.0), "↵", MONO, 10.0, 400, alpha(t.on_accent, 150), 20.0);
-        r.path(9, "M18 26L32 40L46 26", Some(6.0), chev.x + 8.0, chev.y + 11.0, 12.0, t.on_accent);
-        if self.hit(r, chev) {
-            self.actions.push(Action::PickModel(usize::MAX)); // ponytail: cycles; a menu like the branch list if the lists grow
+        // Recent prompts, to start from.
+        let mut reuse = None;
+        if !recent.is_empty() {
+            r.rect(Rect::new(dlg.x + 1.0, y, dlg.w - 2.0, 1.0), 0.0, t.border);
+            r.text(dlg.x + pad, y + 12.0, "RECENT", UI, 11.5, 600, t.text3, 100.0);
+            for (i, p) in recent.iter().enumerate() {
+                let row = Rect::new(dlg.x + 1.0, y + 36.0 + i as f32 * 36.0, dlg.w - 2.0, 36.0);
+                let first = p.lines().next().unwrap_or("");
+                r.text(row.x + pad - 1.0, r.center(row, UI, 13.0), first, UI, 13.0, 400, t.text2, row.w - 2.0 * pad);
+                if self.hit(r, row) {
+                    reuse = Some(p.clone());
+                }
+            }
+            y += recent_h;
         }
-        let attach_key = mod_label("↵");
-        let aw = r.measure(UI, 13.0, 400, "Start & attach") + r.measure(MONO, 10.0, 400, &attach_key) + 32.0;
-        let attach = Rect::new(start.x - 8.0 - aw, start.y, aw, 34.0);
-        r.frame(attach, 4.0, t.panel, t.border2);
-        let alw = r.text(attach.x + 12.0, r.center(attach, UI, 13.0), "Start & attach", UI, 13.0, 400, t.text, aw);
-        r.text(attach.x + 20.0 + alw, r.center(attach, MONO, 10.0), &attach_key, MONO, 10.0, 400, t.text3, 60.0);
-        if !error.is_empty() {
-            r.text(foot.x + 18.0, r.center(start, UI, 12.0), &error, UI, 12.0, 400, t.del, attach.x - foot.x - 30.0);
-        }
+
+        // Footer: keys on the left, Start & attach and Start on the right.
+        let foot = Rect::new(dlg.x + 1.0, y, dlg.w - 2.0, dlg.y + dlg.h - y - 1.0);
+        r.rect(Rect::new(foot.x, foot.y, foot.w, 1.0), 0.0, t.border);
+        let sb = Rect::new(foot.x + foot.w - pad + 1.0, foot.y + 12.0, 0.0, 34.0);
+        let start_label = "Start agent";
+        let sw = r.measure(UI, 13.0, 600, start_label) + 28.0;
+        let start = Rect::new(sb.x - sw, sb.y, sw, sb.h);
+        let ready = !prompt.trim().is_empty();
+        r.rect(start, 0.0, if ready { t.primary_bg } else { alpha(t.primary_bg, 0x80) });
+        r.text(start.x + 14.0, r.center(start, UI, 13.0), start_label, UI, 13.0, 600, t.primary_fg, sw);
+        let attach_label = "Start & attach";
+        let aw = r.measure(UI, 13.0, 500, attach_label) + 28.0;
+        let attach = Rect::new(start.x - 8.0 - aw, sb.y, aw, sb.h);
+        r.frame(attach, 0.0, t.dialog, t.border2);
+        r.text(attach.x + 14.0, r.center(attach, UI, 13.0), attach_label, UI, 13.0, 500, t.text, aw);
         if self.hit(r, start) {
             self.actions.push(Action::Start(false));
         }
         if self.hit(r, attach) {
             self.actions.push(Action::Start(true));
         }
+        let room = attach.x - foot.x - pad - 12.0;
+        if error.is_empty() {
+            // As many key hints as fit.
+            let mut hx = foot.x + pad - 1.0;
+            for (key, what) in [("↵", "start"), (mod_label("↵").as_str(), "start & attach"), ("tab", "agent"), ("esc", "close")] {
+                let kw = r.measure(MONO, 12.0, 500, key);
+                let ww = r.measure(UI, 12.0, 400, what);
+                if hx + kw + 6.0 + ww > foot.x + pad + room {
+                    break;
+                }
+                r.text(hx, r.center(start, MONO, 12.0), key, MONO, 12.0, 500, t.text, kw + 2.0);
+                r.text(hx + kw + 6.0, r.center(start, UI, 12.0), what, UI, 12.0, 400, t.text3, ww + 2.0);
+                hx += kw + 6.0 + ww + 18.0;
+            }
+        } else {
+            r.text(foot.x + pad - 1.0, r.center(start, UI, 12.5), &error, UI, 12.5, 400, t.del, room);
+        }
+
+        let Some(d) = self.dialog.as_mut() else { return };
+        if let Some(p) = reuse {
+            (d.prompt, d.hist) = (p, None);
+            self.actions.push(Action::Focus(Focus::Prompt));
+            self.caret = None; // its end
+        }
 
         // The branch list, over everything else. ponytail: the 8 most recent branches; scroll or type-to-filter if that's too few
-        let Some(d) = self.dialog.as_mut() else { return };
         if d.list.is_none() {
             return;
         }
@@ -3046,21 +3104,21 @@ impl App {
             return;
         }
         let shown: Vec<&String> = branches.iter().take(8).collect();
-        let lw = shown.iter().map(|b| r.measure(MONO, 12.0, 400, b)).fold(bfw, |m, x| m.max(x + 44.0)).min(dlg.w / 2.0 - 20.0);
-        let lr = Rect::new(bfield.x, bfield.y + bfield.h + 4.0, lw, 8.0 + shown.len() as f32 * 28.0);
+        let lw = shown.iter().map(|b| r.measure(MONO, 13.0, 400, b)).fold(bfield.w, |m, x| m.max(x + 48.0)).min(dlg.w / 2.0);
+        let lr = Rect::new(bfield.x, bfield.y + bfield.h + 4.0, lw, 8.0 + shown.len() as f32 * 32.0);
         d.list = Some(lr);
-        r.rect(Rect::new(lr.x - 1.0, lr.y + 3.0, lr.w + 2.0, lr.h + 2.0), 8.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
-        r.frame(lr, 6.0, t.dialog, t.border2);
+        r.rect(Rect::new(lr.x - 1.0, lr.y + 3.0, lr.w + 2.0, lr.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
+        r.frame(lr, 0.0, t.dialog, t.border2);
         r.target(lr, Cursor::Arrow);
         for (i, b) in shown.iter().enumerate() {
-            let row = Rect::new(lr.x + 4.0, lr.y + 4.0 + i as f32 * 28.0, lr.w - 8.0, 28.0);
+            let row = Rect::new(lr.x + 4.0, lr.y + 4.0 + i as f32 * 32.0, lr.w - 8.0, 32.0);
             let on = **b == base;
             if on {
-                r.rect(row, 3.0, t.sel);
+                r.rect(row, 0.0, t.sel);
             }
-            r.text(row.x + 8.0, r.center(row, MONO, 12.0), b, MONO, 12.0, 400, t.text, row.w - 36.0);
+            r.text(row.x + 10.0, r.center(row, MONO, 13.0), b, MONO, 13.0, 400, t.text, row.w - 40.0);
             if on {
-                r.path(8, "M14 33.6L25.6 45.2L50 18.8", Some(7.0), row.x + row.w - 20.0, row.y + 8.0, 12.0, t.text);
+                r.path(8, "M14 33.6L25.6 45.2L50 18.8", Some(7.0), row.x + row.w - 22.0, row.y + 10.0, 12.0, t.text);
             }
             r.target(row, Cursor::Pointer);
             if list_click.is_some_and(|p| row.contains(p)) {
@@ -3222,25 +3280,14 @@ fn last_size(log: &[u8]) -> Option<(u16, u16)> {
     Some((cols.parse().ok()?, rows.parse().ok()?))
 }
 
-/// The arranger mark ("Ensemble"): arcs of players around an amber conductor, from the logo's SVG.
-/// `size` is the mark's box; below 24 px it uses the solid two-arc variant, above it the dotted one.
+/// The arranger mark ("Seats"): the status icons' eight players as empty rings around the amber
+/// conductor, moved down 13 units so the arch sits in the middle of its `size` box. Small marks get
+/// a heavier ring so it doesn't thin out to a hairline.
 fn logo(r: &mut Renderer, x: f32, y: f32, size: f32, ink: Rgba, amber: Rgba) {
-    if size < 24.0 {
-        r.path(1, "M5 45A27 27 0 0 1 59 45M19 45A13 13 0 0 1 45 45", Some(7.0), x, y, size, ink);
-        r.path(2, "M26 46a6 6 0 1 0 12 0a6 6 0 1 0 -12 0", None, x, y, size, amber);
-        return;
-    }
-    // Dots of 5.5 units spaced evenly along each arc: what the SVG's `stroke-dasharray="0 …"` draws.
-    let mut dots = String::new();
-    for (radius, n) in [(28.0f32, 10), (19.0, 7), (10.0, 4)] {
-        for i in 0..=n {
-            let a = std::f32::consts::PI * (1.0 - i as f32 / n as f32);
-            let (cx, cy) = (32.0 + radius * a.cos(), 45.0 - radius * a.sin());
-            dots += &format!("M{} {cy}a2.75 2.75 0 1 0 5.5 0a2.75 2.75 0 1 0 -5.5 0", cx - 2.75);
-        }
-    }
-    r.path(3, &dots, None, x, y, size, ink);
-    r.path(4, "M27.5 45a4.5 4.5 0 1 0 9 0a4.5 4.5 0 1 0 -9 0", None, x, y, size, amber);
+    let (id, stroke) = if size < 24.0 { (1, 3.4) } else { (3, 2.6) };
+    let rings: String = PLAYERS.iter().map(|&(px, py)| dot(px, py + 13.0, 3.8)).collect();
+    r.path(id, &rings, Some(stroke), x, y, size, ink);
+    r.path(2, &dot(31.8, 45.0, 5.2), None, x, y, size, amber);
 }
 
 /// Extract a half-open range, preserving terminal wraps and Unicode combining characters.
@@ -3334,6 +3381,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn saved_scheme_names_survive_the_new_eight() {
+        assert_eq!(THEMES[theme::by_name("Paper")].name, "Paper");
+        assert_eq!(THEMES[theme::by_name("Graphite")].name, "Ink");
+        assert_eq!(THEMES[theme::by_name("Mist")].name, "Snow");
+        assert_eq!(theme::by_name(""), 0, "nothing saved: Gruvbox");
+        // ⌘T pairs each dark scheme with a light one.
+        assert!((0..4).all(|i| THEMES[i].dark && !THEMES[i + 4].dark));
+    }
+
+    #[test]
     fn chat_selection_copies_ranges_and_wraps() {
         let mut screen = Screen::new(8, 4);
         screen.feed("hello world\r\n你好 e\u{301}".as_bytes());
@@ -3393,10 +3450,10 @@ mod tests {
     #[test]
     fn agent_white_text_stays_readable_on_paper() {
         let white = [255; 4];
-        assert_eq!(readable(white, GRAPHITE.term), white);
+        assert_eq!(readable(white, INK.term), white);
         assert_ne!(readable(white, PAPER.term), white);
         let grey = [153, 153, 153, 255];
         assert!(readable(grey, PAPER.term)[0] > readable(white, PAPER.term)[0], "white stays darker than grey");
-        assert_eq!(readable(grey, GRAPHITE.term), grey);
+        assert_eq!(readable(grey, INK.term), grey);
     }
 }

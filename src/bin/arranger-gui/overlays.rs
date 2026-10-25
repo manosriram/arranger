@@ -1,155 +1,163 @@
-//! Overview: one dense table of every agent on every machine; and the scheme menu and vim key
-//! sheet, which float over any view.
+//! What floats over the Workspace: one machine's every task (its sidebar header's "See all"), the
+//! scheme menu and the vim key sheet.
 
 use super::*;
 
-const TOOLBAR_H: f32 = 42.0;
-const HEAD_H: f32 = 28.0;
-const GROUP_ROW_H: f32 = 26.0;
-const ROW_H: f32 = 32.0;
+const HEAD_H: f32 = 52.0;
+const TOOLBAR_H: f32 = 48.0;
+const GROUP_ROW_H: f32 = 28.0;
+const ROW_H: f32 = 40.0;
+const FOOT_H: f32 = 34.0;
+/// Rows the machine popup draws at first, and adds each time its list is scrolled near the end.
+pub const MT_PAGE: usize = 50;
 const GROUPS: [&str; 5] = ["Needs you", "Running", "Queued", "Done", "Ended"];
 
 impl App {
-    pub fn draw_overview(&mut self, r: &mut Renderer, t: &Theme, area: Rect) {
+    /// One machine's tasks in every state, in a popup over the Workspace: a filter and state tabs on
+    /// top, then rows grouped by state, each with the one thing to do next (Revive for an agent
+    /// that has ended). Rows load a page at a time as the list scrolls.
+    pub fn draw_machine_tasks(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
+        let Some(m) = self.machine_tasks else { return };
         let mut acts = Vec::new();
         let colors = [t.needs, t.work, t.faint, t.done, t.faint];
+        r.rect(Rect::new(0.0, 0.0, w, h), 0.0, t.scrim);
+        r.target(Rect::new(0.0, 0.0, w, h), Cursor::Arrow); // nothing under the scrim reacts
+        let pw = (w - 32.0).min(920.0);
+        let ph = (h - 128.0).clamp(240.0, 720.0);
+        let pop = Rect::new((w - pw) / 2.0, (h - ph) / 2.0, pw, ph);
+        r.frame(pop, 0.0, t.dialog, t.border2);
+        r.target(pop, Cursor::Arrow);
+        if self.click.is_some_and(|p| !pop.contains(p)) {
+            acts.push(Action::MachineTasks(None));
+        }
 
-        // Toolbar: filter, then a tab per state with its count.
-        let bar = Rect::new(area.x, area.y, area.w, TOOLBAR_H);
-        r.rect(Rect::new(area.x, bar.y + bar.h - 1.0, area.w, 1.0), 0.0, t.border);
-        let f = Rect::new(area.x + 12.0, bar.y + 8.0, 240.0, 26.0);
-        if self.input(r, t, f, &self.filter.clone(), "Filter by title, branch, agent", Focus::Filter, UI) {
-            acts.push(Action::Focus(Focus::Filter));
+        // Header: ■ This Mac  local · 14 tasks                    esc
+        let host = &self.hosts[m];
+        let head = Rect::new(pop.x, pop.y, pop.w, HEAD_H);
+        r.rect(Rect::new(pop.x, head.y + head.h - 1.0, pop.w, 1.0), 0.0, t.border);
+        let up = matches!(host.link, Link::Up(_));
+        r.rect(Rect::new(head.x + 20.0, head.y + head.h / 2.0 - 4.0, 8.0, 8.0), 0.0, if up { t.done } else { t.del });
+        let nw = r.text(head.x + 38.0, r.center(head, UI, 15.0), host.name(), UI, 15.0, 600, t.text, 300.0);
+        let addr = host.cfg.as_ref().map_or("local", |c| c.ssh.as_str());
+        let total = host.tasks.len();
+        let sub = format!("{addr} · {total} task{}", if total == 1 { "" } else { "s" });
+        r.text(head.x + 50.0 + nw, r.center(head, UI, 12.5), &sub, UI, 12.5, 400, t.text3, pop.w - nw - 160.0);
+        let esc = Rect::new(head.x + head.w - 64.0, head.y + (head.h - 28.0) / 2.0, 44.0, 28.0);
+        r.frame(esc, 0.0, t.dialog, t.border2);
+        r.text(esc.x + 9.0, r.center(esc, MONO, 12.0), "esc", MONO, 12.0, 400, t.text3, 40.0);
+        if self.hit(r, esc) {
+            acts.push(Action::MachineTasks(None));
+        }
+
+        // Toolbar: filter, then a tab per state with its count, as many as fit.
+        let bar = Rect::new(pop.x, head.y + head.h, pop.w, TOOLBAR_H);
+        r.rect(Rect::new(pop.x, bar.y + bar.h - 1.0, pop.w, 1.0), 0.0, t.border);
+        let f = Rect::new(bar.x + 20.0, bar.y + 9.0, (pop.w * 0.3).min(260.0), 30.0);
+        if self.input(r, t, f, &self.mt_filter.clone(), "Filter by title or branch", Focus::TasksFilter, UI) {
+            acts.push(Action::Focus(Focus::TasksFilter));
         }
         let mut counts = [0; 5];
-        for task in self.all_tasks().filter(|x| self.ov_host.is_none_or(|m| x.machine == m)) {
+        for task in &host.tasks {
             counts[group(&task.state)] += 1;
         }
-        let mut x = f.x + f.w + 8.0;
-        let total = counts.iter().sum::<usize>();
+        let mut x = f.x + f.w + 10.0;
         for (g, label) in std::iter::once((None, "All")).chain(GROUPS.iter().enumerate().map(|(i, l)| (Some(i), *l))) {
             let n = g.map_or(total, |g| counts[g]).to_string();
-            let tw = r.measure(UI, 12.0, 400, label) + r.measure(MONO, 12.0, 400, &n) + 20.0;
-            let tab = Rect::new(x, f.y, tw, 26.0);
-            let on = self.ov_group == g;
-            if on {
-                r.rect(tab, 3.0, t.raised);
+            let tw = r.measure(UI, 12.5, 400, label) + r.measure(MONO, 12.5, 400, &n) + 22.0;
+            if x + tw > pop.x + pop.w - 20.0 {
+                break;
             }
-            let lw = r.text(tab.x + 8.0, r.center(tab, UI, 12.0), label, UI, 12.0, 400, if on { t.text } else { t.text2 }, tw);
+            let tab = Rect::new(x, f.y, tw, 30.0);
+            let on = self.mt_group == g;
+            if on {
+                r.rect(tab, 0.0, t.raised);
+            }
+            let lw = r.text(tab.x + 8.0, r.center(tab, UI, 12.5), label, UI, 12.5, 400, if on { t.text } else { t.text2 }, tw);
             let nc = match g {
                 Some(g @ (0 | 1)) => colors[g],
                 _ => t.text3,
             };
-            r.text(tab.x + 12.0 + lw, r.center(tab, MONO, 12.0), &n, MONO, 12.0, 400, nc, 40.0);
+            r.text(tab.x + 14.0 + lw, r.center(tab, MONO, 12.5), &n, MONO, 12.5, 400, nc, 40.0);
             if self.hit(r, tab) {
-                acts.push(Action::OvGroup(g));
+                acts.push(Action::MtGroup(g));
             }
             x += tw + 1.0;
         }
-        if let Some(m) = self.ov_host {
-            // The machine filter, as a chip that clears it.
-            let name = self.hosts[m].name();
-            let cw = r.measure(UI, 12.0, 400, name) + 34.0;
-            let chip = Rect::new(x + 8.0, f.y, cw, 26.0);
-            r.frame(chip, 3.0, t.bg, t.border2);
-            r.text(chip.x + 9.0, r.center(chip, UI, 12.0), name, UI, 12.0, 400, t.text, cw);
-            r.text(chip.x + cw - 18.0, r.center(chip, UI, 12.0), "×", UI, 12.0, 400, t.text3, 12.0);
-            if self.hit(r, chip) {
-                acts.push(Action::OvHost(None));
-            }
-        }
 
-        // Columns: icon | Task | Machine | Agent | Branch | Latest | Time | action.
-        let multi = self.hosts.iter().filter(|h| !h.removed).count() > 1;
-        let inner = area.w - 24.0;
-        let fixed = 28.0 + 72.0 + 52.0 + 112.0 + if multi { 110.0 } else { 0.0 };
+        // Columns: icon | Task | Agent | Branch | Latest | Time | action.
+        let inner = pop.w - 40.0;
+        let fixed = 30.0 + 80.0 + 60.0 + 104.0;
         let flex = (inner - fixed).max(300.0) / 4.2;
-        let (task_w, branch_w, latest_w) = (flex * 1.3, flex * 0.9, flex * 2.0);
-        let mut cols = vec![("", 28.0), ("TASK", task_w)];
-        if multi {
-            cols.push(("MACHINE", 110.0));
-        }
-        cols.extend([("AGENT", 72.0), ("BRANCH", branch_w), ("LATEST", latest_w), ("TIME", 52.0), ("", 112.0)]);
-        let col_x: Vec<f32> = cols.iter().scan(area.x + 12.0, |x, (_, w)| { let at = *x; *x += w; Some(at) }).collect();
-        let col = |name: &str| cols.iter().position(|c| c.0 == name).map(|i| (col_x[i], cols[i].1 - 12.0)).unwrap();
+        let cols = [("", 30.0), ("task", flex * 1.9), ("agent", 80.0), ("branch", flex * 0.7), ("latest", flex * 1.6), ("time", 60.0), ("", 104.0)];
+        let col_x: Vec<f32> = cols.iter().scan(pop.x + 20.0, |x, (_, w)| { let at = *x; *x += w; Some(at) }).collect();
+        let col = |name: &str| cols.iter().position(|c| c.0 == name).map(|i| (col_x[i], cols[i].1 - 14.0)).unwrap();
 
-        let head = Rect::new(area.x, bar.y + bar.h, area.w, HEAD_H);
-        r.rect(Rect::new(area.x, head.y + head.h - 1.0, area.w, 1.0), 0.0, t.border);
-        for (i, (name, w)) in cols.iter().enumerate() {
-            let tx = if *name == "TIME" { col_x[i] + w - 12.0 - r.measure(UI, 10.5, 500, name) } else { col_x[i] };
-            r.text(tx, r.center(head, UI, 10.5), name, UI, 10.5, 500, t.text3, *w);
-        }
-
-        // Rows, grouped by state.
-        let list = Rect::new(area.x, head.y + head.h, area.w, area.y + area.h - head.y - head.h);
+        // Rows, grouped by state; the first `mt_shown` of them.
+        let foot = Rect::new(pop.x, pop.y + pop.h - FOOT_H, pop.w, FOOT_H);
+        let list = Rect::new(pop.x + 1.0, bar.y + bar.h, pop.w - 2.0, foot.y - bar.y - bar.h);
         r.set_clip(Some(list));
         let clicked = |p: Option<(f32, f32)>| p.is_some_and(|p| list.contains(p));
-        let tasks = self.ov_tasks();
-        let mut y = list.y - self.ov_scroll;
+        let tasks = self.mt_tasks();
+        let shown = tasks.len().min(self.mt_shown);
+        let mut y = list.y - self.mt_scroll;
         if tasks.is_empty() {
-            let note = if total == 0 { format!("No tasks yet · {} to start one", mod_label("N")) } else { "No matches".into() };
-            r.text(area.x + 40.0, y + 16.0, &note, UI, 12.5, 400, t.text3, 400.0);
+            let note = if total == 0 { format!("No tasks on {} yet", host.name()) } else { "No matches".into() };
+            r.text(pop.x + 50.0, y + 18.0, &note, UI, 13.0, 400, t.text3, pop.w - 100.0);
         }
         let mut last_group = None;
-        for task in &tasks {
+        for task in &tasks[..shown] {
             let g = group(&task.state);
             if last_group != Some(g) {
                 last_group = Some(g);
-                let row = Rect::new(area.x, y, area.w, GROUP_ROW_H);
+                let row = Rect::new(list.x, y, list.w, GROUP_ROW_H);
                 r.rect(row, 0.0, t.panel);
                 r.rect(Rect::new(row.x, row.y + row.h - 1.0, row.w, 1.0), 0.0, t.border);
-                r.rect(Rect::new(area.x + 12.0, row.y + row.h / 2.0 - 2.5, 5.0, 5.0), 1.0, colors[g]);
-                let lw = r.text(area.x + 23.0, r.center(row, UI, 10.5), &GROUPS[g].to_uppercase(), UI, 10.5, 500, t.text3, 200.0);
-                let n = tasks.iter().filter(|x| group(&x.state) == g).count().to_string();
-                r.text(area.x + 29.0 + lw, r.center(row, MONO, 10.5), &n, MONO, 10.5, 400, t.faint, 40.0);
+                r.rect(Rect::new(pop.x + 20.0, row.y + row.h / 2.0 - 3.0, 6.0, 6.0), 0.0, colors[g]);
+                let lw = r.text(pop.x + 34.0, r.center(row, UI, 11.5), &GROUPS[g].to_uppercase(), UI, 11.5, 600, t.text3, 200.0);
+                r.text(pop.x + 42.0 + lw, r.center(row, MONO, 11.5), &counts[g].to_string(), MONO, 11.5, 400, t.faint, 40.0);
                 y += GROUP_ROW_H;
             }
-            let row = Rect::new(area.x, y, area.w, ROW_H);
+            let row = Rect::new(list.x, y, list.w, ROW_H);
             y += ROW_H;
             if row.y + row.h < list.y || row.y > list.y + list.h {
                 continue;
             }
             let key = (task.machine, task.id);
             let on = self.selected == Some(key);
-            let bg = if on { t.sel } else { t.bg };
+            let bg = if on { t.sel } else { t.dialog };
             if on {
-                r.frame(Rect::new(row.x + 4.0, row.y + 1.0, row.w - 8.0, row.h - 2.0), 3.0, t.sel, t.sel_ring);
-            } else {
-                r.rect(Rect::new(row.x, row.y + row.h - 1.0, row.w, 1.0), 0.0, t.row_line);
+                r.rect(row, 0.0, t.sel);
             }
+            r.rect(Rect::new(row.x, row.y + row.h - 1.0, row.w, 1.0), 0.0, t.row_line);
             if self.hit(r, row) && clicked(self.click) {
                 acts.push(Action::Select(key));
             }
             self.icon(r, t, task, col_x[0], row.y + row.h / 2.0);
-            let (x, w) = col("TASK");
-            let bw = if task.shipped.is_empty() { 0.0 } else { r.measure(UI, 10.5, 500, &format!("✓ {}", task.shipped)) + 16.0 };
-            let tw = r.text(x, r.center(row, UI, 12.5), &title(task), UI, 12.5, 400, if g == 4 { t.text3 } else if on { t.tc_on } else { t.text }, w - bw);
+            let (x, w) = col("task");
+            let bw = if task.shipped.is_empty() { 0.0 } else { r.measure(UI, 11.0, 500, &format!("✓ {}", task.shipped)) + 16.0 };
+            let tc = if g == 4 { t.text2 } else if on { t.tc_on } else { t.text };
+            let tw = r.text(x, r.center(row, UI, 13.0), &title(task), UI, 13.0, 500, tc, w - bw);
             ship_badge(r, t, &task.shipped, x + tw + 6.0, row.y + row.h / 2.0);
-            if multi {
-                let (x, w) = col("MACHINE");
-                r.text(x, r.center(row, MONO, 11.0), self.hosts[task.machine].name(), MONO, 11.0, 400, t.text2, w);
-            }
-            let (x, w) = col("AGENT");
+            let (x, w) = col("agent");
             let kind = adapter::kind(&task.agent);
-            r.text(x, r.center(row, MONO, 11.0), kind, MONO, 11.0, 400, accent(kind), w);
-            let (x, w) = col("BRANCH");
-            r.text(x, r.center(row, MONO, 11.0), &task.branch, MONO, 11.0, 400, t.text3, w);
-            let (x, w) = col("LATEST");
-            let queue_pos = self.hosts[task.machine].tasks.iter().filter(|q| q.state == "queued" && q.id <= task.id).count();
-            let lc = match g {
-                0 => t.needs,
-                3 => t.text2,
-                _ => t.text3,
+            r.text(x, r.center(row, MONO, 12.0), kind, MONO, 12.0, 400, accent(kind), w);
+            let (x, w) = col("branch");
+            r.text(x, r.center(row, MONO, 12.0), &task.branch, MONO, 12.0, 400, t.text3, w);
+            let (x, w) = col("latest");
+            let queue_pos = host.tasks.iter().filter(|q| q.state == "queued" && q.id <= task.id).count();
+            let (latest, lc) = match self.revive_error.as_ref().filter(|e| e.0 == key) {
+                Some((_, e)) => (format!("couldn't revive: {e}"), t.del),
+                None => (status_line(task, queue_pos).replace('\n', " "), if g == 0 { t.needs } else { t.text3 }),
             };
-            r.text(x, r.center(row, MONO, 11.0), &status_line(task, queue_pos).replace('\n', " "), MONO, 11.0, 400, lc, w);
-            let (x, w) = col("TIME");
+            r.text(x, r.center(row, MONO, 12.0), &latest, MONO, 12.0, 400, lc, w);
+            let (x, w) = col("time");
             let time = match g {
                 2 => "—".to_string(),
-                3 if task.since != 0 => ago(task.since),
+                3 | 4 if task.updated != 0 => ago(task.updated),
                 _ => age(task),
             };
-            let tw = r.measure(MONO, 11.0, 400, &time);
-            r.text(x + w - tw, r.center(row, MONO, 11.0), &time, MONO, 11.0, 400, t.text3, tw + 2.0);
+            let tw = r.measure(MONO, 12.0, 400, &time);
+            r.text(x + w - tw, r.center(row, MONO, 12.0), &time, MONO, 12.0, 400, t.text3, tw + 2.0);
 
             // The one thing to do next.
             let approve = g == 0 && task.asking && matches!(task.need, Some(Event::PermissionRequest { .. }));
@@ -157,33 +165,46 @@ impl App {
                 0 if approve => ("Approve", Some(t.needs), t.on_accent),
                 0 => ("Answer", Some(t.needs), t.on_accent),
                 3 => ("Review", Some(t.primary_bg), t.primary_fg),
+                4 => ("Revive", None, t.text),
                 _ => ("Open", None, t.text2),
             };
-            let bw = r.measure(UI, 11.5, 500, label) + 16.0;
-            let b = Rect::new(row.x + row.w - 12.0 - bw, row.y + 5.0, bw, 22.0);
+            let bw = r.measure(UI, 12.0, 500, label) + 20.0;
+            let b = Rect::new(pop.x + pop.w - 20.0 - bw, row.y + (ROW_H - 28.0) / 2.0, bw, 28.0);
             match fill {
-                Some(c) => r.rect(b, 3.0, c),
-                None => r.frame(b, 3.0, bg, t.border2),
+                Some(c) => r.rect(b, 0.0, c),
+                None => r.frame(b, 0.0, bg, t.border2),
             }
-            r.text(b.x + 8.0, r.center(b, UI, 11.5), label, UI, 11.5, 500, fg, bw);
+            r.text(b.x + 10.0, r.center(b, UI, 12.0), label, UI, 12.0, 500, fg, bw);
             if self.hit(r, b) && clicked(self.click) {
                 acts.retain(|a| !matches!(a, Action::Select(_)));
-                if label == "Approve" {
-                    acts.push(Action::Answer(key, true)); // before Select attaches its terminal
-                }
-                acts.push(Action::Select(key));
                 acts.extend(match label {
-                    "Approve" => vec![],
-                    "Answer" => vec![Action::Answering],
-                    "Review" => vec![Action::OpenReview],
-                    _ => vec![Action::Overview(false), Action::Focus(Focus::Term)], // its terminal, to type into
+                    // Answered before Select attaches its terminal, which would take the ask over.
+                    "Approve" => vec![Action::Answer(key, true), Action::Select(key)],
+                    "Answer" => vec![Action::Select(key), Action::Answering],
+                    "Review" => vec![Action::Select(key), Action::MachineTasks(None), Action::OpenReview],
+                    "Revive" => vec![Action::Revive(key, String::new())],
+                    _ => vec![Action::Select(key), Action::MachineTasks(None), Action::Focus(Focus::Term)],
                 });
             }
         }
+        let matched = tasks.len();
         drop(tasks);
-        let content_h = y + self.ov_scroll - list.y;
-        self.ov_scroll = self.ov_scroll.min((content_h - list.h + 8.0).max(0.0));
+        let content_h = y + self.mt_scroll - list.y;
+        self.mt_scroll = self.mt_scroll.min((content_h - list.h + 8.0).max(0.0));
+        // Near the end of what's loaded: load the next page.
+        if shown < matched && y < list.y + list.h + 4.0 * ROW_H {
+            acts.push(Action::MtMore);
+        }
         r.set_clip(None);
+
+        r.rect(Rect::new(pop.x, foot.y, pop.w, 1.0), 0.0, t.border);
+        let fy = r.center(foot, UI, 12.0);
+        r.text(foot.x + 20.0, fy, &format!("Showing {shown} of {matched}"), UI, 12.0, 400, t.text3, 300.0);
+        let note = "Revive picks up an ended agent's last session in its worktree";
+        let nw = r.measure(UI, 12.0, 400, note);
+        if nw < pop.w - 260.0 {
+            r.text(foot.x + foot.w - 20.0 - nw, fy, note, UI, 12.0, 400, t.text3, nw + 2.0);
+        }
         self.actions.extend(acts);
     }
 
