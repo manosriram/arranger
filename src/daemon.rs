@@ -1074,6 +1074,8 @@ impl Daemon {
             .env("PORT", (20000 + id % 1000 * 10).to_string()); // PORT..PORT+9 is this task's
         let (cols, rows) = (80, 24);
         let pty = pty::spawn(cmd, cols, rows).map_err(|e| format!("{agent}: {e}"))?;
+        // Resumed with nothing to say (a clone or revive without a prompt), it sits waiting: no hook fires to say so.
+        let idle = resume.is_some_and(|p| p.trim().is_empty());
         let token = Token(TASK + id as usize);
         self.poll
             .registry()
@@ -1085,9 +1087,9 @@ impl Daemon {
             log: size_mark(cols, rows),
             viewers: Vec::new(),
             osc: Osc::named(agent == "claude"), // ponytail: claude only; other agents' titles are status, not names
-            activity: Activity::Running,
+            activity: if idle { Activity::Done } else { Activity::Running },
             need: None,
-            action: String::new(),
+            action: if idle { "idle".into() } else { String::new() },
             since: now(),
             queued: 0,
             interrupted: false,
