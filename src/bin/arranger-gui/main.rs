@@ -2971,13 +2971,17 @@ impl App {
                 ("Worktree", vec![(wt, t.text)]),
             ]
         } else {
-            vec![
+            let mut details = vec![
                 ("Agent", vec![(kind.to_string(), accent(kind))]),
                 ("Branch", vec![(branch, t.text)]),
                 ("Machine", vec![(host.name().to_string(), t.text)]),
                 ("Changes", changes),
                 ("Elapsed", vec![(age(&task), t.text)]),
-            ]
+            ];
+            if let Some(source) = task.cloned_from {
+                details.push(("Cloned from", vec![(format!("#{source}"), t.text)]));
+            }
+            details
         };
         let (ly, vy) = (area.y + 46.0, area.y + 60.0);
         let mut dx = area.x + 20.0;

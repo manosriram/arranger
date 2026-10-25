@@ -165,6 +165,7 @@ pub fn run() -> io::Result<()> {
         "shipped TEXT NOT NULL DEFAULT ''",
         "model TEXT NOT NULL DEFAULT ''",
         "updated INTEGER NOT NULL DEFAULT 0",
+        "cloned_from INTEGER",
     ] {
         let _ = db.execute(&format!("ALTER TABLE tasks ADD COLUMN {col}"), []);
     }
@@ -1008,9 +1009,9 @@ impl Daemon {
         let head = review::resolve(&from, "HEAD")?;
         self.db
             .execute(
-                "INSERT INTO tasks (agent, repo, branch, worktree, state, created, title, prompt, model)
-                 VALUES (?1, ?2, '', '', 'new', ?3, ?4, ?5, ?6)",
-                params![agent, repo, now_secs(), title, prompt, model],
+                "INSERT INTO tasks (agent, repo, branch, worktree, state, created, title, prompt, model, cloned_from)
+                 VALUES (?1, ?2, '', '', 'new', ?3, ?4, ?5, ?6, ?7)",
+                params![agent, repo, now_secs(), title, prompt, model, src],
             )
             .map_err(e2s)?;
         let id = self.db.last_insert_rowid() as u64;
@@ -1127,7 +1128,7 @@ impl Daemon {
         let mut stmt =
             self.db.prepare(
                 "SELECT id, agent, branch, worktree, state, title, created, summary, shipped,
-                 MAX(created, updated, COALESCE((SELECT MAX(ts) FROM events WHERE task = tasks.id) / 1000, 0)), model
+                 MAX(created, updated, COALESCE((SELECT MAX(ts) FROM events WHERE task = tasks.id) / 1000, 0)), model, cloned_from
                  FROM tasks ORDER BY id",
             ).map_err(e2s)?;
         let rows = stmt.query_map([], |r| {
@@ -1148,6 +1149,7 @@ impl Daemon {
                 shipped: r.get(8)?,
                 updated: r.get(9)?,
                 model: r.get(10)?,
+                cloned_from: r.get(11)?,
                 machine: 0,
             })
         });

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 const MAX_FRAME: usize = 64 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 14;
+pub const VERSION: u32 = 15;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -119,6 +119,9 @@ pub struct TaskInfo {
     /// Its `--model` ("" for the agent's default).
     #[serde(default)]
     pub model: String,
+    /// The source worktree's task ID, if this task was cloned.
+    #[serde(default)]
+    pub cloned_from: Option<u64>,
     /// Which machine the GUI got this task from (an index into its machine list); not sent.
     #[serde(skip)]
     pub machine: usize,
