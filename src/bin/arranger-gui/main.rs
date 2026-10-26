@@ -707,6 +707,14 @@ impl ApplicationHandler<Msg> for App {
                     // Dev aid for screenshots (`ARRANGER_SELECT=<task id>`): start on that local task.
                     let pick = std::env::var("ARRANGER_SELECT").ok().and_then(|v| v.parse().ok()).map(|id| (0, id)).filter(|&k| self.task(k).is_some());
                     self.selected = pick.or_else(|| self.order().first().copied());
+                    // Snapshot a chat draft through the same composer and completion paths as typing.
+                    if std::env::var_os("ARRANGER_SNAPSHOT").is_some()
+                        && let Some(key) = self.selected
+                        && let Ok(draft) = std::env::var("ARRANGER_MESSAGE") {
+                        self.focus = Focus::Message;
+                        self.caret = Some((Focus::Message, draft.len()));
+                        self.drafts.insert(key, draft);
+                    }
                     // Show several checked tasks using the same selection path as V then j/j.
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_MULTISELECT").is_some() {
                         self.vim = true;
@@ -1552,6 +1560,14 @@ impl App {
             self.answering = None;
             return;
         }
+        // A permission ask the daemon is holding: y allows it once, n denies it.
+        if (key == "y" || key == "n") && self.machine_tasks.is_none() && self.review.is_none() {
+            if let Some(t) = self.current().filter(|t| t.asking && matches!(t.need, Some(Event::PermissionRequest { .. }))) {
+                self.actions.push(Action::Answer((t.machine, t.id), key == "y"));
+                self.answering = None;
+                return;
+            }
+        }
         // The agent's menu is up: j/k move through it and ↵ picks, back in its terminal; Esc or i
         // leave it be.
         if self.answering.is_some() && self.machine_tasks.is_none() && self.review.is_none() {
@@ -1978,7 +1994,7 @@ impl App {
             self.menu = false;
             return;
         }
-        if !app_mod(m) && !m.control_key() && !m.shift_key() && self.completion_key(&ev.logical_key) {
+        if !app_mod(m) && !m.control_key() && !m.shift_key() && (self.slash_key(&ev.logical_key) || self.completion_key(&ev.logical_key)) {
             return;
         }
         if let Some(d) = self.dialog.as_ref().filter(|_| ev.logical_key == Key::Named(NamedKey::Tab)) {

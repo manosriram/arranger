@@ -23,6 +23,18 @@ const SMALL_DIFF: usize = 24;
 /// Lines of the message box before it scrolls.
 const COMPOSER_LINES: usize = 8;
 
+#[derive(Default)]
+struct Slash {
+    query: String,
+    selected: usize,
+    dismissed: bool,
+}
+
+fn slash_query(text: &str, at: usize) -> Option<&str> {
+    let query = text.strip_prefix('/')?;
+    (at == text.len() && !query.chars().any(char::is_whitespace) && !query.contains('/')).then_some(query)
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Ink {
     Text,
@@ -70,6 +82,7 @@ struct Laid {
 }
 
 pub struct ChatView {
+    slash: Slash,
     pub key: TaskKey,
     seq: u64,
     writer: UnixStream,
@@ -417,6 +430,7 @@ impl App {
             }
         });
         self.chat = Some(ChatView {
+            slash: Slash::default(),
             key,
             seq,
             writer: sock,
@@ -515,6 +529,79 @@ impl App {
         }
     }
 
+    fn slash_matches(&mut self) -> Vec<&'static str> {
+        if self.focus != Focus::Message || self.dialog.is_some() || self.anchor.is_some() {
+            return Vec::new();
+        }
+        let Some(task) = self.current() else { return Vec::new() };
+        if task.asking { return Vec::new(); }
+        let key = (task.machine, task.id);
+        let names = arranger::commands::names(&task.agent);
+        let text = self.drafts.get(&key).map(String::as_str).unwrap_or("");
+        let query = slash_query(text, caret_at(self.caret, Focus::Message, text));
+        let Some(c) = self.chat.as_mut().filter(|c| c.key == key) else { return Vec::new() };
+        let Some(query) = query else {
+            c.slash = Slash::default();
+            return Vec::new();
+        };
+        if c.slash.query != text {
+            c.slash = Slash { query: text.into(), ..Slash::default() };
+        }
+        if c.slash.dismissed { return Vec::new(); }
+        names.iter().copied().filter(|name| name.starts_with(query)).collect()
+    }
+
+    fn accept_slash(&mut self, name: &str) {
+        let Some(key) = self.chat.as_ref().map(|c| c.key) else { return };
+        let text = format!("/{name} ");
+        self.caret = Some((Focus::Message, text.len()));
+        self.anchor = None;
+        self.drafts.insert(key, text);
+    }
+
+    pub(super) fn slash_key(&mut self, key: &Key) -> bool {
+        let matches = self.slash_matches();
+        if matches.is_empty() { return false; }
+        let slash = &mut self.chat.as_mut().unwrap().slash;
+        slash.selected = slash.selected.min(matches.len() - 1);
+        match key {
+            Key::Named(NamedKey::ArrowDown) => slash.selected = (slash.selected + 1) % matches.len(),
+            Key::Named(NamedKey::ArrowUp) => slash.selected = (slash.selected + matches.len() - 1) % matches.len(),
+            Key::Named(NamedKey::Escape) => slash.dismissed = true,
+            Key::Named(NamedKey::Enter | NamedKey::Tab) => {
+                let name = matches[slash.selected];
+                self.accept_slash(name);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn draw_slash(&mut self, r: &mut Renderer, t: &Theme, sec: Rect, bottom: f32) -> f32 {
+        let matches = self.slash_matches();
+        if matches.is_empty() { return bottom; }
+        let slash = &mut self.chat.as_mut().unwrap().slash;
+        slash.selected = slash.selected.min(matches.len() - 1);
+        let count = matches.len().min(6).min(((bottom - sec.y) / 30.0).floor().max(0.0) as usize);
+        if count == 0 { return bottom; }
+        let first = slash.selected.saturating_sub(count - 1);
+        let panel = Rect::new(sec.x + 16.0, bottom - count as f32 * 30.0 - 8.0, sec.w - 32.0, count as f32 * 30.0 + 8.0);
+        r.frame(panel, 0.0, t.dialog, t.border2);
+        let mut picked = None;
+        for (i, name) in matches.iter().enumerate().skip(first).take(count) {
+            let row = Rect::new(panel.x + 4.0, panel.y + 4.0 + (i - first) as f32 * 30.0, panel.w - 8.0, 30.0);
+            if i == slash.selected { r.rect(row, 0.0, t.sel); }
+            r.text(row.x + 10.0, r.center(row, MONO, 13.0), &format!("/{name}"), MONO, 13.0, 400, t.text, row.w - 20.0);
+            r.target(row, Cursor::Pointer);
+            if self.click.is_some_and(|p| row.contains(p)) { picked = Some(*name); }
+        }
+        if let Some(name) = picked {
+            self.accept_slash(name);
+            self.click = None;
+        }
+        panel.y
+    }
+
     /// The conversation, what's waiting on you and the message box, in `sec` under the header.
     pub(super) fn draw_chat(&mut self, r: &mut Renderer, t: &Theme, sec: Rect, task: &TaskInfo, ended: bool) {
         let key = (task.machine, task.id);
@@ -525,6 +612,7 @@ impl App {
         let mut bottom = sec.y + sec.h;
         if !ended {
             bottom = self.draw_composer(r, t, Rect::new(sec.x, sec.y, sec.w, sec.h), task, focused);
+            bottom = self.draw_slash(r, t, sec, bottom);
         }
         let w = (sec.w - 2.0 * PAD).min(MAX_W);
         let x = sec.x + PAD;
@@ -766,11 +854,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn slash_completion_only_at_command_end() {
+        assert_eq!(slash_query("/", 1), Some(""));
+        assert_eq!(slash_query("/comp", 5), Some("comp"));
+        assert_eq!(slash_query("/compact ", 9), None);
+        assert_eq!(slash_query("/compact instructions", 21), None);
+        assert_eq!(slash_query("/tmp/file", 9), None);
+        assert_eq!(slash_query("explain /compact", 16), None);
+        assert_eq!(slash_query("/compact", 3), None);
+    }
+
+    #[test]
     fn small_edits_and_failures_open_by_themselves() {
         let line = |kind| arranger::proto::DiffLine { kind, old: 0, new: 0, text: "x\n".into() };
         let tool = |ok, diff| ChatItem::Tool { id: "t".into(), name: "Edit".into(), kind: ToolKind::Edit, target: "a".into(), input: String::new(), output: "out".into(), ok, diff };
         let (sock, _) = UnixStream::pair().unwrap();
-        let mut c = ChatView { key: (0, 1), seq: 0, writer: sock, start: 10, items: vec![tool(Some(true), vec![line('+')]), tool(Some(false), vec![]), tool(Some(true), vec![line('+'); SMALL_DIFF + 1])], laid: vec![None, None, None], loaded: true, loading: false, width: 0.0, open: HashMap::new(), top: None, max_top: 0.0, prepended: 0 };
+        let mut c = ChatView { slash: Slash::default(), key: (0, 1), seq: 0, writer: sock, start: 10, items: vec![tool(Some(true), vec![line('+')]), tool(Some(false), vec![]), tool(Some(true), vec![line('+'); SMALL_DIFF + 1])], laid: vec![None, None, None], loaded: true, loading: false, width: 0.0, open: HashMap::new(), top: None, max_top: 0.0, prepended: 0 };
         assert_eq!((c.is_open(0), c.is_open(1), c.is_open(2)), (true, true, false));
         c.toggle(0);
         assert!(!c.is_open(0) && c.open.get(&10) == Some(&false), "kept by conversation index");

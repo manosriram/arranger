@@ -51,6 +51,19 @@ impl Codex {
         let Some(text) = self.c.next_prompt() else { return Vec::new() };
         self.turn.clear();
         self.cancelled = false;
+        let command = crate::commands::name(&text);
+        if command == Some("compact") && text.trim() == "/compact" {
+            let id = self.c.id();
+            self.c.send(json!({"id":id,"method":"thread/compact/start","params":{"threadId":self.c.session}}));
+            return vec![Event::Prompt { text }];
+        }
+        if command == Some("review") {
+            let instructions = text.strip_prefix("/review").unwrap().trim();
+            let target = if instructions.is_empty() { json!({"type":"uncommittedChanges"}) } else { json!({"type":"custom","instructions":instructions}) };
+            let id = self.c.id();
+            self.c.send(json!({"id":id,"method":"review/start","params":{"threadId":self.c.session,"target":target,"delivery":"inline"}}));
+            return vec![Event::Prompt { text }];
+        }
         let mut params = json!({"threadId":self.c.session,"input":[{"type":"text","text":text,"text_elements":[]}],"turnTrigger":"user"});
         if !self.effort.is_empty() {
             params["effort"] = json!(self.effort);
@@ -213,6 +226,19 @@ impl Transport for Codex {
         }
     }
 
+    fn terminal(&self, text: &str) -> Option<String> {
+        let name = crate::commands::name(text)?;
+        if !crate::commands::names("codex").contains(&name) || name == "review" || (name == "compact" && text.trim() == "/compact") {
+            return None;
+        }
+        let quote = crate::commands::shell_quote;
+        Some(if self.c.session.is_empty() {
+            format!("codex {}", quote(text))
+        } else {
+            format!("codex resume {} {}", quote(&self.c.session), quote(text))
+        })
+    }
+
     fn line(&mut self, v: Value, events: &mut Vec<Event>) -> bool {
         let method = v["method"].as_str().unwrap_or("").to_string();
         let p = &v["params"];
@@ -312,6 +338,28 @@ mod tests {
         receive(&mut a, json!({"id":1,"result":{"thread":{"id":"th-2"}}}));
         assert_eq!(a.session(), "th-2");
         (a, out)
+    }
+
+    #[test]
+    fn slash_commands_use_protocol_methods_and_queue() {
+        let (mut a, _) = started(None, false);
+        a.prompt("/compact".into());
+        let compact = sent(&mut a);
+        assert_eq!(compact[0]["method"], "thread/compact/start");
+        assert_eq!(compact[0]["params"], json!({"threadId":"th-2"}));
+        assert!(a.prompt("/review".into()).is_empty());
+        receive(&mut a, json!({"method":"turn/completed","params":{"threadId":"th-2","turn":{"id":"compact","status":"completed"}}}));
+        let review = sent(&mut a);
+        assert_eq!(review[0]["method"], "review/start");
+        assert_eq!(review[0]["params"]["target"], json!({"type":"uncommittedChanges"}));
+        receive(&mut a, json!({"method":"turn/completed","params":{"threadId":"th-2","turn":{"id":"review","status":"completed"}}}));
+        a.prompt("/review focus on security".into());
+        assert_eq!(sent(&mut a)[0]["params"]["target"], json!({"type":"custom","instructions":"focus on security"}));
+        assert_eq!(a.terminal("/model"), Some("codex resume 'th-2' '/model'".into()));
+        assert!(a.terminal("/compact").is_none());
+        assert!(a.terminal("/review").is_none());
+        assert!(a.terminal("/tmp/file").is_none());
+        assert!(a.terminal("fix /model").is_none());
     }
 
     #[test]

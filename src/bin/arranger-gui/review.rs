@@ -15,10 +15,21 @@ const NOTE_X: f32 = 110.0;
 pub struct CheckOutput {
     command: String,
     output: String,
+    wrapped_lines: Vec<String>,
+    wrapped_width: Option<f32>,
     ok: Option<bool>,
     pub scroll: f32,
     next: Instant,
     pending: bool,
+}
+
+impl CheckOutput {
+    fn set_output(&mut self, output: String) {
+        if self.output != output {
+            self.output = output;
+            self.wrapped_width = None;
+        }
+    }
 }
 
 pub struct ReviewView {
@@ -307,14 +318,14 @@ impl App {
                                 proto::ChatItem::Tool { target, output, ok, .. } if target == command => Some((output, ok)),
                                 _ => None,
                             }) {
-                                check.output = output;
+                                check.set_output(output);
                                 check.ok = ok;
                             } else {
-                                check.output = "No output captured for this check.".into();
+                                check.set_output("No output captured for this check.".into());
                             }
                         }
                         Ok(Reply::Error(e)) | Err(e) => {
-                            check.output = format!("Output unavailable: {e}");
+                            check.set_output(format!("Output unavailable: {e}"));
                             check.next = Instant::now() + Duration::from_secs(60);
                         }
                         _ => {}
@@ -398,7 +409,7 @@ impl App {
                 self.focus = rest;
             }
             ReviewAction::Check(command, ok) => {
-                rv.check_output = Some(CheckOutput { command, ok, output: String::new(), scroll: 0.0, next: Instant::now(), pending: false });
+                rv.check_output = Some(CheckOutput { command, ok, output: String::new(), wrapped_lines: Vec::new(), wrapped_width: None, scroll: 0.0, next: Instant::now(), pending: false });
             }
             ReviewAction::Refresh => self.spawn_request(host, Tag::Review(id), Request::Review { id }),
             ReviewAction::File(i) => {
@@ -770,13 +781,21 @@ impl App {
         let logs = Rect::new(panel.x + 12.0, panel.y + 64.0, (panel.w - 24.0).max(1.0), (panel.h - 76.0).max(1.0));
         r.frame(logs, 4.0, t.term, t.border2);
         let body = Rect::new(logs.x + 10.0, logs.y + 10.0, (logs.w - 28.0).max(1.0), (logs.h - 20.0).max(1.0));
-        let output = if check.output.is_empty() { "Waiting for output…" } else { &check.output };
-        let lines: Vec<_> = output.lines().flat_map(|line| wrap(r, line, MONO, 12.0, body.w)).collect();
+        // Wrapping measures every character; only redo it when content or width changes.
+        if check.wrapped_width != Some(body.w) {
+            let output = if check.output.is_empty() { "Waiting for output…" } else { &check.output };
+            check.wrapped_lines = output.lines().flat_map(|line| wrap(r, line, MONO, 12.0, body.w)).collect();
+            check.wrapped_width = Some(body.w);
+        }
+        let lines = &check.wrapped_lines;
         let max = (lines.len() as f32 * 18.0 - body.h).max(0.0);
         check.scroll = check.scroll.min(max);
         r.set_clip(Some(body));
-        for (i, line) in lines.iter().enumerate() {
-            let y = body.y + i as f32 * 18.0 - (max - check.scroll);
+        let offset = max - check.scroll;
+        let first = (offset / 18.0).floor() as usize;
+        let end = (((offset + body.h) / 18.0).ceil() as usize).min(lines.len());
+        for (i, line) in lines.iter().enumerate().take(end).skip(first) {
+            let y = body.y + i as f32 * 18.0 - offset;
             if y + 18.0 >= body.y && y < body.y + body.h {
                 r.text(body.x, y, line, MONO, 12.0, 400, readable(t.text, t.term), body.w);
             }
