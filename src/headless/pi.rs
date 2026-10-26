@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn argv_carries_sessions_model_and_thinking() {
-        let (a, _) = start("pi", Path::new("/r"), "sonnet", "high", Some("/s/x.jsonl"), true);
+        let (a, _) = start("pi", Path::new("/r"), "sonnet", "high", "", Some("/s/x.jsonl"), true);
         assert_eq!(a, ["pi", "--mode", "rpc", "--fork", "/s/x.jsonl", "--model", "sonnet", "--thinking", "high"]);
         assert!(argv("", "", Some("/s/x.jsonl"), false).windows(2).any(|w| w == ["--session", "/s/x.jsonl"]));
         assert_eq!(argv("", "", Some(""), false), ["--mode", "rpc", "--continue"]);
@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn a_turn_from_prompt_to_agent_end() {
-        let (_, mut a) = start("pi", Path::new("/repo"), "", "", None, false);
+        let (_, mut a) = start("pi", Path::new("/repo"), "", "", "", None, false);
         assert_eq!(sent(&mut a)[0]["type"], "get_state");
         receive(&mut a, json!({"id":"arranger-state","type":"response","command":"get_state","success":true,"data":{"sessionFile":"/s/1.jsonl"}}));
         assert_eq!(a.session(), "/s/1.jsonl");
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn extension_dialogs_are_asks() {
-        let (_, mut a) = start("pi", Path::new("/repo"), "", "", None, false);
+        let (_, mut a) = start("pi", Path::new("/repo"), "", "", "", None, false);
         a.prompt("go".into());
         sent(&mut a);
         let confirm = json!({"type":"extension_ui_request","id":"u1","method":"confirm","title":"Run rm?","message":"rm -rf build"});

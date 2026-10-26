@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub const MAX_FRAME: usize = 16 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 19;
+pub const VERSION: u32 = 20;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -70,6 +70,8 @@ pub enum Request {
     /// Stop through the protected socket; never signal a PID read from a stale file.
     /// Append new variants so an old hook cannot be reinterpreted as a different operation.
     Shutdown,
+    /// Switch a headless task's permission mode (one of `headless::MODES`); kept for its revives.
+    SetMode { id: u64, mode: String },
 }
 
 /// What happens after the commit.
@@ -162,6 +164,9 @@ pub struct TaskInfo {
     /// Its reasoning effort ("" for the agent's default).
     #[serde(default)]
     pub effort: String,
+    /// A headless agent's permission mode ("" if it has none arranger can switch).
+    #[serde(default)]
+    pub mode: String,
     /// Which machine the GUI got this task from (an index into its machine list); not sent.
     #[serde(skip)]
     pub machine: usize,

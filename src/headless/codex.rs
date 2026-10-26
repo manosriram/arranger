@@ -303,7 +303,7 @@ mod tests {
     use super::*;
 
     fn started(session: Option<&str>, fork: bool) -> (Agent, Vec<Value>) {
-        let (argv, mut a) = start("/opt/bin/codex", Path::new("/repo"), "gpt-6", "high", session, fork);
+        let (argv, mut a) = start("/opt/bin/codex", Path::new("/repo"), "gpt-6", "high", "", session, fork);
         assert_eq!(argv, ["/opt/bin/codex", "app-server"]);
         assert_eq!(sent(&mut a)[0]["method"], "initialize");
         receive(&mut a, json!({"id":0,"result":{"userAgent":"codex"}}));
@@ -403,7 +403,7 @@ mod tests {
         receive(&mut a, json!({"method":"error","params":{"threadId":"th-2","willRetry":true,"error":{"message":"retrying"}}}));
         let events = receive(&mut a, json!({"method":"turn/completed","params":{"threadId":"th-2","turn":{"id":"t2","status":"failed","error":{"message":"usage limit"}}}}));
         assert_eq!(events, vec![Event::Error { message: "usage limit".into() }]);
-        let mut fresh = start("codex", Path::new("/repo"), "", "", None, false).1;
+        let mut fresh = start("codex", Path::new("/repo"), "", "", "", None, false).1;
         assert_eq!(receive(&mut fresh, json!({"id":0,"error":{"message":"not logged in"}})), vec![Event::Error { message: "codex didn't start: not logged in".into() }]);
     }
 }

@@ -60,6 +60,35 @@ pub trait Transport {
     fn echoes(&self) -> bool {
         true
     }
+    /// Its permission mode, one of `MODES` ("" if arranger can't switch it).
+    fn mode(&self) -> &str {
+        ""
+    }
+    /// Switches its permission mode to one of `MODES`.
+    fn set_mode(&mut self, _mode: &str) -> Result<(), String> {
+        Err("this agent's mode can't be switched from arranger".into())
+    }
+}
+
+/// The permission modes a chat can switch claude between, in Shift+Tab order: ask before acting,
+/// edit without asking, plan without acting. Bypassing approvals isn't offered.
+pub const MODES: &[&str] = &["default", "acceptEdits", "plan"];
+
+/// What a chat shows for `mode`.
+pub fn mode_label(mode: &str) -> &str {
+    match mode {
+        "default" => "ask before edits",
+        "acceptEdits" => "accept edits",
+        "plan" => "plan mode",
+        "bypassPermissions" => "bypass permissions",
+        "dontAsk" => "don't ask",
+        other => other,
+    }
+}
+
+/// The mode after `mode` in Shift+Tab order.
+pub fn next_mode(mode: &str) -> &'static str {
+    MODES.iter().position(|m| *m == mode).map_or(MODES[0], |i| MODES[(i + 1) % MODES.len()])
 }
 
 /// What every transport keeps: the turn, the queues and the bytes for stdin.
@@ -256,8 +285,9 @@ impl Agent {
 
 /// How to start task's agent headless: `program` is what the task runs (`claude`, a path to it);
 /// `session` the one to carry on ("" for the latest in `cwd`, where the agent has that);
-/// `fork` carries it on in a new session (a cloned task). Returns its argv and transport.
-pub fn start(program: &str, cwd: &Path, model: &str, effort: &str, session: Option<&str>, fork: bool) -> (Vec<String>, Agent) {
+/// `fork` carries it on in a new session (a cloned task); `mode` is the permission mode to start in
+/// (one of `MODES`, else the default). Returns its argv and transport.
+pub fn start(program: &str, cwd: &Path, model: &str, effort: &str, mode: &str, session: Option<&str>, fork: bool) -> (Vec<String>, Agent) {
     let mut argv = vec![program.to_string()];
     let t: Box<dyn Transport> = match adapter::kind(program) {
         "codex" => {
@@ -273,8 +303,9 @@ pub fn start(program: &str, cwd: &Path, model: &str, effort: &str, session: Opti
             Box::new(acp::Acp::new(cwd, session))
         }
         _ => {
-            argv.extend(claude::argv(model, effort, "", session, fork, cwd));
-            Box::new(claude::Claude::new(cwd))
+            let mode = if MODES.contains(&mode) { mode } else { MODES[0] };
+            argv.extend(claude::argv(model, effort, mode, session, fork, cwd));
+            Box::new(claude::Claude::new(cwd, mode))
         }
     };
     (argv, Agent { t, input: Default::default(), received: 0, failed: false })

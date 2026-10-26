@@ -2188,6 +2188,7 @@ impl App {
                     self.focus = self.rest();
                 }
             }
+            Key::Named(NamedKey::Tab) if focus == Focus::Message && shift => self.cycle_mode(),
             Key::Named(NamedKey::Enter) if matches!(focus, Focus::Prompt | Focus::Note | Focus::Message) && shift => self.insert("\n"),
             Key::Named(NamedKey::Enter) => match focus {
                 Focus::Note => self.actions.push(Action::Review(ReviewAction::SaveNote)),

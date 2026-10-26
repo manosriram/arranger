@@ -197,6 +197,7 @@ pub fn run() -> io::Result<()> {
         "cloned_from INTEGER",
         "headless INTEGER NOT NULL DEFAULT 0",
         "effort TEXT NOT NULL DEFAULT ''",
+        "mode TEXT NOT NULL DEFAULT ''",
     ] {
         let _ = db.execute(&format!("ALTER TABLE tasks ADD COLUMN {col}"), []);
     }
@@ -635,6 +636,17 @@ impl Daemon {
                 }
                 None => Reply::Error(format!("task {id} isn't running")),
             },
+            Request::SetMode { id, mode } => match self.tasks.get_mut(&id).and_then(|t| t.headless.as_mut()) {
+                Some(agent) => match agent.set_mode(&mode) {
+                    Ok(()) => {
+                        self.mode_changed(id);
+                        self.flush_agent(id);
+                        Reply::Ok
+                    }
+                    Err(e) => Reply::Error(e),
+                },
+                None => Reply::Error(format!("task {id} isn't running in a chat")),
+            },
             Request::Commit { id, message, ship } => match self.commit(t, id, &message, ship) {
                 Ok(()) => return, // JobDone comes when the script finishes
                 Err(e) => Reply::Error(e),
@@ -923,7 +935,7 @@ impl Daemon {
     fn output(&mut self, id: u64, bytes: &[u8]) {
         let task = self.tasks.get_mut(&id).unwrap();
         if let Some(agent) = &mut task.headless {
-            let session = agent.session().to_string();
+            let (session, mode) = (agent.session().to_string(), agent.mode().to_string());
             let (events, lines) = agent.feed(bytes);
             if agent.failed() {
                 let _ = rustix::process::kill_process_group(Pid::from_child(&task.pty.child), Signal::KILL);
@@ -931,6 +943,7 @@ impl Daemon {
             if agent.session() != session {
                 let _ = security::write_private(&headless::session_file(&self.data, id), agent.session().as_bytes());
             }
+            let mode_changed = agent.mode() != mode;
             task.log.extend_from_slice(&lines);
             if task.log.len() >= LOG_CHUNK {
                 flush_log(&log_path(&self.data, id, true), &mut task.log, &mut self.zstd);
@@ -938,6 +951,9 @@ impl Daemon {
             if let Some(chat) = self.chats.get_mut(&id).filter(|_| !lines.is_empty()) {
                 chat.feed(&lines);
                 self.chat_due.get_or_insert_with(|| Instant::now() + CHAT_EVERY);
+            }
+            if mode_changed {
+                self.mode_changed(id);
             }
             self.agent_events(id, events);
             return;
@@ -1096,6 +1112,13 @@ impl Daemon {
             None => {}
         }
         self.flush_agent(id);
+    }
+
+    /// Keeps a headless agent's new permission mode for its revives and clones, and tells watchers.
+    fn mode_changed(&mut self, id: u64) {
+        let Some(agent) = self.tasks.get(&id).and_then(|t| t.headless.as_ref()) else { return };
+        let _ = self.db.execute("UPDATE tasks SET mode = ?1 WHERE id = ?2", params![agent.mode(), id]);
+        self.dirty = true;
     }
 
     /// Writes what's pending for a headless agent's stdin, watching for room when it's full.
@@ -1321,8 +1344,8 @@ impl Daemon {
         let head = review::resolve(&from, "HEAD")?;
         self.db
             .execute(
-                "INSERT INTO tasks (agent, repo, branch, worktree, state, created, title, prompt, model, effort, cloned_from, headless)
-                 VALUES (?1, ?2, '', '', 'new', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO tasks (agent, repo, branch, worktree, state, created, title, prompt, model, effort, cloned_from, headless, mode)
+                 VALUES (?1, ?2, '', '', 'new', ?3, ?4, ?5, ?6, ?7, ?8, ?9, (SELECT mode FROM tasks WHERE id = ?8))",
                 params![agent, repo, now_secs(), title, prompt, model, effort, src, headless],
             )
             .map_err(e2s)?;
@@ -1362,17 +1385,17 @@ impl Daemon {
     /// Launches task `id`'s agent: its first prompt, or with `resume` its last session plus that prompt.
     /// `fork` carries on in a new session of its own (a cloned task's first start).
     fn spawn(&mut self, id: u64, resume: Option<&str>, fork: bool) -> Result<(), String> {
-        let (agent, repo, wt, prompt, model, effort, headless): (String, String, String, String, String, String, bool) = self
+        let (agent, repo, wt, prompt, model, effort, headless, mode): (String, String, String, String, String, String, bool, String) = self
             .db
-            .query_row("SELECT agent, repo, worktree, prompt, model, effort, headless FROM tasks WHERE id = ?1", [id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+            .query_row("SELECT agent, repo, worktree, prompt, model, effort, headless, mode FROM tasks WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
             })
             .map_err(e2s)?;
         let prompt = resume.unwrap_or(&prompt);
         let (argv, env, mut stdio) = if headless {
             // Its session, from the last run; "" (none yet) resumes the latest here.
             let session = resume.map(|_| fs::read_to_string(headless::session_file(&self.data, id)).unwrap_or_default());
-            let (argv, agent) = headless::start(&agent, Path::new(&wt), &model, &effort, session.as_deref().map(str::trim), fork);
+            let (argv, agent) = headless::start(&agent, Path::new(&wt), &model, &effort, &mode, session.as_deref().map(str::trim), fork);
             (argv, Vec::new(), Some(agent))
         } else {
             let session = resume.map(|_| fs::read_to_string(adapter::codex_session(&self.data, id)).unwrap_or_default());
@@ -1465,7 +1488,7 @@ impl Daemon {
         let mut stmt =
             self.db.prepare(
                 "SELECT id, agent, branch, worktree, state, title, created, summary, shipped,
-                 MAX(created, updated, COALESCE((SELECT MAX(ts) FROM events WHERE task = tasks.id) / 1000, 0)), model, cloned_from, headless, effort
+                 MAX(created, updated, COALESCE((SELECT MAX(ts) FROM events WHERE task = tasks.id) / 1000, 0)), model, cloned_from, headless, effort, mode
                  FROM tasks ORDER BY id",
             ).map_err(e2s)?;
         let rows = stmt.query_map([], |r| {
@@ -1489,6 +1512,7 @@ impl Daemon {
                 cloned_from: r.get(11)?,
                 headless: r.get(12)?,
                 effort: r.get(13)?,
+                mode: r.get(14)?,
                 machine: 0,
             })
         });
@@ -1500,6 +1524,9 @@ impl Daemon {
                 info.need = task.need.clone();
                 info.asking = self.asks.iter().any(|a| a.0 == info.id) || task.headless.as_ref().is_some_and(Agent::asking);
                 info.since = task.since;
+                if let Some(agent) = &task.headless {
+                    info.mode = agent.mode().to_string();
+                }
             }
             if with_files {
                 info.files = self.files(info.id).map_err(e2s)?;

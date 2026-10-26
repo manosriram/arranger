@@ -190,7 +190,7 @@ mod tests {
     use super::*;
 
     fn started(session: Option<&str>, caps: Value) -> (Agent, Value) {
-        let (argv, mut a) = start("gemini", Path::new("/repo"), "pro", "", session, false);
+        let (argv, mut a) = start("gemini", Path::new("/repo"), "pro", "", "", session, false);
         assert_eq!(argv, ["gemini", "--acp", "--model", "pro"]);
         assert_eq!(sent(&mut a)[0]["method"], "initialize");
         receive(&mut a, json!({"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":caps}}));

@@ -3,6 +3,7 @@
 //! the item it grows and a long thread draws only the rows on screen. Older items load a page at
 //! a time as you scroll up.
 use super::*;
+use arranger::headless;
 use arranger::proto::{ChatItem, ToolKind};
 use std::collections::HashMap;
 
@@ -506,6 +507,14 @@ impl App {
         }
     }
 
+    /// Shift+Tab: the selected chat's agent to its next permission mode.
+    pub(super) fn cycle_mode(&mut self) {
+        if let Some(task) = self.current().filter(|t| t.headless && !t.mode.is_empty() && is_live(&t.state)) {
+            let mode = headless::next_mode(&task.mode).to_string();
+            let _ = request_at(self.sock(task.machine).as_deref(), &Request::SetMode { id: task.id, mode });
+        }
+    }
+
     /// The conversation, what's waiting on you and the message box, in `sec` under the header.
     pub(super) fn draw_chat(&mut self, r: &mut Renderer, t: &Theme, sec: Rect, task: &TaskInfo, ended: bool) {
         let key = (task.machine, task.id);
@@ -729,6 +738,24 @@ impl App {
         for (k, what) in [("↵", "send"), ("⇧↵", "new line"), (esc, "interrupt")] {
             hx += r.text(hx, fy, k, UI, 11.0, 500, t.text3, 80.0) + 6.0;
             hx += r.text(hx, fy, what, UI, 11.0, 400, t.faint, 120.0) + 18.0;
+        }
+        // Its permission mode at the right; ⇧⇥ or a click moves to the next.
+        if !task.mode.is_empty() {
+            let label = headless::mode_label(&task.mode);
+            let ink = match task.mode.as_str() {
+                "acceptEdits" => t.needs,
+                "plan" => t.work,
+                _ => t.text3,
+            };
+            let (kw, lw) = (r.measure(UI, 11.0, 500, "⇧⇥"), r.measure(UI, 11.0, 500, label));
+            let mx = b.x + b.w - 2.0 - lw - 6.0 - kw;
+            if mx > hx {
+                r.text(mx, fy, "⇧⇥", UI, 11.0, 500, t.faint, kw + 2.0);
+                r.text(mx + kw + 6.0, fy, label, UI, 11.0, 500, ink, lw + 2.0);
+                if self.hit(r, Rect::new(mx - 4.0, fy - 4.0, kw + lw + 14.0, 20.0)) {
+                    self.cycle_mode();
+                }
+            }
         }
         outer.y
     }

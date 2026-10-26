@@ -27,7 +27,7 @@ macro_rules! eprintln {
 const USAGE: &str = "usage: arranger            open the workspace window
        arranger [ls [--files] | new [--headless|--terminal] [--effort <e>] <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
                  | approve <id> | deny <id> [reason] | events <id> | chat <id> | diff <id> | revert <id> <path> <hunk#>
-                 | run <id> [command ...] | send <id> <text> | interrupt <id> | revive <id> [prompt] | clone <id> [--model <m>] [prompt] | commit <id> [--merge|--pr] [message] | ping | stop | serve | hook <adapter>
+                 | run <id> [command ...] | send <id> <text> | interrupt <id> | mode <id> <default|acceptEdits|plan> | revive <id> [prompt] | clone <id> [--model <m>] [prompt] | commit <id> [--merge|--pr] [message] | ping | stop | serve | hook <adapter>
                  | machine [ls | add <name> <user@host> [repo] | rm <name>] | endpoint]";
 /// Ctrl-\, raw and in kitty keyboard encoding.
 const DETACH: &[&[u8]] = &[b"\x1c", b"\x1b[92;5u"];
@@ -78,6 +78,7 @@ fn main() {
         ["commit", id, ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, Ship::Commit)),
         ["new", ref rest @ ..] if !rest.is_empty() => new(rest),
         ["interrupt", id] => parse_id(id).and_then(|id| request(&Request::Interrupt { id }).map(drop)),
+        ["mode", id, mode] => parse_id(id).and_then(|id| request(&Request::SetMode { id, mode: mode.into() }).map(drop)),
         ["run", id, ref command @ ..] => parse_id(id).and_then(|id| run(id, command)),
         ["attach", id] => parse_id(id).and_then(attach),
         ["clone", id, "--model", model, ref text @ ..] => parse_id(id).and_then(|id| clone(id, Some(model), text)),

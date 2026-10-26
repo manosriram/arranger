@@ -4,7 +4,7 @@
 //! `scripts/parity.py` checks the API requests match. Never send a system prompt: leaving it out
 //! is what keeps Claude Code's own.
 
-use super::{Ask, Core, Transport, detail, error_message, string};
+use super::{Ask, Core, MODES, Transport, detail, error_message, string};
 use crate::adapter;
 use crate::proto::Event;
 use serde_json::{Value, json};
@@ -44,11 +44,15 @@ pub struct Claude {
     /// From its init message: the slash commands it runs headless, and those only its TUI has.
     commands: Vec<String>,
     terminal_commands: Vec<String>,
+    /// Its permission mode, as it last said or we last set it.
+    mode: String,
+    /// A mode switch it hasn't confirmed: (request id, the mode before it).
+    switching: Option<(String, String)>,
 }
 
 impl Claude {
-    pub fn new(cwd: &Path) -> Self {
-        let mut c = Claude { c: Core::new(cwd), commands: Vec::new(), terminal_commands: Vec::new() };
+    pub fn new(cwd: &Path, mode: &str) -> Self {
+        let mut c = Claude { c: Core::new(cwd), commands: Vec::new(), terminal_commands: Vec::new(), mode: mode.into(), switching: None };
         // No systemPrompt: that would replace Claude Code's.
         c.c.send(json!({"type":"control_request","request_id":"arranger-init","request":{"subtype":"initialize"}}));
         c
@@ -99,7 +103,11 @@ impl Transport for Claude {
             return Err("it's asking a question: answer with `arranger send`".into());
         }
         let ask = self.c.asks.pop_front().unwrap();
-        let response = if allow {
+        let response = if allow && ask.method == "ExitPlanMode" && self.mode == "plan" {
+            // Approving the plan leaves plan mode, as in its terminal: back to asking before edits.
+            self.mode = MODES[0].into();
+            json!({"behavior":"allow","updatedInput":ask.params["input"],"updatedPermissions":[{"type":"setMode","mode":MODES[0],"destination":"session"}]})
+        } else if allow {
             json!({"behavior":"allow","updatedInput":ask.params["input"]})
         } else {
             json!({"behavior":"deny","message":if message.is_empty() { "The user denied this" } else { message }})
@@ -120,6 +128,22 @@ impl Transport for Claude {
         }
     }
 
+    fn mode(&self) -> &str {
+        &self.mode
+    }
+
+    fn set_mode(&mut self, mode: &str) -> Result<(), String> {
+        if !MODES.contains(&mode) {
+            return Err(format!("unknown mode {mode:?}: one of {}", MODES.join(", ")));
+        }
+        // Sent after initialize, so it's taken even before claude has answered that.
+        let id = format!("arranger-mode-{}", self.c.id());
+        self.c.send(json!({"type":"control_request","request_id":id,"request":{"subtype":"set_permission_mode","mode":mode}}));
+        let before = std::mem::replace(&mut self.mode, mode.into());
+        self.switching = Some((id, before));
+        Ok(())
+    }
+
     /// Built-in commands its TUI has but stream-json doesn't (/permissions, /rewind…) and the ones
     /// it lists as terminal-only. Unknown commands go through: claude says they don't exist.
     fn terminal(&self, text: &str) -> Option<String> {
@@ -132,6 +156,11 @@ impl Transport for Claude {
     fn line(&mut self, v: Value, events: &mut Vec<Event>) -> bool {
         // Subagents' messages carry their parent's tool id; their own tools still ask through us.
         let subagent = !v["parent_tool_use_id"].is_null();
+        // Its init and status messages say which mode it's in (it leaves plan mode by itself, too).
+        if v["type"] == "system"
+            && let Some(mode) = v["permissionMode"].as_str() {
+            self.mode = mode.into();
+        }
         match v["type"].as_str().unwrap_or("") {
             "system" if v["subtype"] == "init" => {
                 self.c.session = string(&v["session_id"]);
@@ -145,6 +174,13 @@ impl Transport for Claude {
                     events.extend(self.start_next());
                 } else {
                     events.push(Event::Error { message: format!("claude didn't start: {}", string(&v["response"]["error"])) });
+                }
+            }
+            "control_response" if self.switching.as_ref().is_some_and(|(id, _)| v["response"]["request_id"] == id.as_str()) => {
+                // Refused: the chat shows the mode it stayed in. Not an error, which would stop the turn.
+                let (_, before) = self.switching.take().unwrap();
+                if v["response"]["subtype"] != "success" {
+                    self.mode = before;
                 }
             }
             "control_request" => {
@@ -233,7 +269,7 @@ mod tests {
     use crate::proto::ToolKind;
 
     fn new() -> Agent {
-        start("claude", Path::new("/repo"), "", "", None, false).1
+        start("claude", Path::new("/repo"), "", "", "", None, false).1
     }
 
     fn started() -> Agent {
@@ -362,6 +398,33 @@ mod tests {
         let sub = json!({"type":"assistant","parent_tool_use_id":"t1","message":{"content":[{"type":"text","text":"Sub."},{"type":"tool_use","name":"Read","input":{"file_path":"/repo/a.rs"}}]}});
         assert!(receive(&mut c, sub).is_empty());
         assert_eq!(receive(&mut c, result())[0], Event::Summary { text: "Main.".into() });
+    }
+
+    #[test]
+    fn modes_are_switched_reported_and_left_with_the_plan() {
+        let mut c = started();
+        assert_eq!(c.mode(), "default");
+        receive(&mut c, json!({"type":"system","subtype":"status","permissionMode":"acceptEdits"}));
+        assert_eq!(c.mode(), "acceptEdits", "its own reports win");
+        assert!(c.set_mode("bypassPermissions").is_err());
+        c.set_mode("plan").unwrap();
+        let out = sent(&mut c);
+        assert_eq!(out[0]["request"], json!({"subtype":"set_permission_mode","mode":"plan"}));
+        assert_eq!(c.mode(), "plan");
+        let id = out[0]["request_id"].clone();
+        receive(&mut c, json!({"type":"control_response","response":{"subtype":"success","request_id":id}}));
+        assert_eq!(c.mode(), "plan");
+        c.set_mode("default").unwrap();
+        let id = sent(&mut c)[0]["request_id"].clone();
+        let events = receive(&mut c, json!({"type":"control_response","response":{"subtype":"error","request_id":id,"error":"no"}}));
+        assert_eq!((c.mode(), events), ("plan", vec![]), "a refused switch keeps the old mode");
+        c.prompt("go".into());
+        sent(&mut c);
+        receive(&mut c, json!({"type":"control_request","request_id":"p1","request":{"subtype":"can_use_tool","tool_name":"ExitPlanMode","input":{"plan":"x"}}}));
+        c.answer(true, "").unwrap();
+        let out = sent(&mut c);
+        assert_eq!(out[0]["response"]["response"]["updatedPermissions"][0]["mode"], "default");
+        assert_eq!(c.mode(), "default");
     }
 
     #[test]
