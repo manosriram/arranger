@@ -707,6 +707,14 @@ impl ApplicationHandler<Msg> for App {
                     // Dev aid for screenshots (`ARRANGER_SELECT=<task id>`): start on that local task.
                     let pick = std::env::var("ARRANGER_SELECT").ok().and_then(|v| v.parse().ok()).map(|id| (0, id)).filter(|&k| self.task(k).is_some());
                     self.selected = pick.or_else(|| self.order().first().copied());
+                    // Snapshot a chat draft through the same composer and completion paths as typing.
+                    if std::env::var_os("ARRANGER_SNAPSHOT").is_some()
+                        && let Some(key) = self.selected
+                        && let Ok(draft) = std::env::var("ARRANGER_MESSAGE") {
+                        self.focus = Focus::Message;
+                        self.caret = Some((Focus::Message, draft.len()));
+                        self.drafts.insert(key, draft);
+                    }
                     // Show several checked tasks using the same selection path as V then j/j.
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_MULTISELECT").is_some() {
                         self.vim = true;
@@ -1986,7 +1994,7 @@ impl App {
             self.menu = false;
             return;
         }
-        if !app_mod(m) && !m.control_key() && !m.shift_key() && self.completion_key(&ev.logical_key) {
+        if !app_mod(m) && !m.control_key() && !m.shift_key() && (self.slash_key(&ev.logical_key) || self.completion_key(&ev.logical_key)) {
             return;
         }
         if let Some(d) = self.dialog.as_ref().filter(|_| ev.logical_key == Key::Named(NamedKey::Tab)) {

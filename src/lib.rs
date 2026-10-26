@@ -4,6 +4,7 @@
 pub mod adapter;
 pub mod chat;
 pub mod client;
+pub mod commands;
 pub mod daemon;
 pub mod headless;
 pub mod machine;

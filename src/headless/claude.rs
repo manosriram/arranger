@@ -212,7 +212,7 @@ impl Transport for Claude {
 /// Interactive claude's own commands that stream-json leaves out of `slash_commands`.
 const TUI_COMMANDS: &[&str] = &[
     "add-dir", "bashes", "bug", "doctor", "exit", "export", "feedback", "help", "hooks", "ide", "install-github-app",
-    "keybindings", "login", "logout", "memory", "permissions", "plugin", "plugins", "privacy-settings", "quit",
+    "keybindings", "login", "logout", "memory", "model", "permissions", "plugin", "plugins", "privacy-settings", "quit", "skills",
     "release-notes", "resume", "rewind", "sandbox", "status", "statusline", "terminal-setup", "theme", "upgrade", "vim",
 ];
 
