@@ -1552,6 +1552,14 @@ impl App {
             self.answering = None;
             return;
         }
+        // A permission ask the daemon is holding: y allows it once, n denies it.
+        if (key == "y" || key == "n") && self.machine_tasks.is_none() && self.review.is_none() {
+            if let Some(t) = self.current().filter(|t| t.asking && matches!(t.need, Some(Event::PermissionRequest { .. }))) {
+                self.actions.push(Action::Answer((t.machine, t.id), key == "y"));
+                self.answering = None;
+                return;
+            }
+        }
         // The agent's menu is up: j/k move through it and ↵ picks, back in its terminal; Esc or i
         // leave it be.
         if self.answering.is_some() && self.machine_tasks.is_none() && self.review.is_none() {
