@@ -425,6 +425,14 @@ mod tests {
         let out = sent(&mut c);
         assert_eq!(out[0]["response"]["response"]["updatedPermissions"][0]["mode"], "default");
         assert_eq!(c.mode(), "default");
+        c.set_mode("auto").unwrap();
+        let out = sent(&mut c);
+        assert_eq!(out[0]["request"], json!({"subtype":"set_permission_mode","mode":"auto"}));
+        let id = out[0]["request_id"].clone();
+        receive(&mut c, json!({"type":"control_response","response":{"subtype":"error","request_id":id,"error":"auto mode isn't enabled"}}));
+        assert_eq!(c.mode(), "default", "an account without auto mode stays where it was");
+        let cycle: Vec<_> = std::iter::successors(Some("default"), |m| Some(crate::headless::next_mode(m))).take(5).collect();
+        assert_eq!(cycle, ["default", "acceptEdits", "plan", "auto", "default"]);
     }
 
     #[test]

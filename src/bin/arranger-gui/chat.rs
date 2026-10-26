@@ -833,6 +833,7 @@ impl App {
             let ink = match task.mode.as_str() {
                 "acceptEdits" => t.needs,
                 "plan" => t.work,
+                "auto" => t.done,
                 _ => t.text3,
             };
             let (kw, lw) = (r.measure(UI, 11.0, 500, "⇧⇥"), r.measure(UI, 11.0, 500, label));

@@ -71,8 +71,9 @@ pub trait Transport {
 }
 
 /// The permission modes a chat can switch claude between, in Shift+Tab order: ask before acting,
-/// edit without asking, plan without acting. Bypassing approvals isn't offered.
-pub const MODES: &[&str] = &["default", "acceptEdits", "plan"];
+/// edit without asking, plan without acting, let claude's classifier decide what needs asking.
+/// Bypassing approvals isn't offered.
+pub const MODES: &[&str] = &["default", "acceptEdits", "plan", "auto"];
 
 /// What a chat shows for `mode`.
 pub fn mode_label(mode: &str) -> &str {
@@ -80,6 +81,7 @@ pub fn mode_label(mode: &str) -> &str {
         "default" => "ask before edits",
         "acceptEdits" => "accept edits",
         "plan" => "plan mode",
+        "auto" => "auto mode",
         "bypassPermissions" => "bypass permissions",
         "dontAsk" => "don't ask",
         other => other,
