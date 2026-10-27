@@ -1159,7 +1159,7 @@ fn pipeline(t: &Theme, task: &TaskInfo) -> Vec<(String, Rgba)> {
     };
     let review = if task.shipped.is_empty() { todo } else { done };
     let merge = if task.shipped == "merged" { done } else { todo };
-    let stages = [("Setup", setup), ("Working", working), ("Checks", checks), ("Summary", todo), ("Review", review), ("Merge", merge)];
+    let stages = [("Setup", setup), ("Working", working), ("Checks", checks), ("Summary", match task.summary_state.as_str() { "ready" => done, "running" => ("●", t.work), "error" => ("✗", t.del), _ => todo }), ("Review", review), ("Merge", merge)];
     let mut parts = Vec::new();
     for (i, (name, (mark, color))) in stages.into_iter().enumerate() {
         let sep = if i == 0 { "" } else { "  " };

@@ -47,6 +47,15 @@ pub struct Run {
 /// Starts `planner` in `cwd` on `prompt`, read-only, answering with JSON matching `schema`.
 /// `name` keeps its files apart from other runs' in `dir`.
 pub fn start(planner: Planner, cwd: &Path, prompt: &str, schema: &Value, model: &str, dir: &Path, name: &str) -> io::Result<Run> {
+    start_inner(planner, cwd, prompt, schema, model, dir, name, None)
+}
+
+/// Fork the task session when supported. Other agents get a fresh read-only run with the diff.
+pub fn start_summary(planner: Planner, cwd: &Path, prompt: &str, model: &str, dir: &Path, name: &str, agent: &str, session: &str, exe: &Path) -> io::Result<Run> {
+    start_inner(planner, cwd, prompt, &crate::summary::schema(), model, dir, name, Some((agent, session, exe)))
+}
+
+fn start_inner(planner: Planner, cwd: &Path, prompt: &str, schema: &Value, model: &str, dir: &Path, name: &str, summary: Option<(&str, &str, &Path)>) -> io::Result<Run> {
     crate::security::private_dir(dir)?;
     let file = |ext: &str| dir.join(format!("{name}.{ext}"));
     let files = [file("prompt"), file("schema.json"), file("out"), file("err")];
@@ -54,12 +63,23 @@ pub fn start(planner: Planner, cwd: &Path, prompt: &str, schema: &Value, model: 
     crate::security::write_private(&files[1], schema.to_string().as_bytes())?;
     let mut cmd = match &planner {
         Planner::Claude => {
-            let mut c = Command::new("claude");
+            let binary = summary.filter(|(a, _, _)| crate::adapter::kind(a) == "claude").map_or("claude", |(a, _, _)| a);
+            let mut c = Command::new(binary);
+            if let Some((_, session, _)) = summary.filter(|(_, s, _)| !s.is_empty()) {
+                c.args(["--resume", session, "--fork-session"]);
+            }
             c.args(["-p", "--output-format", "json", "--json-schema", &schema.to_string()]);
             c.args(["--tools", "Read,Grep,Glob", "--no-session-persistence"]);
             if !model.is_empty() {
                 c.args(["--model", model]);
             }
+            c
+        }
+        Planner::Codex if summary.is_some() => {
+            let (agent, session, exe) = summary.unwrap();
+            let binary = if crate::adapter::kind(agent) == "codex" { agent } else { "codex" };
+            let mut c = Command::new(exe);
+            c.args(["internal-summary-codex", binary, session, model]);
             c
         }
         Planner::Codex => {
@@ -82,14 +102,16 @@ pub fn start(planner: Planner, cwd: &Path, prompt: &str, schema: &Value, model: 
         cmd.env_remove(key);
     }
     // codex writes its answer to -o and its progress to stdout: keep that out of the answer.
-    let stdout = if planner == Planner::Codex { file("log") } else { files[2].clone() };
+    let stdout = if planner == Planner::Codex && summary.is_none() { file("log") } else { files[2].clone() };
     let child = cmd
+        .env("ARRANGER_SIDE_KIND", if summary.is_some() { "summary" } else { "plan" })
         .current_dir(cwd)
         .stdin(fs::File::open(&files[0])?)
         .stdout(crate::security::private_file(&stdout, true)?)
         .stderr(crate::security::private_file(&files[3], true)?)
         .process_group(0)
         .spawn()?;
+    let planner = if planner == Planner::Codex && summary.is_some() { Planner::Program(PathBuf::new()) } else { planner };
     Ok(Run { child, planner, files })
 }
 
@@ -172,4 +194,20 @@ mod tests {
         assert!(fs::read_dir(dir.join("side")).unwrap().next().is_none(), "its files are removed");
         let _ = fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn claude_summary_forks_without_writing_the_working_session() {
+        let dir = std::env::temp_dir().join(format!("arranger-summary-claude-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("claude");
+        fs::write(&binary, "#!/bin/sh\nprintf '%s\n' \"$@\" > args\ncat >/dev/null\nprintf '{\"structured_output\":{\"title\":\"Forked\"}}'\n").unwrap();
+        fs::set_permissions(&binary, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let mut run = start_summary(Planner::Claude, &dir, "Summarize", "", &dir.join("side"), "summary", binary.to_str().unwrap(), "working-session", Path::new("unused")).unwrap();
+        let ok = run.child.wait().unwrap().success();
+        assert_eq!(run.finish(ok).unwrap().0["title"], "Forked");
+        let args = fs::read_to_string(dir.join("args")).unwrap();
+        assert!(args.contains("--resume\nworking-session\n--fork-session\n"), "{args}");
+        assert!(args.contains("--tools\nRead,Grep,Glob\n--no-session-persistence"), "{args}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
 }

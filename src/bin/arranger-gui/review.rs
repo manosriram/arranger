@@ -48,6 +48,8 @@ pub struct ReviewView {
     pub notes: Vec<Note>,
     pub editing: Option<usize>,
     pub message: String,
+    refreshed: Instant,
+    default_message: String,
     status: String,
     error: bool,
     busy: bool,
@@ -67,7 +69,7 @@ pub const FLASH: Duration = Duration::from_millis(2000);
 impl ReviewView {
     /// Something on screen moves: the button's dots while busy, or its confirmation fading.
     pub fn animating(&self) -> bool {
-        self.check_output.is_some() || self.busy || self.flash.as_ref().is_some_and(|f| f.1.elapsed() < FLASH)
+        self.data.as_ref().is_some_and(|d| d.summary_state == "running") || self.check_output.is_some() || self.busy || self.flash.as_ref().is_some_and(|f| f.1.elapsed() < FLASH)
     }
 }
 
@@ -84,7 +86,9 @@ pub enum ReviewAction {
     Close,
     Run,
     Refresh,
-    Check(String, Option<bool>),
+    GenerateSummary,
+    PlanChecks,
+    Check,
     File(usize),
     Split(bool),
     Revert(String, String),
@@ -107,6 +111,7 @@ pub enum ReviewAction {
 
 pub enum Tag {
     Review(u64),
+    Summary,
     CheckOutput(u64, String),
     /// A background diff for the Review tab's enabled state.
     Changes(crate::TaskKey),
@@ -251,7 +256,9 @@ impl App {
             accepted: HashSet::new(),
             notes: Vec::new(),
             editing: None,
+            default_message: message.clone(),
             message,
+            refreshed: Instant::now(),
             status: "Loading…".into(),
             error: false,
             busy: false,
@@ -340,12 +347,22 @@ impl App {
                 }
             }
             (Tag::Review(id), Ok(Reply::Review(data))) if id == rv.task => {
+                rv.refreshed = Instant::now();
+                if let Some(s) = data.work_summary.as_ref().filter(|s| s.tree == data.tree && data.summary_state == "ready") {
+                    let message = arranger::summary::message(s);
+                    if rv.message == rv.default_message { rv.message = message.clone(); }
+                    rv.default_message = message;
+                } else if data.summary_state == "stale" && rv.message == rv.default_message {
+                    rv.message.clear();
+                    rv.default_message.clear();
+                }
                 rv.file = rv.file.min(data.files.len().saturating_sub(1));
                 rv.data = Some(data);
                 if !rv.busy && !rv.error {
                     rv.status.clear();
                 }
             }
+            (Tag::Summary, Ok(_)) => refresh = true,
             (Tag::Revert | Tag::Resolve, Ok(_)) => refresh = true,
             (Tag::Commit, Ok(Reply::JobDone { ok, output })) => {
                 rv.busy = false;
@@ -371,6 +388,7 @@ impl App {
                 rv.shipped = Some((line, ok));
                 refresh = true;
             }
+            (Tag::Commit, Err(e)) => { rv.busy = false; rv.status = e; rv.error = true; refresh = true; },
             (Tag::Commit, _) => rv.busy = false,
             (Tag::Note, Ok(_)) => {
                 rv.status = "Sent to the agent".into();
@@ -415,8 +433,12 @@ impl App {
                 self.review = None;
                 self.focus = rest;
             }
-            ReviewAction::Check(command, ok) => {
-                rv.check_output = Some(CheckOutput { command, ok, output: String::new(), wrapped_lines: Vec::new(), wrapped_width: None, scroll: 0.0, next: Instant::now(), pending: false });
+            ReviewAction::Check => self.open_checks(),
+            ReviewAction::GenerateSummary => self.spawn_request(host, Tag::Summary, Request::GenerateSummary { id }),
+            ReviewAction::PlanChecks => {
+                let reply = request_at(self.sock(host).as_deref(), &Request::RunChecks { id, checks: Vec::new() });
+                if let Err(e) = reply { self.review.as_mut().unwrap().status = e.to_string(); }
+                else { self.open_checks(); }
             }
             ReviewAction::Refresh => self.spawn_request(host, Tag::Review(id), Request::Review { id }),
             ReviewAction::File(i) => {
@@ -488,7 +510,8 @@ impl App {
                 .into();
                 let message = rv.message.clone();
                 self.focus = rest;
-                self.spawn_request(host, Tag::Commit, Request::Commit { id, message, ship });
+                let force = ship == Ship::Merge && rv.data.as_ref().is_some_and(|d| !matches!(d.verification.as_str(), "passed" | "accepted" | "skipped"));
+                self.spawn_request(host, Tag::Commit, Request::Commit { id, message, ship, force });
             }
             ReviewAction::ShipMenu(open) => rv.ship_menu = open.then(Rect::default),
             ReviewAction::AskResolve => {
@@ -535,6 +558,11 @@ impl App {
     }
 
     pub fn draw_review(&mut self, r: &mut Renderer, t: &Theme, area: Rect) {
+        if let Some(rv) = self.review.as_mut().filter(|r| r.data.as_ref().is_some_and(|d| d.summary_state == "running") && r.refreshed.elapsed() > Duration::from_secs(1)) {
+            rv.refreshed = Instant::now();
+            let (host, id) = (rv.host, rv.task);
+            self.spawn_request(host, Tag::Review(id), Request::Review { id });
+        }
         let Some(rv) = self.review.as_ref() else { return };
         let task = self.task((rv.host, rv.task)).cloned();
         let agent = task.as_ref().map(|t| adapter::kind(&t.agent).to_string()).unwrap_or_default();
@@ -617,6 +645,24 @@ impl App {
         let section = |r: &mut Renderer, y: f32, label: &str| {
             r.text(rail.x + 16.0, y, label, UI, 11.0, 500, t.text3, 200.0);
         };
+        if let Some(d) = &rv.data {
+            let (label, color) = match d.verification.as_str() {
+                "passed" => ("Passed on this exact diff", t.add),
+                "accepted" => ("Failed checks accepted", t.needs),
+                "skipped" => ("No checks needed for this diff", t.add),
+                "stale" => ("Checks are out of date", t.needs),
+                "failed" => ("Checks failed", t.del),
+                "running" | "planning" => ("Checks running", t.work),
+                _ => ("This diff is unverified", t.needs),
+            };
+            r.text(rail.x + 16.0, y, label, UI, 12.0, 500, color, rail.w - 32.0);
+            y += 25.0;
+            let b = Rect::new(rail.x + 16.0, y, 100.0, 26.0);
+            r.frame(b, 0.0, t.bg, t.border2);
+            r.text(b.x + 9.0, r.center(b, UI, 12.0), "Run checks", UI, 12.0, 500, t.text, b.w);
+            if self.hit(r, b) { acts.push(ReviewAction::PlanChecks); }
+            y += 40.0;
+        }
         section(r, y, "FILES");
         y += 22.0;
         if files.is_empty() && rv.data.is_some() {
@@ -651,6 +697,9 @@ impl App {
                 acts.push(ReviewAction::File(i));
             }
             y += 34.0;
+            if let Some(change) = rv.data.as_ref().and_then(|d| d.work_summary.as_ref().filter(|s| s.tree == d.tree)).and_then(|s| s.files.iter().find(|(path, _)| path == &f.path)).map(|(_, change)| change) {
+                y = draw_markdown(r, t, change, rail.x + 24.0, y, self.rail_w - 40.0) + 8.0;
+            }
         }
         if let Some(d) = rv.data.as_ref().filter(|d| !d.checks.is_empty()) {
             y += 18.0;
@@ -667,8 +716,21 @@ impl App {
                 let lw = r.measure(MONO, 12.0, 400, label);
                 r.text(row.x + 21.0, r.center(row, MONO, 12.0), cmd, MONO, 12.0, 400, t.tc, row.w - 30.0 - lw);
                 r.text(row.x + row.w - lw, r.center(row, MONO, 12.0), label, MONO, 12.0, 400, if ok.is_none() { t.needs } else { t.text3 }, lw + 2.0);
-                if self.hit(r, row) { acts.push(ReviewAction::Check(cmd.clone(), *ok)); }
+                if self.hit(r, row) { acts.push(ReviewAction::Check); }
                 y += 28.0;
+            }
+        }
+        if let Some(d) = &rv.data {
+            y += 14.0;
+            let status = format!("Summary: {}", d.summary_state);
+            r.text(rail.x + 16.0, y, &status, UI, 11.5, 500, if d.summary_state == "ready" { t.add } else { t.needs }, rail.w - 32.0);
+            y += 22.0;
+            if d.summary_state != "running" {
+                let b = Rect::new(rail.x + 16.0, y, 160.0, 26.0);
+                r.frame(b, 0.0, t.bg, t.border2);
+                r.text(b.x + 9.0, r.center(b, UI, 12.0), "Regenerate summary", UI, 12.0, 500, t.text, b.w);
+                if self.hit(r, b) { acts.push(ReviewAction::GenerateSummary); }
+                y += 32.0;
             }
         }
         if let Some(summary) = rv.data.as_ref().map(|d| d.summary.trim()).filter(|s| !s.is_empty()) {
@@ -1061,9 +1123,11 @@ impl App {
         let branch = rv.data.as_ref().map_or("", |d| d.branch.as_str());
         // Conflicts turn the main button into asking the agent; ▾ then settles them by side instead.
         let conflicted = rv.data.as_ref().is_some_and(|d| !d.conflicts.is_empty());
+        let force_merge = rv.data.as_ref().is_some_and(|d| !matches!(d.verification.as_str(), "passed" | "accepted" | "skipped"));
         let merge_label = match (conflicted, ended) {
             (true, false) => format!("Ask {agent} to resolve"),
             (true, true) => format!("Revive {agent} to resolve"),
+            _ if force_merge => "Force merge".to_string(),
             _ if base.is_empty() => "Merge".to_string(),
             _ => format!("Merge into {base}"),
         };
@@ -1100,6 +1164,7 @@ impl App {
         let fill = match flash {
             Some((_, k)) => blend(t.done, t.primary_bg, ((k - 0.8) / 0.2).clamp(0.0, 1.0)),
             None if idle => t.raised,
+            None if force_merge && !conflicted => dim(t.del),
             None => dim(t.primary_bg),
         };
         r.rect(ship, 4.0, fill);

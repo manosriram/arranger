@@ -209,5 +209,16 @@ Phases 1–3 were carried forward from worktree 143. Phase 4 now includes editab
 reports in the GUI, acceptance tied to the checked tree, needs-you status, rerunning the
 latest list, and persisted auto-fix rounds (default 0; configurable in Checks or the CLI).
 Auto-fix rounds reset when checks pass or a prompt is sent through Arranger. The report
-composer also works for terminal tasks. Summary generation and review/merge gates remain
-phases 5–6.
+composer also works for terminal tasks. Phases 5–6 are now implemented too:
+
+- Structured summaries are stored by task and tree, generated after passing/skipped/accepted
+  checks, and refreshed on request. Claude resumes a fork; Codex uses a separate app-server
+  thread fork. Missing sessions and other agents use fresh read-only runs with context.
+- Review shows verification and summary freshness, per-file notes, and defaults the commit
+  message from a matching summary. Verification is taken from Arranger's actual runs.
+- Normal merges require a matching passed/skipped/accepted run. Stale merge attempts request
+  checks; the GUI exposes Force merge and the CLI requires --force for an override.
+- Merge preparation never updates the base. If integrating the base changes the tree, the last
+  check list runs again; only a successful run allows the final fast-forward. Snapshot changes,
+  changed commit-hook output, further base moves, or interrupted/failed checks block that update.
+- Tests use fake Claude/Codex processes; no paid model calls are made by the test suite.

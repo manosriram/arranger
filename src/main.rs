@@ -27,8 +27,8 @@ macro_rules! eprintln {
 const USAGE: &str = "usage: arranger            open the workspace window
        arranger [ls [--files] | new [--headless|--terminal] [--effort <e>] <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
                  | approve <id> | deny <id> [reason] | events <id> | chat <id> | diff <id> | revert <id> <path> <hunk#>
-                 | run <id> [command ...] | send <id> <text> | interrupt <id> | mode <id> <default|acceptEdits|plan> | revive <id> [prompt] | clone <id> [--model <m>] [prompt] | commit <id> [--merge|--pr] [message]
-                 | setup <id> [approve|skip|retry|replan|log] | checks <id> [--run [--wait] <command> ... | --stop | --approve [--always] | --drop <command> | --log <check> | --report | --accept] | settings auto_fix [0..10] | ping | stop | serve | hook <adapter>
+                 | run <id> [command ...] | send <id> <text> | interrupt <id> | mode <id> <default|acceptEdits|plan> | revive <id> [prompt] | clone <id> [--model <m>] [prompt] | commit <id> [--merge [--force]|--pr] [message]
+                 | setup <id> [approve|skip|retry|replan|log] | checks <id> [--run [--wait] <command> ... | --stop | --approve [--always] | --drop <command> | --log <check> | --report | --accept] | summary <id> [--regenerate] | settings auto_fix [0..10] | ping | stop | serve | hook <adapter>
                  | machine [ls | add <name> <user@host> [repo] | rm <name>] | endpoint]";
 /// Ctrl-\, raw and in kitty keyboard encoding.
 const DETACH: &[&[u8]] = &[b"\x1c", b"\x1b[92;5u"];
@@ -37,6 +37,12 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args[..] {
+        ["internal-summary-codex", binary, session, model] => arranger::summary::codex_worker(binary, session, model),
+        ["summary", id, "--regenerate"] => parse_id(id).and_then(|id| request(&Request::GenerateSummary { id }).map(drop)),
+        ["summary", id] => parse_id(id).and_then(|id| match request(&Request::Review { id })? {
+            Reply::Review(data) => { println!("Summary: {}\n{}", data.summary_state, data.summary); Ok(()) },
+            reply => Err(unexpected(reply)),
+        }),
         ["serve"] => daemon::run(),
         [] => gui(),
         ["ls"] => ls(false),
@@ -74,9 +80,10 @@ fn main() {
         ["revive", id, ref text @ ..] => {
             parse_id(id).and_then(|id| request(&Request::Revive { id, prompt: text.join(" ") }).map(drop))
         }
-        ["commit", id, "--merge", ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, Ship::Merge)),
-        ["commit", id, "--pr", ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, Ship::Pr)),
-        ["commit", id, ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, Ship::Commit)),
+        ["commit", id, "--merge", "--force", ref msg @ ..] | ["commit", id, "--force", "--merge", ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, Ship::Merge, true)),
+        ["commit", id, "--merge", ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, Ship::Merge, false)),
+        ["commit", id, "--pr", ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, Ship::Pr, false)),
+        ["commit", id, ref msg @ ..] => parse_id(id).and_then(|id| commit(id, msg, Ship::Commit, false)),
         ["new", ref rest @ ..] if !rest.is_empty() => new(rest),
         ["interrupt", id] => parse_id(id).and_then(|id| request(&Request::Interrupt { id }).map(drop)),
         ["mode", id, mode] => parse_id(id).and_then(|id| request(&Request::SetMode { id, mode: mode.into() }).map(drop)),
@@ -94,6 +101,7 @@ fn main() {
         ["checks", id, "--drop", command] => parse_id(id).and_then(|id| request(&Request::DropCheck { id, command: command.into() }).map(drop)),
         ["checks", id, "--stop"] => parse_id(id).and_then(|id| request(&Request::StopChecks { id }).map(drop)),
         ["checks", _, "--log", check] => parse_id(check).and_then(print_console),
+        ["checks", id, "--run"] => parse_id(id).and_then(|id| request(&Request::RunChecks { id, checks: Vec::new() }).map(drop)),
         ["checks", id, "--run", "--wait", ref commands @ ..] if !commands.is_empty() => parse_id(id).and_then(|id| run_checks(id, commands, true)),
         ["checks", id, "--run", ref commands @ ..] if !commands.is_empty() => parse_id(id).and_then(|id| run_checks(id, commands, false)),
         ["setup", id] => parse_id(id).and_then(show_setup),
@@ -340,6 +348,7 @@ fn diff(id: u64) -> io::Result<()> {
     let reply = request(&Request::Review { id })?;
     let Reply::Review(r) = reply else { return Err(unexpected(reply)) };
     println!("{} -> {}", r.branch, r.base);
+    println!("Checks: {} · Summary: {}", r.verification, r.summary_state);
     for f in r.files {
         println!("\n{} {}  +{} -{}{}", f.status, f.path, f.added, f.removed, if f.binary { "  (binary)" } else { "" });
         for (i, h) in f.hunks.iter().enumerate() {
@@ -370,8 +379,8 @@ fn revert(id: u64, path: &str, hunk: &str) -> io::Result<()> {
     request(&Request::Revert { id, path: path.into(), header }).map(drop)
 }
 
-fn commit(id: u64, message: &[&str], ship: Ship) -> io::Result<()> {
-    match request(&Request::Commit { id, message: message.join(" "), ship })? {
+fn commit(id: u64, message: &[&str], ship: Ship, force: bool) -> io::Result<()> {
+    match request(&Request::Commit { id, message: message.join(" "), ship, force })? {
         Reply::JobDone { ok, output } => {
             println!("{output}");
             if ok { Ok(()) } else { Err(io::Error::other("commit failed")) }

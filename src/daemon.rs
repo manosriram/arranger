@@ -3,6 +3,7 @@
 use crate::adapter::{self, Osc};
 use crate::chat::Chat;
 use crate::checks;
+use std::os::unix::process::CommandExt;
 use crate::console::Console;
 use crate::headless::{self, Agent};
 use crate::proto::{self, Event, Reply, Request, Ship, TaskInfo};
@@ -118,6 +119,8 @@ struct Job {
     /// The worktree's HEAD when the job started.
     head: String,
     ship: Ship,
+    /// Merge preparation ends before checks and the final fast-forward.
+    merge: Option<MergePending>,
 }
 
 struct Daemon {
@@ -157,6 +160,25 @@ struct Daemon {
     check_plans: HashMap<u64, CheckPlan>,
     /// Tasks whose turn just ended, and when to see whether it needs checks.
     auto_due: HashMap<u64, Instant>,
+    summaries: HashMap<u64, SummaryRun>,
+    merges: HashMap<u64, MergePending>,
+}
+
+struct SummaryRun {
+    tree: String,
+    verified_by: Vec<String>,
+    side: side::Run,
+    deadline: Instant,
+}
+
+#[derive(Clone)]
+struct MergePending {
+    conn: Token,
+    tree: String,
+    message: String,
+    base: String,
+    force: bool,
+    checks: Vec<proto::CheckSpec>,
 }
 
 /// A side-run planning a task's checks after its turn.
@@ -284,6 +306,9 @@ pub fn run() -> io::Result<()> {
             name TEXT NOT NULL, command TEXT NOT NULL, why TEXT NOT NULL, state TEXT NOT NULL, exit INTEGER,
             started INTEGER NOT NULL DEFAULT 0, ended INTEGER NOT NULL DEFAULT 0);
          CREATE INDEX IF NOT EXISTS checks_run ON checks (run);
+         CREATE TABLE IF NOT EXISTS summaries (task INTEGER NOT NULL, tree TEXT NOT NULL, state TEXT NOT NULL,
+            json TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', updated INTEGER NOT NULL, PRIMARY KEY(task, tree));
+         UPDATE summaries SET state = 'error', error = 'Interrupted by daemon restart' WHERE state = 'running';
          CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS approved_checks (repo TEXT NOT NULL, command TEXT NOT NULL, PRIMARY KEY (repo, command));
          CREATE TABLE IF NOT EXISTS dropped_checks (task INTEGER NOT NULL, command TEXT NOT NULL, PRIMARY KEY (task, command));",
@@ -337,6 +362,8 @@ pub fn run() -> io::Result<()> {
         consoles: HashMap::new(),
         check_plans: HashMap::new(),
         auto_due: HashMap::new(),
+        summaries: HashMap::new(),
+        merges: HashMap::new(),
     };
     d.start_queued();
 
@@ -379,6 +406,7 @@ pub fn run() -> io::Result<()> {
         d.time_out_setups();
         d.time_out_checks();
         d.auto_checks();
+        d.reap_summaries();
         let expired: Vec<Token> = d.conns.iter().filter(|(_, c)| (!c.received || !c.inbuf.is_empty()) && c.last_input.elapsed() > Duration::from_secs(30)).map(|(&t, _)| t).collect();
         for t in expired { d.close(t); }
         if d.dirty {
@@ -484,34 +512,6 @@ fn write_pty(master: &OwnedFd, mut bytes: &[u8]) {
             Err(_) => return,
         }
     }
-}
-
-/// The latest result of each check-like command (tests, builds, linters) the agent ran.
-fn checks(events: &[(u64, Event)]) -> Vec<(String, Option<bool>)> {
-    const WORDS: &[&str] = &["test", "build", "check", "lint", "clippy", "fmt", "tsc", "eslint", "vet", "bench", "make"];
-    let mut out: Vec<(String, Option<bool>)> = Vec::new();
-    let mut running: Option<String> = None;
-    for (_, e) in events {
-        match e {
-            Event::ToolStart { kind: proto::ToolKind::Bash, target } => {
-                let lower = target.to_lowercase();
-                running = WORDS.iter().any(|w| lower.contains(w)).then(|| target.clone());
-                if let Some(cmd) = &running {
-                    out.retain(|(c, _)| c != cmd);
-                    out.push((cmd.clone(), None));
-                }
-            }
-            Event::ToolEnd { ok } => {
-                if let Some(cmd) = running.take()
-                    && let Some(c) = out.iter_mut().find(|(c, _)| *c == cmd) {
-                    c.1 = Some(*ok);
-                }
-            }
-            _ => {}
-        }
-    }
-    let skip = out.len().saturating_sub(6);
-    out.split_off(skip)
 }
 
 /// PORT..PORT+9 is task `id`'s, for its agent and its setup.
@@ -777,7 +777,7 @@ impl Daemon {
                 },
                 None => Reply::Error(format!("task {id} isn't running in a chat")),
             },
-            Request::Commit { id, message, ship } => match self.commit(t, id, &message, ship) {
+            Request::Commit { id, message, ship, force } => match self.commit(t, id, &message, ship, force) {
                 Ok(()) => return, // JobDone comes when the script finishes
                 Err(e) => Reply::Error(e),
             },
@@ -807,6 +807,7 @@ impl Daemon {
                 Ok(()) => Reply::Ok,
                 Err(e) => Reply::Error(e),
             },
+            Request::GenerateSummary { id } => self.start_summary(id).map(|()| Reply::Ok).unwrap_or_else(Reply::Error),
             Request::CheckReport { id } => self.check_report(id).map(Reply::Text).unwrap_or_else(Reply::Error),
             Request::AcceptChecks { id } => self.accept_checks(id).map(|()| Reply::Ok).unwrap_or_else(Reply::Error),
             Request::Setting { key, value } => self.setting(&key, value.as_deref()).map(Reply::Text).unwrap_or_else(Reply::Error),
@@ -1148,6 +1149,7 @@ impl Daemon {
     fn record(&mut self, id: u64, event: Event) {
         // Another turn: checks of the last one no longer judge the work, and mustn't run under it.
         if matches!(event, Event::Prompt { .. }) && self.tasks.contains_key(&id) {
+            self.cancel_summary(id);
             self.auto_due.remove(&id);
             self.end_checks(id, "stale");
         }
@@ -1879,14 +1881,19 @@ impl Daemon {
 
     /// Runs `specs` on task `id`'s worktree as it is now, at your asking.
     fn run_checks(&mut self, id: u64, specs: Vec<proto::CheckSpec>) -> Result<u64, String> {
-        if self.passes.contains_key(&id) || self.check_plans.contains_key(&id) {
+        if self.passes.contains_key(&id) || self.check_plans.contains_key(&id) || self.jobs.values().any(|j| j.task == id) || self.merges.contains_key(&id) {
             return Err("checks are already running; stop them first".into());
+        }
+        if specs.is_empty() {
+            self.plan_checks(id, true)?;
+            return self.check_runs(id)?.first().map(|r| r.id).ok_or("no check planner is available".into());
         }
         let wt = self.checkable_worktree(id)?;
         let specs = checks::validate(specs)?;
         let tree = checks::tree_hash(Path::new(&wt))?;
         // Whatever waited on approval is replaced by this.
         self.db.execute("UPDATE check_runs SET state = 'stopped', ended = ?1 WHERE task = ?2 AND state = 'approval'", params![now_secs(), id]).map_err(e2s)?;
+        self.cancel_summary(id);
         let run = self.new_run(id, &tree, "running", false)?;
         let specs: Vec<(proto::CheckSpec, &str)> = specs.into_iter().map(|s| (s, "manual")).collect();
         self.add_checks(run, id, &specs)?;
@@ -2013,6 +2020,15 @@ impl Daemon {
         let _ = self.db.execute("UPDATE check_runs SET state = ?1, ended = ?2 WHERE id = ?3", params![state, now_secs(), pass.run]);
         self.dirty = true;
         if state == "failed" {
+            let _ = self.db.execute("UPDATE summaries SET state = 'stale' WHERE task = ?1 AND tree = (SELECT tree FROM check_runs WHERE id = ?2)", params![task, pass.run]);
+        }
+        if state == "passed" { self.schedule_summary(task); }
+        if let Some(pending) = self.merges.remove(&task) {
+            let result = if state == "passed" { self.finish_merge(task, pending.clone()) } else { Err("Checks after merging the base failed; base branch was not updated".into()) };
+            if let Err(output) = result { self.send(pending.conn, &proto::reply_frame(&Reply::JobDone { ok: false, output })); }
+            return;
+        }
+        if state == "failed" {
             if let Err(e) = self.auto_fix(task) {
                 eprintln!("task {task}: auto-fix: {e}");
             }
@@ -2122,6 +2138,9 @@ impl Daemon {
     /// `state`: "stopped" by you, or "stale" when the agent starts another turn. False if none.
     fn end_checks(&mut self, task: u64, state: &str) -> bool {
         let now = now_secs();
+        if let Some(pending) = self.merges.remove(&task) {
+            self.send(pending.conn, &proto::reply_frame(&Reply::JobDone { ok: false, output: "Merge checks were interrupted; base branch was not updated".into() }));
+        }
         let mut ended = false;
         if let Some(mut plan) = self.check_plans.remove(&task) {
             let _ = rustix::process::kill_process_group(Pid::from_child(&plan.side.child), Signal::KILL);
@@ -2153,12 +2172,15 @@ impl Daemon {
 
     /// After a turn: plans checks for what it changed, unless nothing changed since the last
     /// checks, or nobody can plan them.
-    fn plan_checks(&mut self, id: u64) -> Result<(), String> {
+    fn plan_checks(&mut self, id: u64, force: bool) -> Result<(), String> {
+        if self.passes.contains_key(&id) || self.check_plans.contains_key(&id) || self.merges.contains_key(&id) || self.jobs.values().any(|j| j.task == id) {
+            return Err("checks or a commit are already running".into());
+        }
         let (agent, repo, model, base_commit): (String, String, String, String) = self
             .db
             .query_row("SELECT agent, repo, model, base_commit FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .map_err(e2s)?;
-        let Some(planner) = side::planner(&agent) else { return Ok(()) };
+        let Some(planner) = side::planner(&agent) else { return if force { Err("check planning is disabled or no planner is installed; supply check commands explicitly".into()) } else { Ok(()) } };
         let wt = self.checkable_worktree(id)?;
         let wtp = Path::new(&wt);
         let tree = checks::tree_hash(wtp)?;
@@ -2169,7 +2191,7 @@ impl Daemon {
             .map_err(e2s)?;
         let base = if base_commit.is_empty() { "HEAD".to_string() } else { base_commit };
         let base_tree = git(git_in(wtp).args(["rev-parse", &format!("{base}^{{tree}}")]))?.trim().to_string();
-        if last.as_ref().map_or(base_tree == tree, |(old, state, accepted)| old == &tree && (state != "failed" || *accepted)) {
+        if !force && last.as_ref().map_or(base_tree == tree, |(old, state, accepted)| old == &tree && (state != "failed" || *accepted)) {
             return Ok(());
         }
         // What changed since the work last passed (or since its base).
@@ -2291,6 +2313,7 @@ impl Daemon {
             };
             let _ = self.db.execute("UPDATE check_runs SET state = ?1, note = ?2, ended = ?3 WHERE id = ?4", params![state, note, now_secs(), run]);
             self.dirty = true;
+            if state == "skipped" { self.schedule_summary(task); }
             return;
         }
         let _ = self.db.execute("UPDATE check_runs SET note = ?1 WHERE id = ?2", params![note, run]);
@@ -2345,9 +2368,97 @@ impl Daemon {
             if !idle || self.passes.contains_key(&id) || self.check_plans.contains_key(&id) {
                 continue;
             }
-            if let Err(e) = self.plan_checks(id) {
+            if let Err(e) = self.plan_checks(id, false) {
                 eprintln!("task {id}: checks: {e}");
             }
+        }
+    }
+
+    fn verification(&self, id: u64, tree: &str) -> Result<String, String> {
+        let Some(run) = self.check_runs(id)?.into_iter().next() else { return Ok("unverified".into()) };
+        if run.tree != tree { return Ok("stale".into()); }
+        Ok(if run.accepted && run.state == "failed" { "accepted".into() } else { run.state })
+    }
+
+    fn schedule_summary(&mut self, id: u64) {
+        if self.summaries.contains_key(&id) { return; }
+        if let Err(error) = self.start_summary(id) {
+            if let Ok(tree) = self.checkable_worktree(id).and_then(|wt| checks::tree_hash(Path::new(&wt))) {
+                let _ = self.db.execute("INSERT INTO summaries (task, tree, state, error, updated) VALUES (?1, ?2, 'error', ?3, ?4) ON CONFLICT(task, tree) DO UPDATE SET state = 'error', error = excluded.error, updated = excluded.updated", params![id, tree, error, now_secs()]);
+                self.dirty = true;
+            }
+        }
+    }
+
+    fn start_summary(&mut self, id: u64) -> Result<(), String> {
+        if self.summaries.contains_key(&id) { return Err("summary is already running".into()); }
+        let wt = self.checkable_worktree(id)?;
+        let tree = checks::tree_hash(Path::new(&wt))?;
+        if !matches!(self.verification(id, &tree)?.as_str(), "passed" | "accepted" | "skipped") {
+            return Err("run checks or accept their failures before generating a summary".into());
+        }
+        let (agent, model, base, headless): (String, String, String, bool) = self.db.query_row(
+            "SELECT agent, model, base_commit, headless FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(e2s)?;
+        let planner = side::planner(&agent).ok_or("summary generation is disabled or no agent is installed")?;
+        let own = matches!((&planner, adapter::kind(&agent)), (side::Planner::Claude, "claude") | (side::Planner::Codex, "codex"));
+        let session = if headless {
+            fs::read_to_string(headless::session_file(&self.data, id)).unwrap_or_default()
+        } else if adapter::kind(&agent) == "codex" {
+            fs::read_to_string(adapter::codex_session(&self.data, id)).unwrap_or_default()
+        } else if adapter::kind(&agent) == "claude" {
+            fs::read_dir(adapter::claude_sessions(Path::new(&wt))).ok().into_iter().flatten().filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+                .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+                .and_then(|e| e.path().file_stem().map(|s| s.to_string_lossy().into_owned())).unwrap_or_default()
+        } else { String::new() };
+        let mut diff = git(git_in(Path::new(&wt)).args(["diff", if base.is_empty() { "HEAD" } else { &base }, &tree]))?;
+        if diff.len() > 100 << 10 {
+            let cut = (0..=100 << 10).rev().find(|&i| diff.is_char_boundary(i)).unwrap_or(0);
+            diff.truncate(cut);
+            diff.push_str("\n(diff truncated; read the worktree for more)");
+        }
+        let run = self.check_runs(id)?.into_iter().next().ok_or("no check run")?;
+        let verified_by = run.checks.iter().filter(|c| c.state == "passed").map(|c| c.command.clone()).collect::<Vec<_>>();
+        let context = review::chat_summary(&self.events(id)?);
+        let prompt = format!("Summarize the completed work for human review and a commit message. Return JSON matching the schema. Read only; do not edit files, run checks, or send messages. Describe this exact tree {tree}, not intended future work. Include a short title, overview, per-file changes, and risks. Do not claim verification beyond these recorded results: {}. Check state: {}.\nConversation context:\n{context}\nDiff:\n{diff}", verified_by.join(", "), run.state);
+        let name = format!("summary-{}", self.next_side);
+        self.next_side += 1;
+        let side = side::start_summary(planner, Path::new(&wt), &prompt, if own { &model } else { "" }, &self.data.join("side"), &name, &agent, if own { session.trim() } else { "" }, &self.exe).map_err(e2s)?;
+        self.db.execute("INSERT INTO summaries (task, tree, state, updated) VALUES (?1, ?2, 'running', ?3) ON CONFLICT(task, tree) DO UPDATE SET state = 'running', error = '', updated = excluded.updated", params![id, tree, now_secs()]).map_err(e2s)?;
+        self.summaries.insert(id, SummaryRun { tree, verified_by, side, deadline: Instant::now() + PLAN_TIMEOUT });
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn reap_summaries(&mut self) {
+        let done: Vec<(u64, bool)> = self.summaries.iter_mut().filter_map(|(&id, run)| {
+            if Instant::now() >= run.deadline {
+                let _ = rustix::process::kill_process_group(Pid::from_child(&run.side.child), Signal::KILL);
+                return Some((id, false));
+            }
+            match run.side.child.try_wait() { Ok(Some(s)) => Some((id, s.success())), Ok(None) => None, Err(_) => Some((id, false)) }
+        }).collect();
+        for (id, ok) in done {
+            let run = self.summaries.remove(&id).unwrap();
+            let tree = run.tree.clone();
+            let result = run.side.finish(ok).and_then(|(v, _)| crate::summary::parse(v, tree.clone(), run.verified_by));
+            let current = self.checkable_worktree(id).and_then(|wt| checks::tree_hash(Path::new(&wt)));
+            let result = result.and_then(|s| if current.as_deref() == Ok(tree.as_str()) { Ok(s) } else { Err("Work changed while the summary was generated; regenerate it".into()) });
+            let (state, json, error) = match result {
+                Ok(summary) => ("ready", serde_json::to_string(&summary).unwrap(), String::new()),
+                Err(e) => ("error", String::new(), e),
+            };
+            let _ = self.db.execute("UPDATE summaries SET state = ?1, json = ?2, error = ?3, updated = ?4 WHERE task = ?5 AND tree = ?6", params![state, json, error, now_secs(), id, tree]);
+            self.dirty = true;
+        }
+    }
+
+    fn cancel_summary(&mut self, id: u64) {
+        if let Some(mut run) = self.summaries.remove(&id) {
+            let _ = rustix::process::kill_process_group(Pid::from_child(&run.side.child), Signal::KILL);
+            let _ = run.side.child.wait();
+            let _ = run.side.finish(false);
+            let _ = self.db.execute("UPDATE summaries SET state = 'error', error = 'Interrupted by new work' WHERE task = ?1 AND state = 'running'", [id]);
         }
     }
 
@@ -2381,6 +2492,7 @@ impl Daemon {
         self.db.execute("UPDATE check_runs SET accepted = 1 WHERE id = ?1", [run.id]).map_err(e2s)?;
         self.auto_due.remove(&id);
         self.dirty = true;
+        self.schedule_summary(id);
         Ok(())
     }
 
@@ -2501,6 +2613,15 @@ impl Daemon {
     }
 
     fn kill(&mut self, id: u64) -> Result<(), String> {
+        for n in self.jobs.iter().filter(|(_, j)| j.task == id).map(|(&n, _)| n).collect::<Vec<_>>() {
+            if let Some(mut job) = self.jobs.remove(&n) {
+                let _ = self.poll.registry().deregister(&mut SourceFd(&job.out.as_raw_fd()));
+                let _ = rustix::process::kill_process_group(Pid::from_child(&job.child), Signal::KILL);
+                let _ = job.child.wait();
+                self.send(job.conn, &proto::reply_frame(&Reply::JobDone { ok: false, output: "Commit cancelled: task deleted".into() }));
+            }
+        }
+        self.cancel_summary(id);
         let (repo, wt): (String, String) = self
             .db
             .query_row("SELECT repo, worktree FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -2522,6 +2643,7 @@ impl Daemon {
         }
         let _ = self.db.execute("DELETE FROM checks WHERE task = ?1", [id]);
         let _ = self.db.execute("DELETE FROM check_runs WHERE task = ?1", [id]);
+        let _ = self.db.execute("DELETE FROM summaries WHERE task = ?1", [id]);
         let _ = self.db.execute("DELETE FROM dropped_checks WHERE task = ?1", [id]);
         self.auto_due.remove(&id);
         if !wt.is_empty() && Path::new(&wt).exists() {
@@ -2571,6 +2693,7 @@ impl Daemon {
                 setup: r.get(15)?,
                 setup_detail: r.get(16)?,
                 checks: proto::ChecksSummary::default(),
+                summary_state: String::new(),
                 machine: 0,
             })
         });
@@ -2590,6 +2713,8 @@ impl Daemon {
             .and_then(Iterator::collect)
             .map_err(e2s)?;
         for info in &mut tasks {
+            let state: Option<String> = self.db.query_row("SELECT CASE WHEN s.tree = r.tree THEN s.state ELSE 'stale' END FROM summaries s LEFT JOIN check_runs r ON r.id = (SELECT MAX(id) FROM check_runs WHERE task = ?1) WHERE s.task = ?1 ORDER BY (s.tree = r.tree) DESC, s.updated DESC LIMIT 1", [info.id], |r| r.get(0)).optional().map_err(e2s)?;
+            info.summary_state = if self.tasks.get(&info.id).is_some_and(|t| t.activity == Activity::Running) && state.is_some() { "stale".into() } else { state.unwrap_or_default() };
             if let Some(s) = summaries.get(&info.id) {
                 info.checks = s.clone();
             }
@@ -2679,49 +2804,111 @@ impl Daemon {
             .query_row("SELECT branch, base FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(e2s)?;
         let events = self.events(id)?;
-        let summary = review::chat_summary(&events);
+        let tree = checks::tree_hash(Path::new(&wt))?;
+        let verification = self.verification(id, &tree)?;
+        let stored: Option<(String, String, String, String)> = self.db.query_row(
+            "SELECT tree, state, json, error FROM summaries WHERE task = ?1 ORDER BY (tree = ?2) DESC, updated DESC LIMIT 1", params![id, tree], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional().map_err(e2s)?;
+        let (work_summary, summary_state) = match stored {
+            Some((old, state, json, error)) => (serde_json::from_str::<proto::WorkSummary>(&json).ok(), if old != tree { "stale".into() } else if state == "error" { error } else { state }),
+            None => (None, "missing".into()),
+        };
+        let summary = work_summary.as_ref().map(crate::summary::message).unwrap_or_else(|| review::chat_summary(&events));
         let (conflicts, merging) = review::conflicts(Path::new(&wt))?;
         Ok(proto::Review {
+            tree: tree.clone(), verification, work_summary, summary_state,
             conflicts,
             merging,
             branch,
             base: if base.is_empty() { "HEAD".into() } else { base },
             summary,
-            checks: checks(&events),
+            checks: self.check_runs(id)?.first().filter(|r| r.tree == tree).map(|r| r.checks.iter().map(|c| (c.command.clone(), match c.state.as_str() { "passed" => Some(true), "failed" | "stopped" => Some(false), _ => None })).collect()).unwrap_or_default(),
             files: review::diff(Path::new(&wt), &base_commit, None)?,
         })
     }
 
-    fn commit(&mut self, conn: Token, id: u64, message: &str, ship: Ship) -> Result<(), String> {
-        let (wt, _) = self.task_paths(id)?;
-        let (title, base): (String, String) = self
-            .db
-            .query_row("SELECT title, base FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map_err(e2s)?;
-        let message = if message.trim().is_empty() { title.lines().next().unwrap_or("arranger task").to_string() } else { message.to_string() };
-        let summary = self.review(id).map(|r| r.summary).unwrap_or_default();
+    fn commit(&mut self, conn: Token, id: u64, message: &str, ship: Ship, force: bool) -> Result<(), String> {
+        if self.jobs.values().any(|j| j.task == id) || self.merges.contains_key(&id) {
+            return Err("a commit or merge is already running".into());
+        }
+        if ship == Ship::Merge && (self.tasks.get(&id).is_some_and(|t| t.activity != Activity::Done || t.queued > 0)
+            || self.passes.contains_key(&id) || self.check_plans.contains_key(&id)) {
+            return Err("wait for the agent and checks to finish before merging".into());
+        }
+        let data = self.review(id)?;
+        let (title, base): (String, String) = self.db.query_row("SELECT title, base FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(e2s)?;
+        let message = if !message.trim().is_empty() { message.to_string() }
+            else if let Some(s) = data.work_summary.as_ref().filter(|s| s.tree == data.tree && data.summary_state == "ready") { crate::summary::message(s) }
+            else { title.lines().next().unwrap_or("arranger task").to_string() };
         let base = if base == "HEAD" { String::new() } else { base };
         if ship != Ship::Commit {
             if base.is_empty() { return Err("no base branch selected".into()); }
+            let (wt, _) = self.task_paths(id)?;
             git(git_in(Path::new(&wt)).args(["check-ref-format", "--branch", &base]))?;
             git(git_in(Path::new(&wt)).args(["show-ref", "--verify", &format!("refs/heads/{base}")]))?;
         }
+        if ship == Ship::Merge {
+            if !force && !matches!(data.verification.as_str(), "passed" | "accepted" | "skipped") {
+                let _ = self.plan_checks(id, true);
+                return Err("this tree has not passed checks; review/run checks and retry, or use --force to merge anyway".into());
+            }
+            let checks = self.check_runs(id)?.first().map(|r| r.checks.iter().map(|c| proto::CheckSpec { name: c.name.clone(), command: c.command.clone(), why: c.why.clone() }).collect()).unwrap_or_default();
+            self.cancel_summary(id);
+            let pending = MergePending { conn, tree: data.tree.clone(), message: message.clone(), base: base.clone(), force, checks };
+            return self.spawn_commit(conn, id, &message, ship, "prepare", &data.summary, &base, &data.tree, Some(pending));
+        }
+        self.spawn_commit(conn, id, &message, ship, if ship == Ship::Pr { "pr" } else { "" }, &data.summary, &base, &data.tree, None)
+    }
+
+    fn spawn_commit(&mut self, conn: Token, id: u64, message: &str, ship: Ship, mode: &str, summary: &str, base: &str, tree: &str, merge: Option<MergePending>) -> Result<(), String> {
+        let (wt, _) = self.task_paths(id)?;
         let (out, write) = std::io::pipe().map_err(e2s)?;
         let child = Command::new("sh")
-            .args(["-c", review::COMMIT_SCRIPT, "arranger-commit", &message, match ship { Ship::Commit => "", Ship::Merge => "merge", Ship::Pr => "pr" }, &summary, &base])
-            .current_dir(&wt)
-            .stdin(std::process::Stdio::null())
-            .stdout(write.try_clone().map_err(e2s)?)
-            .stderr(write)
-            .spawn()
-            .map_err(e2s)?; // the Command, and with it our copies of the write end, drop here
+            .args(["-c", review::COMMIT_SCRIPT, "arranger-commit", message, mode, summary, base, tree])
+            .current_dir(&wt).stdin(Stdio::null()).stdout(write.try_clone().map_err(e2s)?).stderr(write)
+            .process_group(0).spawn().map_err(e2s)?;
         rustix::fs::fcntl_setfl(&out, rustix::fs::OFlags::NONBLOCK).map_err(e2s)?;
         let n = self.next_job;
         self.next_job += 1;
         self.poll.registry().register(&mut SourceFd(&out.as_raw_fd()), Token(JOB + n), Interest::READABLE).map_err(e2s)?;
         let head = review::resolve(Path::new(&wt), "HEAD").unwrap_or_default();
-        self.jobs.insert(n, Job { child, out, buf: Vec::new(), conn, task: id, head, ship });
+        self.jobs.insert(n, Job { child, out, buf: Vec::new(), conn, task: id, head, ship, merge });
         Ok(())
+    }
+
+    fn prepared_merge(&mut self, id: u64, mut pending: MergePending) -> Result<(), String> {
+        let wt = self.checkable_worktree(id)?;
+        let tree = checks::tree_hash(Path::new(&wt))?;
+        if tree == pending.tree || pending.force {
+            pending.tree = tree;
+            return self.finish_merge(id, pending);
+        }
+        // The base changed the tree: rerun exactly the checks already approved, with no planner.
+        if pending.checks.is_empty() && !checks::code_changed(&checks::changed_files(Path::new(&wt), &pending.tree, &tree)?) {
+            let run = self.new_run(id, &tree, "skipped", false)?;
+            self.db.execute("UPDATE check_runs SET ended = ?1, note = 'Base changed only non-code files; no checks needed' WHERE id = ?2", params![now_secs(), run]).map_err(e2s)?;
+            pending.tree = tree;
+            self.schedule_summary(id);
+            return self.finish_merge(id, pending);
+        }
+        if pending.checks.is_empty() {
+            return Err("merging the base changed the tree and there are no previous checks; run checks before retrying".into());
+        }
+        let run = self.new_run(id, &tree, "running", false)?;
+        let specs = pending.checks.iter().cloned().map(|c| (c, "merge")).collect::<Vec<_>>();
+        self.add_checks(run, id, &specs)?;
+        pending.tree = tree;
+        self.merges.insert(id, pending);
+        self.start_run(id, run);
+        Ok(())
+    }
+
+    fn finish_merge(&mut self, id: u64, pending: MergePending) -> Result<(), String> {
+        let wt = self.checkable_worktree(id)?;
+        if checks::tree_hash(Path::new(&wt))? != pending.tree { return Err("worktree changed before merge; run checks again".into()); }
+        if !pending.force && !matches!(self.verification(id, &pending.tree)?.as_str(), "passed" | "accepted" | "skipped") {
+            return Err("the merged tree has not passed checks".into());
+        }
+        self.spawn_commit(pending.conn, id, &pending.message, Ship::Merge, "merge", "", &pending.base, &pending.tree, None)
     }
 
     fn read_job(&mut self, n: usize) {
@@ -2741,8 +2928,15 @@ impl Daemon {
         }
         // EOF: the script closed its output, so it's exiting.
         let mut job = self.jobs.remove(&n).unwrap();
+        let _ = self.poll.registry().deregister(&mut SourceFd(&job.out.as_raw_fd()));
         let ok = job.child.wait().is_ok_and(|s| s.success());
         let output = String::from_utf8_lossy(&job.buf).trim().to_string();
+        if ok && let Some(pending) = job.merge.take() {
+            if let Err(output) = self.prepared_merge(job.task, pending) {
+                self.send(job.conn, &proto::reply_frame(&Reply::JobDone { ok: false, output }));
+            }
+            return;
+        }
         // Review now starts from what was committed. A failed merge or PR may still have committed
         // first, so a moved HEAD counts too.
         if let Ok(head) = self.task_paths(job.task).and_then(|(wt, _)| review::resolve(Path::new(&wt), "HEAD")) {
@@ -2792,6 +2986,13 @@ impl Daemon {
     /// Agents get SIGHUP when their PTY masters close as the process exits; headless ones, which
     /// have no terminal, get it from us.
     fn shutdown(&mut self, sock: &Path) {
+        for id in self.summaries.keys().copied().collect::<Vec<_>>() { self.cancel_summary(id); }
+        let checking: Vec<u64> = self.passes.keys().chain(self.check_plans.keys()).copied().collect();
+        for id in checking { self.end_checks(id, "stopped"); }
+        for job in self.jobs.values_mut() {
+            let _ = rustix::process::kill_process_group(Pid::from_child(&job.child), Signal::KILL);
+            let _ = job.child.wait();
+        }
         for (&id, task) in &mut self.tasks {
             if task.headless.is_some() {
                 let _ = rustix::process::kill_process_group(Pid::from_child(&task.pty.child), Signal::HUP);
@@ -2873,15 +3074,6 @@ mod tests {
         assert_eq!(turn_prompts(&events), ["second", "and also"]);
         assert_eq!(turn_prompts(&events[..2]), ["first"]);
         assert!(turn_prompts(&[]).is_empty());
-    }
-
-    #[test]
-    fn checks_keep_the_latest_result() {
-        let bash = |cmd: &str| (0, Event::ToolStart { kind: ToolKind::Bash, target: cmd.into() });
-        let end = |ok| (0, Event::ToolEnd { ok });
-        let events = [bash("cargo test"), end(false), bash("ls"), end(true), bash("cargo build"), end(true), bash("cargo test"), end(true), bash("npm run lint")];
-        let want: Vec<(String, Option<bool>)> = vec![("cargo build".into(), Some(true)), ("cargo test".into(), Some(true)), ("npm run lint".into(), None)];
-        assert_eq!(checks(&events), want);
     }
 
     #[test]

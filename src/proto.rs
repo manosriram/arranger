@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub const MAX_FRAME: usize = 16 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 24;
+pub const VERSION: u32 = 25;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -51,7 +51,7 @@ pub enum Request {
     /// Up to `limit` items before item `end`, for scrolling back; replied to with `Chat`.
     ChatPage { id: u64, end: usize, limit: usize },
     /// Commit everything in the worktree, then maybe merge or open a PR. Replied to with JobDone.
-    Commit { id: u64, message: String, ship: Ship },
+    Commit { id: u64, message: String, ship: Ship, force: bool },
     /// The task's recorded PTY output (zstd), for replaying a finished task's chat.
     Log { id: u64 },
     /// Start an ended task's agent again in its worktree, resuming its last session, and send it
@@ -93,6 +93,7 @@ pub enum Request {
     AcceptChecks { id: u64 },
     /// What to tell the agent about its latest run's failures; replied to with Text.
     CheckReport { id: u64 },
+    GenerateSummary { id: u64 },
     /// A daemon setting ("auto_fix": rounds of failures sent to the agent by themselves), set
     /// to `value` if given; replied to with Text (its value now).
     Setting { key: String, value: Option<String> },
@@ -306,19 +307,36 @@ pub struct TaskInfo {
     /// Its latest check run.
     #[serde(default)]
     pub checks: ChecksSummary,
+    pub summary_state: String,
     /// Which machine the GUI got this task from (an index into its machine list); not sent.
     #[serde(skip)]
     pub machine: usize,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkSummary {
+    pub tree: String,
+    pub title: String,
+    pub overview: String,
+    pub files: Vec<(String, String)>,
+    pub risks: Vec<String>,
+    pub verified_by: Vec<String>,
+}
+
 /// A task's changes against the commit its worktree branched from.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Review {
+    pub tree: String,
+    /// passed, accepted, skipped, stale, unverified, failed, running, or approval.
+    pub verification: String,
+    pub work_summary: Option<WorkSummary>,
+    /// missing, running, ready, stale, or an error message.
+    pub summary_state: String,
     pub branch: String,
     pub base: String,
     /// The agent's last reply.
     pub summary: String,
-    /// Check-like commands the agent ran (test, build, lint…): ok is None while running.
+    /// Arranger checks for this tree: ok is None while pending or running.
     pub checks: Vec<(String, Option<bool>)>,
     pub files: Vec<FileDiff>,
     /// Files a merge left with conflict markers in the worktree.

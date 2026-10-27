@@ -18,3 +18,5 @@ pub mod security;
 pub mod setup;
 pub mod shell;
 pub mod side;
+
+pub mod summary;

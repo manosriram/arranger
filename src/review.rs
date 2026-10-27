@@ -292,31 +292,32 @@ pub fn conflicts(worktree: &Path) -> Result<(Vec<String>, bool), String> {
     Ok((files, repo.git_dir().join("MERGE_HEAD").exists()))
 }
 
-/// Shell script for Commit: `$1` message, `$2` "merge", "pr" or "", `$3` PR body, `$4` base branch.
-/// A merge goes into wherever the base is checked out; a conflict is backed out, never left half done.
+/// Commit/merge stages: `$1` message, `$2` mode, `$3` PR body, `$4` base,
+/// `$5` expected tree. Preparation never updates the base; finalization never merges new code.
 pub const COMMIT_SCRIPT: &str = r#"set -e
 if [ -n "$(git diff --name-only --diff-filter=U)" ]; then echo "resolve the conflicts first"; exit 1; fi
 git add -A
-if ! git diff --cached --quiet; then git commit -q -m "$1"; fi
+if [ -n "$5" ] && [ "$(git write-tree)" != "$5" ]; then echo "worktree changed since verification; run checks again"; exit 1; fi
+if ! git diff --cached --quiet || [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then git commit -q -m "$1"; fi
+if [ -n "$5" ] && [ "$(git rev-parse HEAD^{tree})" != "$5" ]; then echo "commit changed the checked tree; run checks again"; exit 1; fi
 if [ "$2" = pr ]; then
   git push -q -u origin HEAD
-  gh pr create --title "$1" --body "$3" --base "$4"
-elif [ "$2" = merge ]; then
-  [ -n "$4" ] || { echo "no base branch to merge into"; exit 1; }
-  branch=$(git rev-parse --abbrev-ref HEAD)
-  where=$(git worktree list --porcelain | awk -v b="branch refs/heads/$4" '/^worktree /{w=substr($0,10)} $0==b{print w}')
-  into_base() {
-    if [ -z "$where" ]; then git fetch -q . "$branch:$4" 2>/dev/null
-    else git -C "$where" merge -q --ff-only "$branch" 2>/dev/null; fi
-  }
-  if ! into_base; then
-    # $4 moved on: bring it into this branch here, so a conflict lands in this worktree, never in $4.
-    if ! git merge -q --no-edit "$4" >/dev/null 2>&1; then
+  gh pr create --title "$(printf '%s\n' "$1" | head -n 1)" --body "$3" --base "$4"
+elif [ "$2" = prepare ]; then
+  if ! git merge-base --is-ancestor "$4" HEAD; then
+    if ! git merge -q --no-edit "$4"; then
       echo "conflicts with $4 in $(git diff --name-only --diff-filter=U | tr '\n' ' ')"
       exit 1
     fi
-    into_base || { echo "couldn't update $4 (local changes there?); nothing was changed"; exit 1; }
   fi
+elif [ "$2" = merge ]; then
+  branch=$(git rev-parse --abbrev-ref HEAD)
+  head=$(git rev-parse HEAD)
+  base=$(git rev-parse "refs/heads/$4")
+  git merge-base --is-ancestor "$base" "$head" || { echo "base moved again; retry merge to recheck it"; exit 1; }
+  where=$(git worktree list --porcelain | awk -v b="branch refs/heads/$4" '/^worktree /{w=substr($0,10)} $0==b{print w}')
+  if [ -z "$where" ]; then git update-ref "refs/heads/$4" "$head" "$base"
+  else git -C "$where" merge -q --ff-only "$head"; fi
   echo "merged $branch into $4"
 else
   git log -1 --format='committed %h %s'
