@@ -2383,7 +2383,8 @@ impl Daemon {
     fn schedule_summary(&mut self, id: u64) {
         if self.summaries.contains_key(&id) { return; }
         if let Err(error) = self.start_summary(id)
-            && let Ok(tree) = self.checkable_worktree(id).and_then(|wt| checks::tree_hash(Path::new(&wt))) {
+            && let Ok(tree) = self.checkable_worktree(id).and_then(|wt| checks::tree_hash(Path::new(&wt)))
+        {
             let _ = self.db.execute("INSERT INTO summaries (task, tree, state, error, updated) VALUES (?1, ?2, 'error', ?3, ?4) ON CONFLICT(task, tree) DO UPDATE SET state = 'error', error = excluded.error, updated = excluded.updated", params![id, tree, error, now_secs()]);
             self.dirty = true;
         }
