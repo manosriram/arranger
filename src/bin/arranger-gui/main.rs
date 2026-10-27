@@ -1809,6 +1809,7 @@ impl App {
         }
         if self.confirm_delete.is_some() { return; }
         if self.dialog.is_none() && self.checks.is_some() && self.scroll_checks(dy) {
+            self.redraw();
             return;
         }
         if let Some(d) = self.dialog.as_mut() {
