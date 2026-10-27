@@ -32,6 +32,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LISTENER: Token = Token(0);
+// Number the full task history before limiting the displayed runs.
+const CHECK_RUNS_QUERY: &str = "SELECT id, started, ended, tree, state, auto, note, accepted,
+    ROW_NUMBER() OVER (ORDER BY id) AS number
+    FROM check_runs WHERE task = ?1 ORDER BY id DESC LIMIT 30";
 const CHILD: Token = Token(1);
 const STOP: Token = Token(2);
 /// Task PTYs use `Token(TASK + id)`; client connections count up from 3.
@@ -2546,10 +2550,10 @@ impl Daemon {
 
     /// Task `id`'s check runs, newest first.
     fn check_runs(&self, id: u64) -> Result<Vec<proto::CheckRun>, String> {
-        let mut stmt = self.db.prepare("SELECT id, started, ended, tree, state, auto, note, accepted FROM check_runs WHERE task = ?1 ORDER BY id DESC LIMIT 30").map_err(e2s)?;
+        let mut stmt = self.db.prepare(CHECK_RUNS_QUERY).map_err(e2s)?;
         let mut runs: Vec<proto::CheckRun> = stmt
             .query_map([id], |r| {
-                Ok(proto::CheckRun { id: r.get(0)?, started: r.get(1)?, ended: r.get(2)?, tree: r.get(3)?, state: r.get(4)?, auto: r.get(5)?, note: r.get(6)?, accepted: r.get(7)?, checks: Vec::new() })
+                Ok(proto::CheckRun { id: r.get(0)?, number: r.get(8)?, started: r.get(1)?, ended: r.get(2)?, tree: r.get(3)?, state: r.get(4)?, auto: r.get(5)?, note: r.get(6)?, accepted: r.get(7)?, checks: Vec::new() })
             })
             .and_then(Iterator::collect)
             .map_err(e2s)?;
@@ -3047,6 +3051,34 @@ fn queued_label(n: usize) -> String {
 mod tests {
     use super::*;
     use proto::ToolKind;
+
+    #[test]
+    fn check_run_numbers_start_fresh_for_each_task() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE check_runs (
+            id INTEGER PRIMARY KEY, task INTEGER, started INTEGER DEFAULT 0,
+            ended INTEGER DEFAULT 0, tree TEXT DEFAULT '', state TEXT DEFAULT 'passed',
+            auto INTEGER DEFAULT 0, note TEXT DEFAULT '', accepted INTEGER DEFAULT 0)").unwrap();
+        for task in [1, 2, 1, 3, 2] {
+            db.execute("INSERT INTO check_runs (task) VALUES (?1)", [task]).unwrap();
+        }
+        let numbers = |task| {
+            db.prepare(CHECK_RUNS_QUERY).unwrap()
+                .query_map([task], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, u64>(8)?)))
+                .unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        assert_eq!(numbers(1), [(3, 2), (1, 1)]);
+        assert_eq!(numbers(2), [(5, 2), (2, 1)]);
+        assert_eq!(numbers(3), [(4, 1)]);
+        assert!(numbers(4).is_empty());
+        for _ in 0..31 {
+            db.execute("INSERT INTO check_runs (task) VALUES (1)", []).unwrap();
+        }
+        let runs = numbers(1);
+        assert_eq!(runs.len(), 30);
+        assert_eq!(runs.first().unwrap().1, 33);
+        assert_eq!(runs.last().unwrap().1, 4);
+    }
 
     #[test]
     fn interrupted_turn_ignores_late_hooks_until_next_prompt() {

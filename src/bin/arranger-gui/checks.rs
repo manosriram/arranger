@@ -436,7 +436,7 @@ impl App {
                 s => s,
             };
             let counts = if run.checks.is_empty() { String::new() } else { format!(" · {passed}/{}", run.checks.len()) };
-            let head = format!("Run {} · {state}{counts}", run.id);
+            let head = format!("Run {} · {state}{counts}", run.number);
             r.text(x + 18.0, y, &head, UI, 12.0, 600, t.text, w - 80.0);
             let when = if run.started == 0 { String::new() } else { ago(run.started) };
             let ww = r.measure(MONO, 11.0, 400, &when);

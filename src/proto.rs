@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub const MAX_FRAME: usize = 16 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 25;
+pub const VERSION: u32 = 26;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -111,6 +111,8 @@ pub struct CheckSpec {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CheckRun {
     pub id: u64,
+    /// One-based run number within this task, independent of the database ID.
+    pub number: u64,
     /// Unix seconds; `ended` is 0 while it runs.
     pub started: u64,
     pub ended: u64,
