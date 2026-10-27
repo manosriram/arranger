@@ -89,16 +89,28 @@ pub fn read_limited(reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
 
 pub const MAX_LOG: usize = 64 << 20;
 pub const MAX_JSON_LINE: usize = 1 << 20;
+/// An agent's own stdout records: a file it read (an image, a PDF) comes back inline as base64.
+pub const MAX_AGENT_LINE: usize = 32 << 20;
 
 /// Enforce the limit while assembling fragments, and discard an entire oversized record.
 /// Parsing a suffix as a fresh JSON message could otherwise forge protocol events.
-#[derive(Default)]
 pub struct JsonLines {
     input: Vec<u8>,
     discarding: bool,
+    limit: usize,
+}
+
+impl Default for JsonLines {
+    fn default() -> Self {
+        JsonLines::new(MAX_JSON_LINE)
+    }
 }
 
 impl JsonLines {
+    pub fn new(limit: usize) -> Self {
+        JsonLines { input: Vec::new(), discarding: false, limit }
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) -> (Vec<Vec<u8>>, bool) {
         let mut lines = Vec::new();
         let mut oversized = false;
@@ -108,7 +120,7 @@ impl JsonLines {
                 if complete { self.discarding = false; }
                 continue;
             }
-            if self.input.len().saturating_add(part.len()) > MAX_JSON_LINE {
+            if self.input.len().saturating_add(part.len()) > self.limit {
                 self.input.clear();
                 self.discarding = !complete;
                 oversized = true;

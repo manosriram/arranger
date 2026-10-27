@@ -266,14 +266,23 @@ impl Agent {
         let (lines, oversized) = self.input.feed(bytes);
         if oversized {
             self.failed = true;
-            return (vec![Event::Error { message: "the agent wrote a JSON line over the 1 MiB limit".into() }], Vec::new());
+            return (vec![Event::Error { message: "the agent wrote a JSON line over the 32 MiB limit".into() }], Vec::new());
         }
         for line in lines {
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
             match serde_json::from_slice::<Value>(&line) {
-                Ok(v) => {
+                Ok(mut v) => {
+                    // Its chat log keeps lines under the usual limit: a big one loses its inline files.
+                    let line = if line.len() > crate::security::MAX_JSON_LINE {
+                        drop_blobs(&mut v);
+                        let mut small = serde_json::to_vec(&v).unwrap_or_default();
+                        small.push(b'\n');
+                        small
+                    } else {
+                        line
+                    };
                     if self.t.line(v, &mut events) {
                         kept.extend_from_slice(&line);
                     }
@@ -282,6 +291,16 @@ impl Agent {
             }
         }
         (events, kept)
+    }
+}
+
+/// Empties the strings over 64 KiB in `v`: base64 images and documents the agent read.
+fn drop_blobs(v: &mut Value) {
+    match v {
+        Value::String(s) if s.len() > 64 << 10 => s.clear(),
+        Value::Array(a) => a.iter_mut().for_each(drop_blobs),
+        Value::Object(o) => o.values_mut().for_each(drop_blobs),
+        _ => {}
     }
 }
 
@@ -310,7 +329,7 @@ pub fn start(program: &str, cwd: &Path, model: &str, effort: &str, mode: &str, s
             Box::new(claude::Claude::new(cwd, mode))
         }
     };
-    (argv, Agent { t, input: Default::default(), received: 0, failed: false })
+    (argv, Agent { t, input: crate::security::JsonLines::new(crate::security::MAX_AGENT_LINE), received: 0, failed: false })
 }
 
 /// Where the daemon keeps task `task`'s headless session.

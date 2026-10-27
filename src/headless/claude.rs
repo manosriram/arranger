@@ -446,4 +446,21 @@ mod tests {
         assert_eq!(c.terminal("fix /permissions"), None);
         assert_eq!(new().terminal("/permissions"), None, "not before it has said what it has");
     }
+
+    #[test]
+    fn reading_a_big_image_keeps_the_agent_and_logs_it_without_the_image() {
+        let mut c = started();
+        c.prompt("look".into());
+        sent(&mut c);
+        let image = "A".repeat(3 << 20);
+        let read = json!({"type":"user","message":{"content":[{"type":"tool_result","content":[{"type":"image","source":{"type":"base64","data":image}}]}]},"tool_use_result":{"file":{"base64":image}}});
+        let mut bytes = serde_json::to_vec(&read).unwrap();
+        bytes.push(b'\n');
+        let (events, kept) = c.feed(&bytes);
+        assert_eq!(events, vec![Event::ToolEnd { ok: true }]);
+        assert!(!c.failed());
+        assert!(kept.len() < 1024 && kept.ends_with(b"\n"), "{} bytes kept", kept.len());
+        let logged: Value = serde_json::from_slice(&kept).unwrap();
+        assert_eq!(logged["message"]["content"][0]["content"][0]["source"]["data"], "");
+    }
 }
