@@ -16,6 +16,7 @@ pub struct ChecksView {
     pub task: u64,
     pub host: usize,
     runs: Vec<CheckRun>,
+    expanded_runs: std::collections::HashSet<u64>,
     loaded: bool,
     runs_pending: bool,
     runs_at: Instant,
@@ -52,6 +53,7 @@ struct ConsoleView {
 #[derive(Clone, Debug)]
 pub enum ChecksAction {
     Select(u64),
+    ToggleRun(u64),
     SendFailures,
     Accept,
     AutoFix,
@@ -90,6 +92,7 @@ impl App {
             task,
             host,
             runs: Vec::new(),
+            expanded_runs: Default::default(),
             loaded: false,
             runs_pending: false,
             runs_at: Instant::now(),
@@ -114,6 +117,9 @@ impl App {
         let Some(cv) = &mut self.checks else { return };
         let (host, id) = (cv.host, cv.task);
         match action {
+            ChecksAction::ToggleRun(run) => {
+                if !cv.expanded_runs.remove(&run) { cv.expanded_runs.insert(run); }
+            }
             ChecksAction::RetryLatest => {
                 let Some(run) = cv.runs.first() else { return };
                 let checks = run.checks.iter().map(|c| proto::CheckSpec { name: c.name.clone(), command: c.command.clone(), why: c.why.clone() }).collect();
@@ -213,7 +219,7 @@ impl App {
                 self.refresh_runs();
             }
             ChecksAction::Step(d) => {
-                let ids: Vec<u64> = cv.runs.iter().flat_map(|r| r.checks.iter().map(|c| c.id)).collect();
+                let ids: Vec<u64> = cv.runs.iter().filter(|r| cv.expanded_runs.contains(&r.id)).flat_map(|r| r.checks.iter().map(|c| c.id)).collect();
                 let at = cv.selected.and_then(|s| ids.iter().position(|&i| i == s)).unwrap_or(0) as i32;
                 if let Some(&next) = ids.get((at + d).clamp(0, ids.len() as i32 - 1).max(0) as usize) {
                     cv.selected = Some(next);
@@ -261,6 +267,12 @@ impl App {
                         if first && cv.draft.is_empty() {
                             let ran = runs.iter().find(|r| !matches!(r.state.as_str(), "planning" | "approval") && !r.checks.is_empty());
                             cv.draft = ran.map(|r| r.checks.iter().map(|c| c.command.clone()).collect()).unwrap_or_default();
+                        }
+                        if runs.first().map(|r| r.id) != cv.runs.first().map(|r| r.id) {
+                            cv.expanded_runs.clear();
+                            if let Some(run) = runs.first() { cv.expanded_runs.insert(run.id); }
+                            cv.selected = None;
+                            cv.rail_scroll = 0.0;
                         }
                         cv.runs = runs;
                         // Show something: the latest run's first failure, else what runs, else its first.
@@ -413,11 +425,12 @@ impl App {
         r.rect(Rect::new(rail.x, y, rail.w - 1.0, 1.0), 0.0, t.border);
         y += 14.0;
 
-        // Runs, newest first, each with its checks.
+        // Runs, newest first; only the latest starts expanded.
         let list = Rect::new(rail.x, y, rail.w - 1.0, rail.y + rail.h - y);
         r.set_clip(Some(list));
         let cv = self.checks.as_ref().unwrap();
         let (runs, selected, loaded) = (cv.runs.clone(), cv.selected, cv.loaded);
+        let expanded_runs = cv.expanded_runs.clone();
         let mut y = y - cv.rail_scroll;
         if runs.is_empty() {
             let note = if loaded { "No checks have run yet. Add the commands that prove the work holds up (tests, build, lint) and run them." } else { "Loading…" };
@@ -436,12 +449,22 @@ impl App {
                 s => s,
             };
             let counts = if run.checks.is_empty() { String::new() } else { format!(" · {passed}/{}", run.checks.len()) };
-            let head = format!("Run {} · {state}{counts}", run.number);
+            let expanded = expanded_runs.contains(&run.id);
+            let arrow = if expanded { "▾" } else { "▸" };
+            let head = format!("{arrow} Run {} · {state}{counts}", run.number);
+            let header = Rect::new(rail.x + 6.0, y - 4.0, rail.w - 13.0, 24.0);
+            if header.y + header.h >= list.y && header.y <= list.y + list.h && self.hit(r, header) {
+                self.actions.push(Action::Checks(ChecksAction::ToggleRun(run.id)));
+            }
             r.text(x + 18.0, y, &head, UI, 12.0, 600, t.text, w - 80.0);
             let when = if run.started == 0 { String::new() } else { ago(run.started) };
             let ww = r.measure(MONO, 11.0, 400, &when);
             r.text(x + w - ww, y, &when, MONO, 11.0, 400, t.text3, ww + 2.0);
             y += 20.0;
+            if !expanded {
+                y += 12.0;
+                continue;
+            }
             let by = if run.auto { "after the agent's turn" } else { "run by you" };
             r.text(x + 18.0, y, by, UI, 11.0, 400, t.text3, w - 18.0);
             y += 18.0;

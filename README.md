@@ -66,7 +66,7 @@ A new worktree has your tracked files but nothing git ignores, so before its age
 
 Nothing is read from or written to the repository for this.
 
-**Checks** (the tab between Workspace and Review) run commands that prove a task's work holds up (tests, builds, linters) in its worktree, one after another.
+**Checks** (the tab between Workspace and Review) run commands that prove a task's work holds up (tests, builds, linters) in its worktree, one after another. Only the latest run starts expanded; click a run header to expand or collapse its checks.
 
 **After each agent turn**, checks are chosen for that turn:
 - **Planning.** When a turn ends with changes and the agent is idle, a separate read-only claude or codex run (not the agent that did the work) looks at the turn's prompt and diff and picks checks that cover what changed.
