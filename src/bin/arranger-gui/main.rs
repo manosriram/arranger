@@ -2884,13 +2884,13 @@ impl App {
                     };
                     r.rect(Rect::new(head.x + 8.0, head.y + 9.0, 8.0, 8.0), 0.0, dot);
                     let top = Rect::new(head.x, head.y + 2.0, head.w, 22.0);
-                    // "See all N →": every task on the machine, ended ones too, in a popup.
+                    // "See All →": every task on the machine, ended ones too, in a popup.
                     let mut see = Rect::default();
                     if matches!(h.link, Link::Up(_)) && !h.tasks.is_empty() {
-                        let label = format!("See all {} →", h.tasks.len());
-                        let lw = r.measure(UI, 12.0, 500, &label);
+                        let label = "See All →";
+                        let lw = r.measure(UI, 12.0, 500, label);
                         see = Rect::new(self.sidebar_w - 36.0 - lw - 12.0, top.y, lw + 12.0, top.h);
-                        r.text(see.x + 6.0, r.center(see, UI, 12.0), &label, UI, 12.0, 500, t.text2, lw + 2.0);
+                        r.text(see.x + 6.0, r.center(see, UI, 12.0), label, UI, 12.0, 500, t.text2, lw + 2.0);
                         if self.hit(r, see) && clicked(self.click) {
                             picks.push(Action::MachineTasks(Some(m)));
                         }
