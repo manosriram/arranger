@@ -253,6 +253,7 @@ struct AddHost {
 
 enum Action {
     Select(TaskKey),
+    ToggleBookmark(TaskKey),
     Focus(Focus),
     NewTask,
     ToggleTheme,
@@ -319,6 +320,7 @@ struct App {
     gfx: Option<Gfx>,
     hosts: Vec<Host>,
     selected: Option<TaskKey>,
+    bookmarks: Vec<Bookmark>,
     session: Option<Session>,
     /// The selected headless task's conversation, in place of its terminal.
     chat: Option<chat::ChatView>,
@@ -476,6 +478,7 @@ fn run() -> io::Result<()> {
         gfx: None,
         hosts: Vec::new(),
         selected: None,
+        bookmarks: Vec::new(),
         session: None,
         chat: None,
         drafts: std::collections::HashMap::new(),
@@ -555,6 +558,7 @@ fn run() -> io::Result<()> {
     app.ding_muted = settings.ding_muted;
     app.prompts = settings.prompts;
     app.recent = settings.recent;
+    app.bookmarks = settings.bookmarks;
     // Started inside a project (from a terminal): that's the one. Else (Finder, the Dock) ask.
     match welcome::project_root(&app.repo) {
         Some(top) => {
@@ -571,10 +575,18 @@ fn run() -> io::Result<()> {
     event_loop.run_app(&mut app).map_err(io::Error::other)
 }
 
+/// Stable machine identity keeps saved threads valid when machines are reordered.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+struct Bookmark {
+    host: Option<String>,
+    id: u64,
+}
+
 /// Window preferences, kept in <data>/gui.json.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 #[serde(default)]
 struct Settings {
+    bookmarks: Vec<Bookmark>,
     theme: String,
     vim: bool,
     ding_muted: bool,
@@ -1295,6 +1307,14 @@ impl App {
         self.spawn_request(key.0, Tag::Changes(key), Request::Review { id: key.1 });
     }
 
+    fn bookmark(&self, key: TaskKey) -> Bookmark {
+        Bookmark { host: self.hosts[key.0].cfg.as_ref().map(|m| m.ssh.clone()), id: key.1 }
+    }
+
+    fn is_bookmarked(&self, key: TaskKey) -> bool {
+        self.bookmarks.contains(&self.bookmark(key))
+    }
+
     fn all_tasks(&self) -> impl Iterator<Item = &TaskInfo> {
         self.hosts.iter().filter(|h| !h.removed).flat_map(|h| &h.tasks)
     }
@@ -1315,6 +1335,10 @@ impl App {
         let mut needs: Vec<&TaskInfo> = self.all_tasks().filter(shown).filter(|t| group(&t.state) == 0).collect();
         sort(&mut needs);
         let mut out = vec![Section { key: "needs".into(), host: None, tasks: needs, ended: 0, more: 0 }];
+        let mut saved: Vec<_> = self.all_tasks().filter(|t| self.is_bookmarked((t.machine, t.id)))
+            .filter(|t| f.is_empty() || format!("{} {} {} {}", title(t), t.agent, t.branch, self.hosts[t.machine].name()).to_lowercase().contains(&f)).collect();
+        sort(&mut saved);
+        out.insert(0, Section { key: "bookmarks".into(), host: None, tasks: saved, ended: 0, more: 0 });
         let dense = self.dense();
         for (i, h) in self.hosts.iter().enumerate().filter(|(_, h)| !h.removed) {
             let mut tasks: Vec<&TaskInfo> = h.tasks.iter().filter(shown).filter(|t| group(&t.state) != 0).collect();
@@ -1367,7 +1391,8 @@ impl App {
         }
         let sections = self.sections();
         let open = sections.iter().filter(|s| !self.collapsed.contains(&s.key));
-        open.flat_map(|s| s.tasks.iter().map(|t| (t.machine, t.id))).collect()
+        let mut seen = std::collections::HashSet::new();
+        open.flat_map(|s| s.tasks.iter().map(|t| (t.machine, t.id))).filter(|key| seen.insert(*key)).collect()
     }
 
     /// Adds a machine to the window; a remote one gets a thread that keeps its ssh link up.
@@ -1491,7 +1516,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        let s = Settings { theme: THEMES[self.theme].name.into(), vim: self.vim, ding_muted: self.ding_muted, prompts: self.prompts.clone(), recent: self.recent.clone() };
+        let s = Settings { theme: THEMES[self.theme].name.into(), vim: self.vim, ding_muted: self.ding_muted, prompts: self.prompts.clone(), recent: self.recent.clone(), bookmarks: self.bookmarks.clone() };
         if arranger::security::private_dir(&proto::data_dir()).is_ok() {
             let _ = arranger::security::write_private(&Settings::path(), &serde_json::to_vec_pretty(&s).unwrap_or_default());
         }
@@ -2335,6 +2360,15 @@ impl App {
     fn apply(&mut self) {
         for action in std::mem::take(&mut self.actions) {
             match action {
+                Action::ToggleBookmark(key) => {
+                    let bookmark = self.bookmark(key);
+                    if let Some(i) = self.bookmarks.iter().position(|b| b == &bookmark) {
+                        self.bookmarks.remove(i);
+                    } else {
+                        self.bookmarks.push(bookmark);
+                    }
+                    self.save_settings();
+                }
                 Action::Select(id) => {
                     if self.multi_select.is_some() {
                         self.toggle_task_selection(id);
@@ -2800,6 +2834,18 @@ impl App {
             };
             let mut host_down = None;
             match sec.host {
+                None if sec.key == "bookmarks" => {
+                    let head = Rect::new(6.0, y + 6.0, self.sidebar_w - 13.0, GROUP_H);
+                    let label = format!("BOOKMARKS  {}", sec.tasks.len());
+                    r.text(16.0, r.center(head, UI, 11.5), &label, UI, 11.5, 600, t.text2, head.w - 32.0);
+                    chevron(r, head.y + head.h / 2.0);
+                    if self.hit(r, head) && clicked(self.click) { picks.push(Action::Toggle(sec.key.clone())); }
+                    y += GROUP_H + 12.0;
+                    if sec.tasks.is_empty() && !folded {
+                        r.text(16.0, y + 2.0, "Bookmark a thread to keep it here", UI, 11.5, 400, t.text3, self.sidebar_w - 32.0);
+                        y += 28.0;
+                    }
+                }
                 None if sec.tasks.is_empty() => continue,
                 None => {
                     let head = Rect::new(6.0, y + 6.0, self.sidebar_w - 13.0, GROUP_H);
@@ -2888,7 +2934,7 @@ impl App {
                 y += 24.0;
             }
             for task in &sec.tasks {
-                if sec.host.is_none() {
+                if sec.key == "needs" {
                     let card = Rect::new(10.0, y + 2.0, self.sidebar_w - 21.0, NEEDS_CARD_H);
                     let chip = multi.then(|| self.hosts[task.machine].name());
                     picks.extend(self.draw_needs_card(r, t, task, card, chip, clicked(self.click)));
@@ -3066,6 +3112,15 @@ impl App {
             }
             right = clone.x;
         }
+        let key = (task.machine, task.id);
+        let saved = self.is_bookmarked(key);
+        let label = if saved { "Bookmarked" } else { "Bookmark" };
+        let bw = r.measure(UI, 12.0, 500, label) + 24.0;
+        let bookmark = Rect::new(right - 8.0 - bw, top.y, bw, 28.0);
+        r.frame(bookmark, 4.0, if saved { t.sel } else { t.bg }, t.border2);
+        r.text(bookmark.x + 12.0, r.center(bookmark, UI, 12.0), label, UI, 12.0, 500, if saved { t.tc_on } else { t.text }, bw - 20.0);
+        if self.hit(r, bookmark) { self.actions.push(Action::ToggleBookmark(key)); }
+        right = bookmark.x;
         let tx = pill.x + pw + 8.0 + ship_badge(r, t, &task.shipped, pill.x + pw + 8.0, pill.y + pill.h / 2.0) + 4.0;
         r.text(tx, r.center(top, UI, 15.0), &title(&task), UI, 15.0, 600, t.text, (right - tx - 16.0).max(40.0));
 
@@ -3960,6 +4015,21 @@ fn draw_term(r: &mut Renderer, t: &Theme, screen: &Screen, area: Rect, top: f32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bookmarks_survive_settings_roundtrip_and_older_preferences() {
+        let old: Settings = serde_json::from_str(r#"{"theme":"Paper","vim":true}"#).unwrap();
+        assert!(old.bookmarks.is_empty());
+        let saved = Settings {
+            bookmarks: vec![Bookmark { host: None, id: 7 }, Bookmark { host: Some("user@gpu".into()), id: 7 }],
+            ..old
+        };
+        let loaded: Settings = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(loaded.bookmarks, saved.bookmarks);
+        assert_ne!(loaded.bookmarks[0], loaded.bookmarks[1]);
+        assert_eq!(loaded.theme, "Paper");
+        assert!(loaded.vim);
+    }
 
     #[test]
     fn saved_scheme_names_survive_the_new_eight() {

@@ -35,10 +35,17 @@ impl App {
             if self.hit(r, cancel) { self.multi_select = None; self.actions.clear(); }
         }
         if let Some((key, (x, y))) = self.task_menu {
-            let menu = Rect::new(x.min(w - 172.0).max(0.0), y.min(h - 42.0).max(0.0), 172.0, 38.0);
+            let menu = Rect::new(x.min(w - 192.0).max(0.0), y.min(h - 80.0).max(0.0), 192.0, 76.0);
             r.frame(menu, 4.0, t.dialog, t.border2);
-            r.text(menu.x + 12.0, r.center(menu, UI, 13.0), "Select task", UI, 13.0, 500, t.text, 148.0);
-            if self.hit(r, menu) {
+            let save = Rect::new(menu.x, menu.y, menu.w, 38.0);
+            let select = Rect::new(menu.x, menu.y + 38.0, menu.w, 38.0);
+            let label = if self.is_bookmarked(key) { "Remove bookmark" } else { "Bookmark thread" };
+            r.text(save.x + 12.0, r.center(save, UI, 13.0), label, UI, 13.0, 500, t.text, 168.0);
+            r.text(select.x + 12.0, r.center(select, UI, 13.0), "Select task", UI, 13.0, 500, t.text, 168.0);
+            if self.hit(r, save) {
+                self.actions.push(Action::ToggleBookmark(key));
+                self.task_menu = None;
+            } else if self.hit(r, select) {
                 self.multi_select = Some(vec![key]);
                 self.answering = None;
                 self.task_menu = None;

@@ -9,6 +9,8 @@ Linux and macOS. Rust throughout; no webview.
   <img alt="arranger workspace with six agents on three machines, permission and question cards in the sidebar, and a completed Codex task selected" src="assets/screenshot.png">
 </picture>
 
+Threads can be saved with **Bookmark** in the thread header, or **Bookmark thread** in a thread's right-click menu. Open any saved thread from **Bookmarks** at the top of the sidebar. Saved threads remain available after restarting, including ended and merged threads; click **Bookmarked** or choose **Remove bookmark** to unsave one.
+
 ## Install
 
 ```sh
