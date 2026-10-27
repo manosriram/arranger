@@ -25,11 +25,7 @@ pub fn parse(value: Value, tree: String, verified_by: Vec<String>) -> Result<Wor
 }
 
 pub fn message(s: &WorkSummary) -> String {
-    let mut out = format!("{}\n\n{}", s.title, s.overview);
-    for (path, change) in &s.files { out.push_str(&format!("\n- {path}: {change}")); }
-    if !s.risks.is_empty() { out.push_str(&format!("\n\nRisks:\n- {}", s.risks.join("\n- "))); }
-    if !s.verified_by.is_empty() { out.push_str(&format!("\n\nVerified by:\n- {}", s.verified_by.join("\n- "))); }
-    out
+    s.overview.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Internal subprocess entrypoint, with a daemon-enforced timeout/process group. It speaks to
@@ -94,7 +90,11 @@ mod tests {
         let value = json!({"title":"Fix search","overview":"Find Unicode names.","files":[{"path":"search.rs","change":"Handle Unicode"}],"risks":[],"verified_by":["invented"]});
         let s = parse(value, "tree".into(), vec!["cargo test".into()]).unwrap();
         assert_eq!(s.verified_by, ["cargo test"]);
-        assert!(message(&s).starts_with("Fix search\n\n"));
+        assert_eq!(message(&s), "Find Unicode names.");
+        let mut multiline = s.clone();
+        multiline.overview = "Find Unicode names.\n\n Preserve search behavior.".into();
+        multiline.risks.push("Legacy metadata".into());
+        assert_eq!(message(&multiline), "Find Unicode names. Preserve search behavior.");
         assert!(parse(json!({"title":"bad\ntitle"}), "tree".into(), vec![]).is_err());
     }
 }

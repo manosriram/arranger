@@ -2424,7 +2424,7 @@ impl Daemon {
         let run = self.check_runs(id)?.into_iter().next().ok_or("no check run")?;
         let verified_by = run.checks.iter().filter(|c| c.state == "passed").map(|c| c.command.clone()).collect::<Vec<_>>();
         let context = review::chat_summary(&self.events(id)?);
-        let prompt = format!("Summarize the completed work for human review and a commit message. Return JSON matching the schema. Read only; do not edit files, run checks, or send messages. Describe this exact tree {tree}, not intended future work. Include a short title, overview, per-file changes, and risks. Do not claim verification beyond these recorded results: {}. Check state: {}.\nConversation context:\n{context}\nDiff:\n{diff}", verified_by.join(", "), run.state);
+        let prompt = format!("Summarize the completed work for human review and a commit message. Return JSON matching the schema. Read only; do not edit files, run checks, or send messages. Describe this exact tree {tree}, not intended future work. Keep the overview short: one concise paragraph describing only what the changes do to the existing codebase. Do not include headings, lists, per-file breakdowns, risks, or verification details in the overview. Include a short title and return empty arrays for files and risks. Do not claim verification beyond these recorded results: {}. Check state: {}.\nConversation context:\n{context}\nDiff:\n{diff}", verified_by.join(", "), run.state);
         let name = format!("summary-{}", self.next_side);
         self.next_side += 1;
         let side = side::start_summary(planner, Path::new(&wt), &prompt, if own { &model } else { "" }, &self.data.join("side"), &name, &agent, if own { session.trim() } else { "" }, &self.exe).map_err(e2s)?;
