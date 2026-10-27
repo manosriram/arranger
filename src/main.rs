@@ -28,7 +28,7 @@ const USAGE: &str = "usage: arranger            open the workspace window
        arranger [ls [--files] | new [--headless|--terminal] [--effort <e>] <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
                  | approve <id> | deny <id> [reason] | events <id> | chat <id> | diff <id> | revert <id> <path> <hunk#>
                  | run <id> [command ...] | send <id> <text> | interrupt <id> | mode <id> <default|acceptEdits|plan> | revive <id> [prompt] | clone <id> [--model <m>] [prompt] | commit <id> [--merge|--pr] [message]
-                 | setup <id> [approve|skip|retry|replan|log] | checks <id> [--run [--wait] <command> ... | --stop | --approve [--always] | --drop <command> | --log <check>] | ping | stop | serve | hook <adapter>
+                 | setup <id> [approve|skip|retry|replan|log] | checks <id> [--run [--wait] <command> ... | --stop | --approve [--always] | --drop <command> | --log <check> | --report | --accept] | settings auto_fix [0..10] | ping | stop | serve | hook <adapter>
                  | machine [ls | add <name> <user@host> [repo] | rm <name>] | endpoint]";
 /// Ctrl-\, raw and in kitty keyboard encoding.
 const DETACH: &[&[u8]] = &[b"\x1c", b"\x1b[92;5u"];
@@ -84,6 +84,10 @@ fn main() {
         ["attach", id] => parse_id(id).and_then(attach),
         ["clone", id, "--model", model, ref text @ ..] => parse_id(id).and_then(|id| clone(id, Some(model), text)),
         ["clone", id, ref text @ ..] => parse_id(id).and_then(|id| clone(id, None, text)),
+        ["settings", key] => print_text(Request::Setting { key: key.to_string(), value: None }),
+        ["settings", key, value] => print_text(Request::Setting { key: key.to_string(), value: Some(value.to_string()) }),
+        ["checks", id, "--accept"] => parse_id(id).and_then(|id| request(&Request::AcceptChecks { id }).map(drop)),
+        ["checks", id, "--report"] => parse_id(id).and_then(|id| print_text(Request::CheckReport { id })),
         ["checks", id] => parse_id(id).and_then(|id| show_checks(id, 30).map(drop)),
         ["checks", id, "--approve"] => parse_id(id).and_then(|id| request(&Request::ApproveChecks { id, always: false }).map(drop)),
         ["checks", id, "--approve", "--always"] => parse_id(id).and_then(|id| request(&Request::ApproveChecks { id, always: true }).map(drop)),
@@ -188,6 +192,13 @@ fn ls(files: bool) -> io::Result<()> {
 }
 
 /// Task `id`'s latest check runs, the newest first; returns the newest run's state.
+fn print_text(req: Request) -> io::Result<()> {
+    match request(&req)? {
+        Reply::Text(text) => { println!("{text}"); Ok(()) }
+        reply => Err(unexpected(reply)),
+    }
+}
+
 fn show_checks(id: u64, runs: usize) -> io::Result<String> {
     let reply = request(&Request::Checks { id })?;
     let Reply::Checks(list) = reply else { return Err(unexpected(reply)) };
@@ -199,6 +210,7 @@ fn show_checks(id: u64, runs: usize) -> io::Result<String> {
         let tree: String = run.tree.chars().take(9).collect();
         let after = if run.auto { " · after a turn" } else { "" };
         println!("run {} · {} · {passed}/{} passed · tree {tree}{after}", run.id, run.state, run.checks.len());
+        if run.accepted { println!("  failed checks accepted"); }
         if !run.note.is_empty() {
             println!("  {}", run.note);
         }

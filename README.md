@@ -76,6 +76,15 @@ Nothing is read from or written to the repository for this.
 - **Stale.** Sending the agent another prompt marks the turn's checks stale and stops them.
 - **Checks must not change the work.** A check that changes or deletes files fails, and its changes are put back. New files it leaves behind (a lockfile, a snapshot) are removed and noted.
 
+**When checks fail**, the task appears under Needs you. Open **Review checks** to:
+- **Send to agent:** prepare an editable message with the failed commands, exit codes, and relevant output. Sending it starts another turn.
+- **Rerun:** run the latest list again.
+- **Accept anyway:** record your acceptance for the checked worktree. Changed work must be checked again; failures stay visible and remain required on later runs.
+
+**Auto-fix rounds** in the Checks tab sets how many failure reports Arranger sends automatically (0–10, default 0). This is a daemon-wide setting, also available as `arranger settings auto_fix 2`. The round count is stored per task and resets after checks pass or you send a prompt through Arranger. Automatic fixes wait for an idle agent and use the normal check approval rules.
+
+From the CLI, `arranger checks <id> --report` prints the failure message and `arranger checks <id> --accept` accepts the latest failed run.
+
 **You can also run them yourself:**
 - **Running them.** Add commands under **Run checks** and press it; the next run starts with the last run's commands.
 - **The record.** Each run records exactly which state of the worktree it judged (uncommitted edits included), and each check its exit status and output.

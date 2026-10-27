@@ -779,7 +779,7 @@ impl App {
     }
 
     /// The message box at the bottom of `sec`; returns the y above it.
-    fn draw_composer(&mut self, r: &mut Renderer, t: &Theme, sec: Rect, task: &TaskInfo, focused: bool) -> f32 {
+    pub(super) fn draw_composer(&mut self, r: &mut Renderer, t: &Theme, sec: Rect, task: &TaskInfo, focused: bool) -> f32 {
         let key = (task.machine, task.id);
         let draft = self.drafts.get(&key).cloned().unwrap_or_default();
         let send_w = 76.0;

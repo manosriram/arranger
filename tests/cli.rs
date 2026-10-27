@@ -615,6 +615,17 @@ fn checks_run_log_and_stop() {
     let (_, list) = home.arranger(&repo, &["checks", "1"]);
     assert!(!list.contains(&tree[..9]), "an index without the untracked file would give {tree}:\n{list}");
 
+    let (ok, report) = home.arranger(&repo, &["checks", "1", "--report"]);
+    assert!(ok && report.contains("exit 2") && report.contains("error: it broke") && !report.contains('\x1b'), "{report}");
+    assert!(!report.contains("port 20010"), "passing checks aren't failures: {report}");
+    let wt = home.0.join("worktrees/repo/1");
+    std::fs::write(wt.join("changed"), "new work").unwrap();
+    let (ok, out) = home.arranger(&repo, &["checks", "1", "--accept"]);
+    assert!(!ok && out.contains("worktree changed"), "{out}");
+    std::fs::remove_file(wt.join("changed")).unwrap();
+    assert!(home.arranger(&repo, &["checks", "1", "--accept"]).0);
+    assert!(home.arranger(&repo, &["checks", "1"]).1.contains("failed checks accepted"));
+
     // A long check: a second run waits for it; stopping ends both it and the rest.
     assert!(home.arranger(&repo, &["checks", "1", "--run", "echo started; sleep 30", "echo never"]).0);
     let (ok, out) = home.arranger(&repo, &["checks", "1", "--run", "true"]);
@@ -752,4 +763,62 @@ fn checks_follow_turns() {
     let out = until("unverified");
     assert!(out.starts_with("run 5 ") && out.contains("Code changed and no check covers it"), "{out}");
     home.wait_state(&repo, &["done"]);
+}
+
+#[test]
+fn failed_checks_auto_fix_is_bounded_and_persisted() {
+    let home = Home(std::env::temp_dir().join(format!("arranger-auto-fix-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&home.0);
+    let repo = home.0.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("lib.rs"), "fn a() {}\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    let exe = |path: &Path, body: &str| {
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    };
+    let bin = home.0.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let claude = bin.join("claude");
+    exe(&claude, HEADLESS_CLAUDE);
+    // A planner is present from daemon startup; initially it only plans setup.
+    let planner = home.0.join("planner");
+    exe(&planner, "#!/bin/sh\ncat >/dev/null\nprintf '{\"structured_output\":{\"copy\":[],\"commands\":[],\"note\":\"\"}}'\n");
+    assert!(home.arranger(&repo, &["new", "--headless", claude.to_str().unwrap(), "hello"]).0);
+    home.wait_state(&repo, &["done"]);
+    assert_eq!(home.arranger(&repo, &["settings", "auto_fix"]).1.trim(), "0");
+    for value in ["-1", "11", "no"] {
+        assert!(!home.arranger(&repo, &["settings", "auto_fix", value]).0);
+    }
+    assert!(!home.arranger(&repo, &["settings", "unknown", "1"]).0);
+    let wt = home.0.join("worktrees/repo/1");
+    std::fs::write(wt.join("lib.rs"), "fn changed() {}\n").unwrap();
+    std::fs::write(home.0.join("plan"), r#"{"checks":[{"name":"test","command":"false","why":"fixture"}],"none_reason":""}"#).unwrap();
+    exe(&planner, CHECK_PLANNER);
+    assert!(home.arranger(&repo, &["send", "1", "check this"]).0);
+    let wait_run = |run: u64, state: &str| {
+        let start = Instant::now();
+        loop {
+            let out = home.arranger(&repo, &["checks", "1"]).1;
+            if out.starts_with(&format!("run {run} · {state}")) { break; }
+            assert!(start.elapsed() < Duration::from_secs(15), "{out}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    wait_run(1, "approval");
+    assert!(home.arranger(&repo, &["settings", "auto_fix", "2"]).0);
+    assert!(home.arranger(&repo, &["checks", "1", "--approve", "--always"]).0);
+    // The fake makes no edits: failed checks still rerun on the unchanged tree.
+    wait_run(3, "failed");
+    home.wait_state(&repo, &["needs-you"]);
+    let events = home.arranger(&repo, &["events", "1"]).1;
+    assert_eq!(events.matches("prompt: These checks failed").count(), 2, "{events}");
+    assert!(home.arranger(&repo, &["checks", "1", "--accept"]).0);
+    home.wait_state(&repo, &["done"]);
+    assert!(home.arranger(&repo, &["stop"]).0);
+    assert_eq!(home.arranger(&repo, &["settings", "auto_fix"]).1.trim(), "2");
+    let out = home.arranger(&repo, &["checks", "1"]).1;
+    assert!(out.starts_with("run 3 · failed") && out.contains("failed checks accepted"), "{out}");
 }

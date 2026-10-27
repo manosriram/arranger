@@ -202,3 +202,12 @@ empty, the result is "Unverified" (amber). If only docs or non-code files change
 4. **Failure loop:** Send to agent, Accept anyway, auto-fix.
 5. **Summary.**
 6. **Review and Merge gates.**
+
+## Progress in worktree 145
+
+Phases 1–3 were carried forward from worktree 143. Phase 4 now includes editable failure
+reports in the GUI, acceptance tied to the checked tree, needs-you status, rerunning the
+latest list, and persisted auto-fix rounds (default 0; configurable in Checks or the CLI).
+Auto-fix rounds reset when checks pass or a prompt is sent through Arranger. The report
+composer also works for terminal tasks. Summary generation and review/merge gates remain
+phases 5–6.

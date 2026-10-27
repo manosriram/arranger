@@ -29,6 +29,7 @@ pub struct ChecksView {
     pub input: String,
     error: String,
     rail_scroll: f32,
+    auto_fix: u32,
 }
 
 struct ConsoleView {
@@ -50,6 +51,10 @@ struct ConsoleView {
 #[derive(Clone, Debug)]
 pub enum ChecksAction {
     Select(u64),
+    SendFailures,
+    Accept,
+    AutoFix,
+    RetryLatest,
     /// Add the typed command to the next run (or, with nothing typed, run).
     Add,
     Remove(usize),
@@ -76,6 +81,10 @@ impl App {
             return;
         }
         (self.review, self.machine_tasks, self.shell) = (None, None, false);
+        let auto_fix = match request_at(self.sock(host).as_deref(), &Request::Setting { key: "auto_fix".into(), value: None }) {
+            Ok(Reply::Text(value)) => value.parse().unwrap_or(0),
+            _ => 0,
+        };
         self.checks = Some(ChecksView {
             task,
             host,
@@ -90,6 +99,7 @@ impl App {
             input: String::new(),
             error: String::new(),
             rail_scroll: 0.0,
+            auto_fix,
         });
         self.focus = self.rest();
     }
@@ -103,6 +113,45 @@ impl App {
         let Some(cv) = &mut self.checks else { return };
         let (host, id) = (cv.host, cv.task);
         match action {
+            ChecksAction::RetryLatest => {
+                let Some(run) = cv.runs.first() else { return };
+                let checks = run.checks.iter().map(|c| proto::CheckSpec { name: c.name.clone(), command: c.command.clone(), why: c.why.clone() }).collect();
+                self.run_checks_now(host, id, checks);
+            }
+            ChecksAction::AutoFix => {
+                let rounds = (cv.auto_fix + 1) % 11;
+                match request_at(self.sock(host).as_deref(), &Request::Setting { key: "auto_fix".into(), value: Some(rounds.to_string()) }) {
+                    Ok(Reply::Text(value)) => self.checks.as_mut().unwrap().auto_fix = value.parse().unwrap_or(0),
+                    Ok(Reply::Error(e)) => self.checks.as_mut().unwrap().error = e,
+                    Err(e) => self.checks.as_mut().unwrap().error = e.to_string(),
+                    _ => {}
+                }
+            }
+            ChecksAction::SendFailures => {
+                match request_at(self.sock(host).as_deref(), &Request::CheckReport { id }) {
+                    Ok(Reply::Text(text)) => {
+                        let draft = self.drafts.entry((host, id)).or_default();
+                        if !draft.is_empty() { draft.push_str("\n\n"); }
+                        draft.push_str(&text);
+                        self.caret = Some((Focus::Message, draft.len()));
+                        self.anchor = None;
+                        self.checks = None;
+                        self.focus = Focus::Message;
+                    }
+                    Ok(Reply::Error(e)) => self.checks.as_mut().unwrap().error = e,
+                    Err(e) => self.checks.as_mut().unwrap().error = e.to_string(),
+                    _ => {}
+                }
+            }
+            ChecksAction::Accept => {
+                match request_at(self.sock(host).as_deref(), &Request::AcceptChecks { id }) {
+                    Ok(Reply::Ok) => self.checks.as_mut().unwrap().error.clear(),
+                    Ok(Reply::Error(e)) => self.checks.as_mut().unwrap().error = e,
+                    Err(e) => self.checks.as_mut().unwrap().error = e.to_string(),
+                    _ => {}
+                }
+                self.refresh_runs();
+            }
             ChecksAction::Select(check) => {
                 cv.selected = Some(check);
                 cv.console = None;
@@ -346,6 +395,12 @@ impl App {
             self.actions.push(Action::Checks(action));
         }
         y += 38.0;
+        let rounds = self.checks.as_ref().unwrap().auto_fix;
+        let label = format!("Auto-fix rounds: {rounds}");
+        let b = Rect::new(x, y, w, 26.0);
+        r.text(b.x, r.center(b, UI, 12.0), &label, UI, 12.0, 500, t.text2, w);
+        if self.hit(r, b) { self.actions.push(Action::Checks(ChecksAction::AutoFix)); }
+        y += 30.0;
         let error = self.checks.as_ref().unwrap().error.clone();
         if !error.is_empty() {
             r.text(x, y, &error, UI, 12.0, 400, t.del, w);
@@ -370,6 +425,7 @@ impl App {
             let (mark, color) = state_mark(t, &run.state);
             r.text(x, y, mark, UI, 12.0, 600, color, 14.0);
             let state = match run.state.as_str() {
+                "failed" if run.accepted => "failed · accepted",
                 "planning" => "planning checks…",
                 "approval" => "waits for approval",
                 "skipped" => "no checks needed",
@@ -389,6 +445,23 @@ impl App {
             if !run.note.is_empty() {
                 let color = if matches!(run.state.as_str(), "unverified" | "error") { color } else { t.text2 };
                 y += self.wrapped(r, x + 18.0, y, w - 18.0, &run.note, UI, 11.5, color, 17.0) + 2.0;
+            }
+            if run.state == "failed" && !run.accepted && runs.first().is_some_and(|r| r.id == run.id) {
+                let mut bx = x + 18.0;
+                for (label, action) in [("Send to agent", ChecksAction::SendFailures), ("Accept anyway", ChecksAction::Accept)] {
+                    let bw = r.measure(UI, 12.0, 500, label) + 18.0;
+                    let b = Rect::new(bx, y + 4.0, bw, 28.0);
+                    r.frame(b, 0.0, t.bg, t.border2);
+                    r.text(b.x + 9.0, r.center(b, UI, 12.0), label, UI, 12.0, 500, t.text, bw);
+                    if self.hit(r, b) { self.actions.push(Action::Checks(action)); }
+                    bx += bw + 6.0;
+                }
+                y += 36.0;
+                let b = Rect::new(x + 18.0, y, 64.0, 26.0);
+                r.frame(b, 0.0, t.bg, t.border2);
+                r.text(b.x + 9.0, r.center(b, UI, 12.0), "Rerun", UI, 12.0, 500, t.text, b.w);
+                if self.hit(r, b) { self.actions.push(Action::Checks(ChecksAction::RetryLatest)); }
+                y += 30.0;
             }
             // Planned checks that aren't plainly check-only wait for you.
             if run.state == "approval" {

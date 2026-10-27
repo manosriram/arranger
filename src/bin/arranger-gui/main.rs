@@ -3196,7 +3196,9 @@ impl App {
         r.text(ask.x, r.center(ask, UI, 12.5), &status_line(task, 0).replace('\n', " "), UI, 12.5, 400, t.needs, ask.w);
 
         let checks_wait = task.checks.state == "approval" && task.state == "needs-you";
-        let buttons: Vec<(&str, bool, Vec<Action>)> = if self.multi_select.is_some() { vec![] } else if checks_wait {
+        let buttons: Vec<(&str, bool, Vec<Action>)> = if self.multi_select.is_some() { vec![] } else if task.checks.state == "failed" && !task.checks.accepted && task.state == "needs-you" {
+            vec![("Review checks", true, vec![Action::Select(key), Action::OpenChecks])]
+        } else if checks_wait {
             vec![("Review checks", true, vec![Action::Select(key), Action::OpenChecks]), ("Skip", false, vec![Action::StopChecks(key)])]
         } else if task.state == "setup-needs-you" {
             let first = if task.setup == "failed" { ("Retry", SetupAction::Retry) } else { ("Approve", SetupAction::Approve) };
@@ -3370,7 +3372,7 @@ impl App {
             }
         }
         let bottom = if ended { input_area.y } else { area.y + area.h };
-        let sec = Rect::new(area.x, area.y + HEADER_H, area.w, bottom - area.y - HEADER_H);
+        let mut sec = Rect::new(area.x, area.y + HEADER_H, area.w, bottom - area.y - HEADER_H);
         r.rect(sec, 0.0, t.term);
         if self.hit_as(r, sec, Cursor::Text) {
             self.actions.push(Action::Focus(Focus::Term));
@@ -3382,6 +3384,10 @@ impl App {
         if task.headless && !self.shell {
             self.draw_chat(r, t, sec, &task, ended);
             return;
+        }
+        if !task.headless && !self.shell && self.drafts.contains_key(&(task.machine, task.id)) {
+            let top = self.draw_composer(r, t, sec, &task, self.focus == Focus::Message);
+            sec.h = (top - sec.y).max(0.0);
         }
         let grid = Rect::new(sec.x + 16.0, sec.y + 12.0, sec.w - 32.0, sec.h - 20.0);
         let cell_w = r.advance(MONO, TERM_SIZE, 400, '0');
