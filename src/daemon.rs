@@ -2,11 +2,15 @@
 
 use crate::adapter::{self, Osc};
 use crate::chat::Chat;
+use crate::checks;
+use crate::console::Console;
 use crate::headless::{self, Agent};
 use crate::proto::{self, Event, Reply, Request, Ship, TaskInfo};
 use crate::pty::{self, Pty};
 use crate::review;
 use crate::security;
+use crate::setup::{self, Plan};
+use crate::side;
 use alacritty_terminal::term::TermMode;
 use crate::screen::Screen;
 use mio::net::{UnixListener, UnixStream};
@@ -140,7 +144,47 @@ struct Daemon {
     chats: HashMap<u64, Chat>,
     /// When changed chat items next go out to their viewers.
     chat_due: Option<Instant>,
+    /// Setup plans being made: one side-run per repository state, and the tasks waiting on it.
+    plans: Vec<PlanRun>,
+    /// Setup commands running, by task, and when they're out of time.
+    setups: HashMap<u64, (std::process::Child, Instant)>,
+    next_side: u64,
+    /// Check runs under way, by task.
+    passes: HashMap<u64, Pass>,
+    /// Check output parsed so far, by check, and how many bytes of its log that took.
+    consoles: HashMap<u64, (Console, u64)>,
 }
+
+/// A task's check run: the checks still to go, and the one running.
+struct Pass {
+    run: u64,
+    queue: std::collections::VecDeque<u64>,
+    current: Option<Running>,
+}
+
+struct Running {
+    check: u64,
+    child: std::process::Child,
+    deadline: Instant,
+    /// Why arranger stopped it (out of time, too much output), if it did.
+    cut: Option<&'static str>,
+}
+
+const CHECK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const CHECK_LOG_MAX: u64 = 32 << 20;
+
+struct PlanRun {
+    repo: String,
+    key: String,
+    /// The ignored files offered to it: its plan may copy only these.
+    candidates: Vec<String>,
+    run: side::Run,
+    waiting: Vec<u64>,
+    deadline: Instant,
+}
+
+const PLAN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const SETUP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 pub fn run() -> io::Result<()> {
     let data = proto::data_dir();
@@ -149,6 +193,7 @@ pub fn run() -> io::Result<()> {
     security::private_dir(&data)?;
     security::private_dir(&data.join("logs"))?;
     security::private_dir(&data.join("adapters"))?;
+    security::private_dir(&data.join("logs/checks"))?;
     let sock = proto::socket_path();
     security::private_dir(sock.parent().ok_or_else(|| io::Error::other("socket has no directory"))?)?;
     // Retain the lock for the daemon's lifetime. Concurrent starts must never unlink a live socket.
@@ -198,9 +243,34 @@ pub fn run() -> io::Result<()> {
         "headless INTEGER NOT NULL DEFAULT 0",
         "effort TEXT NOT NULL DEFAULT ''",
         "mode TEXT NOT NULL DEFAULT ''",
+        "setup TEXT NOT NULL DEFAULT ''",
+        "setup_detail TEXT NOT NULL DEFAULT ''",
+        "start_ask TEXT NOT NULL DEFAULT ''",
+        "setup_key TEXT NOT NULL DEFAULT ''",
     ] {
         let _ = db.execute(&format!("ALTER TABLE tasks ADD COLUMN {col}"), []);
     }
+    // Setup plans per repository and the state of its manifests (`setup::fingerprint`);
+    // `approved`: you approved it, so it runs without asking.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS setup_plans (
+            repo TEXT NOT NULL, key TEXT NOT NULL, plan TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0,
+            created INTEGER NOT NULL, PRIMARY KEY (repo, key));
+         UPDATE tasks SET setup = 'failed', setup_detail = 'Interrupted: the daemon stopped while it ran'
+            WHERE state = 'setup' AND setup IN ('planning', 'running');
+         CREATE TABLE IF NOT EXISTS check_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, task INTEGER NOT NULL, started INTEGER NOT NULL,
+            ended INTEGER NOT NULL DEFAULT 0, tree TEXT NOT NULL, state TEXT NOT NULL);
+         CREATE INDEX IF NOT EXISTS check_runs_task ON check_runs (task);
+         CREATE TABLE IF NOT EXISTS checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, run INTEGER NOT NULL, task INTEGER NOT NULL, pos INTEGER NOT NULL,
+            name TEXT NOT NULL, command TEXT NOT NULL, why TEXT NOT NULL, state TEXT NOT NULL, exit INTEGER,
+            started INTEGER NOT NULL DEFAULT 0, ended INTEGER NOT NULL DEFAULT 0);
+         CREATE INDEX IF NOT EXISTS checks_run ON checks (run);
+         UPDATE checks SET state = 'stopped', ended = CAST(strftime('%s', 'now') AS INTEGER) WHERE state IN ('pending', 'running');
+         UPDATE check_runs SET state = 'stopped', ended = CAST(strftime('%s', 'now') AS INTEGER) WHERE state = 'running';",
+    )
+    .map_err(io::Error::other)?;
 
     let poll = Poll::new()?;
     poll.registry().register(&mut listener, LISTENER, Interest::READABLE)?;
@@ -229,6 +299,11 @@ pub fn run() -> io::Result<()> {
         stopping: false,
         chats: HashMap::new(),
         chat_due: None,
+        plans: Vec::new(),
+        setups: HashMap::new(),
+        next_side: 0,
+        passes: HashMap::new(),
+        consoles: HashMap::new(),
     };
     d.start_queued();
 
@@ -268,6 +343,8 @@ pub fn run() -> io::Result<()> {
             d.shutdown(&sock);
             return Ok(());
         }
+        d.time_out_setups();
+        d.time_out_checks();
         let expired: Vec<Token> = d.conns.iter().filter(|(_, c)| (!c.received || !c.inbuf.is_empty()) && c.last_input.elapsed() > Duration::from_secs(30)).map(|(&t, _)| t).collect();
         for t in expired { d.close(t); }
         if d.dirty {
@@ -401,6 +478,22 @@ fn checks(events: &[(u64, Event)]) -> Vec<(String, Option<bool>)> {
     }
     let skip = out.len().saturating_sub(6);
     out.split_off(skip)
+}
+
+/// PORT..PORT+9 is task `id`'s, for its agent and its setup.
+fn task_port(id: u64) -> u64 {
+    20000 + id % 1000 * 10
+}
+
+/// Up to the last `limit` bytes of a file.
+fn read_tail(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    use std::io::Seek;
+    let mut f = fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    f.seek(io::SeekFrom::Start(len.saturating_sub(limit)))?;
+    let mut buf = Vec::new();
+    f.take(limit).read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 fn now_secs() -> u64 {
@@ -651,6 +744,28 @@ impl Daemon {
                 Ok(()) => return, // JobDone comes when the script finishes
                 Err(e) => Reply::Error(e),
             },
+            Request::Setup { id, action } => match self.setup_action(id, action) {
+                Ok(()) => Reply::Ok,
+                Err(e) => Reply::Error(e),
+            },
+            Request::SetupLog { id } => match read_tail(&self.data.join(format!("logs/{id}.setup")), 4 << 20) {
+                Ok(bytes) => Reply::Log(bytes),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Reply::Log(Vec::new()),
+                Err(e) => Reply::Error(format!("no setup log for task {id}: {e}")),
+            },
+            Request::RunChecks { id, checks } => match self.run_checks(id, checks) {
+                Ok(_) => Reply::Ok,
+                Err(e) => Reply::Error(e),
+            },
+            Request::StopChecks { id } => match self.stop_checks(id) {
+                Ok(()) => Reply::Ok,
+                Err(e) => Reply::Error(e),
+            },
+            Request::Checks { id } => match self.check_runs(id) {
+                Ok(runs) => Reply::Checks(runs),
+                Err(e) => Reply::Error(e),
+            },
+            Request::Console { check, start, limit } => self.console(check, start, limit).unwrap_or_else(Reply::Error),
             Request::Kill { id } => match self.kill(id) {
                 Ok(()) => Reply::Ok,
                 Err(e) => Reply::Error(e),
@@ -1230,6 +1345,8 @@ impl Daemon {
             }
             self.finish(id, if failed { "failed" } else { "exited" });
         }
+        self.reap_setups();
+        self.reap_checks();
         let exited: Vec<u64> = self.shells.iter_mut().filter_map(|(&id, s)| matches!(s.pty.child.try_wait(), Ok(Some(_))).then_some(id)).collect();
         for id in exited {
             self.read_shell(id);
@@ -1281,11 +1398,11 @@ impl Daemon {
         }
         self.db
             .execute(
-                "UPDATE tasks SET branch = ?1, worktree = ?2, state = 'queued', base = ?3, base_commit = ?4 WHERE id = ?5",
+                "UPDATE tasks SET branch = ?1, worktree = ?2, state = 'setup', base = ?3, base_commit = ?4 WHERE id = ?5",
                 params![branch, wt.to_string_lossy(), base_name, base_commit, id],
             )
             .map_err(e2s)?;
-        self.start_queued();
+        self.begin_setup(id);
         Ok(id)
     }
 
@@ -1372,13 +1489,13 @@ impl Daemon {
         }
         self.db
             .execute(
-                "UPDATE tasks SET branch = ?1, worktree = ?2, state = 'exited', base = ?3, base_commit = ?4, reviewed = ?5 WHERE id = ?6",
-                params![branch, wt.to_string_lossy(), base, base_commit, reviewed, id],
+                "UPDATE tasks SET branch = ?1, worktree = ?2, state = 'setup', base = ?3, base_commit = ?4, reviewed = ?5, start_ask = ?6 WHERE id = ?7",
+                params![branch, wt.to_string_lossy(), base, base_commit, reviewed, ask, id],
             )
             .map_err(e2s)?;
         self.dirty = true;
-        // Left ended if it can't start: Revive tries again.
-        self.spawn(id, Some(ask), true)?;
+        // Its edits came along, its ignored files (dependencies, .env) didn't.
+        self.begin_setup(id);
         Ok(id)
     }
 
@@ -1413,7 +1530,7 @@ impl Daemon {
             .env("COLORTERM", "truecolor")
             .env("ARRANGER_TASK", id.to_string())
             .env("ARRANGER_REPO", &repo)
-            .env("PORT", (20000 + id % 1000 * 10).to_string()); // PORT..PORT+9 is this task's
+            .env("PORT", task_port(id).to_string());
         let (cols, rows) = (80, 24);
         let pty = if headless {
             let stderr = security::private_file(&self.data.join(format!("logs/{id}.stderr")), true).map_err(e2s)?;
@@ -1456,6 +1573,476 @@ impl Daemon {
         Ok(())
     }
 
+    /// Starts task `id`'s setup: its repository's plan, reused or made now, then copy and run.
+    /// The task is in state `setup` until it ends; then its agent starts.
+    fn begin_setup(&mut self, id: u64) {
+        let row = self.db.query_row("SELECT agent, repo, base_commit, model FROM tasks WHERE id = ?1", [id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))
+        });
+        let Ok((agent, repo, commit, model)) = row else { return };
+        let candidates = setup::candidates(Path::new(&repo));
+        let commit = if commit.is_empty() { "HEAD".to_string() } else { commit };
+        let key = match setup::fingerprint(Path::new(&repo), &commit, &candidates) {
+            Ok(key) => key,
+            Err(e) => return self.setup_stage(id, "failed", &format!("Couldn't read the repository: {e}")),
+        };
+        let _ = self.db.execute("UPDATE tasks SET setup_key = ?1 WHERE id = ?2", params![key, id]);
+        if let Some((plan, approved)) = self.stored_plan(&repo, &key) {
+            return self.planned(id, &plan, approved);
+        }
+        if let Some(p) = self.plans.iter_mut().find(|p| p.repo == repo && p.key == key) {
+            p.waiting.push(id);
+            return self.setup_stage(id, "planning", "");
+        }
+        let Some(planner) = side::planner(&agent) else {
+            self.setup_stage(id, "skipped", "No claude or codex to plan the setup with");
+            return self.setup_done(id);
+        };
+        // Its own model when the planner is its own agent.
+        let same = matches!((&planner, adapter::kind(&agent)), (side::Planner::Claude, "claude") | (side::Planner::Codex, "codex"));
+        let name = format!("setup-{}", self.next_side);
+        self.next_side += 1;
+        match side::start(planner, Path::new(&repo), &setup::prompt(&candidates), &setup::schema(), if same { &model } else { "" }, &self.data.join("side"), &name) {
+            Ok(run) => {
+                self.plans.push(PlanRun { repo, key, candidates, run, waiting: vec![id], deadline: Instant::now() + PLAN_TIMEOUT });
+                self.setup_stage(id, "planning", "");
+            }
+            Err(e) => self.setup_stage(id, "failed", &format!("Couldn't start the planner: {e}")),
+        }
+    }
+
+    fn stored_plan(&self, repo: &str, key: &str) -> Option<(Plan, bool)> {
+        let row: Option<(String, bool)> = self
+            .db
+            .query_row("SELECT plan, approved FROM setup_plans WHERE repo = ?1 AND key = ?2", params![repo, key], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .ok()
+            .flatten();
+        row.and_then(|(plan, approved)| Some((serde_json::from_str(&plan).ok()?, approved)))
+    }
+
+    fn setup_stage(&mut self, id: u64, stage: &str, detail: &str) {
+        let _ = self.db.execute("UPDATE tasks SET setup = ?1, setup_detail = ?2, updated = ?3 WHERE id = ?4", params![stage, detail, now(), id]);
+        self.dirty = true;
+    }
+
+    /// Task `id` has a plan: nothing to do, run it, or ask first.
+    fn planned(&mut self, id: u64, plan: &Plan, approved: bool) {
+        if plan.is_empty() {
+            self.setup_stage(id, "ok", &plan.note);
+            self.setup_done(id);
+        } else if approved || plan.allowed() {
+            self.run_setup(id, plan);
+        } else {
+            self.setup_stage(id, "approval", &plan.describe());
+        }
+    }
+
+    fn run_setup(&mut self, id: u64, plan: &Plan) {
+        let Ok((repo, wt)) = self.db.query_row("SELECT repo, worktree FROM tasks WHERE id = ?1", [id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) else { return };
+        if let Err(e) = setup::copy(Path::new(&repo), Path::new(&wt), &plan.copy) {
+            return self.setup_stage(id, "failed", &e);
+        }
+        if plan.commands.is_empty() {
+            self.setup_stage(id, "ok", &plan.note);
+            return self.setup_done(id);
+        }
+        let spawned = security::private_file(&self.data.join(format!("logs/{id}.setup")), false).and_then(|log| {
+            log.set_len(0)?;
+            use std::os::unix::process::CommandExt;
+            Command::new("sh")
+                .args(["-c", setup::SCRIPT, "arranger-setup"])
+                .args(plan.commands.iter().map(|c| &c.run))
+                .current_dir(&wt)
+                .stdin(Stdio::null())
+                .stdout(log.try_clone()?)
+                .stderr(log)
+                .env("ARRANGER_TASK", id.to_string())
+                .env("ARRANGER_ROOT", &repo)
+                .env("ARRANGER_WORKTREE", &wt)
+                .env("PORT", task_port(id).to_string())
+                .env("FORCE_COLOR", "1")
+                .env("CLICOLOR_FORCE", "1")
+                .process_group(0)
+                .spawn()
+        });
+        match spawned {
+            Ok(child) => {
+                self.setups.insert(id, (child, Instant::now() + SETUP_TIMEOUT));
+                self.setup_stage(id, "running", &plan.describe());
+            }
+            Err(e) => self.setup_stage(id, "failed", &format!("Couldn't start the setup: {e}")),
+        }
+    }
+
+    /// Setup is over (done or skipped): a new task queues for its agent, a clone starts its fork.
+    fn setup_done(&mut self, id: u64) {
+        let Ok((cloned, ask)) = self.db.query_row("SELECT cloned_from, start_ask FROM tasks WHERE id = ?1", [id], |r| Ok((r.get::<_, Option<u64>>(0)?, r.get::<_, String>(1)?))) else { return };
+        if cloned.is_some() {
+            // Left ended if it can't start: Revive tries again.
+            self.set_state(id, "exited");
+            if let Err(e) = self.spawn(id, Some(&ask), true) {
+                eprintln!("task {id}: {e}");
+            }
+        } else {
+            self.set_state(id, "queued");
+            self.start_queued();
+        }
+    }
+
+    fn reap_setups(&mut self) {
+        let mut i = 0;
+        while i < self.plans.len() {
+            match self.plans[i].run.child.try_wait() {
+                Ok(Some(status)) => {
+                    let p = self.plans.remove(i);
+                    self.plan_made(p, status.success());
+                }
+                Ok(None) => i += 1,
+                Err(_) => {
+                    let p = self.plans.remove(i);
+                    self.plan_made(p, false);
+                }
+            }
+        }
+        let exited: Vec<(u64, bool)> = self
+            .setups
+            .iter_mut()
+            .filter_map(|(&id, (child, _))| match child.try_wait() {
+                Ok(Some(status)) => Some((id, status.success())),
+                Ok(None) => None,
+                Err(_) => Some((id, false)),
+            })
+            .collect();
+        for (id, ok) in exited {
+            self.setups.remove(&id);
+            if ok {
+                self.setup_stage(id, "ok", "");
+                self.setup_done(id);
+            } else {
+                let log = read_tail(&self.data.join(format!("logs/{id}.setup")), 16 << 10).unwrap_or_default();
+                let tail = setup::tail(&log, 4);
+                self.setup_stage(id, "failed", if tail.is_empty() { "The setup failed" } else { &tail });
+            }
+        }
+    }
+
+    fn plan_made(&mut self, p: PlanRun, ok: bool) {
+        let made = p.run.finish(ok).and_then(|(answer, _cost)| setup::validate(answer, &p.candidates));
+        let waiting: Vec<u64> = p.waiting.into_iter().filter(|&id| self.setup_of(id).as_deref() == Some("planning")).collect();
+        match made {
+            Ok(plan) => {
+                let json = serde_json::to_string(&plan).unwrap();
+                let _ = self.db.execute(
+                    "INSERT OR REPLACE INTO setup_plans (repo, key, plan, approved, created) VALUES (?1, ?2, ?3, 0, ?4)",
+                    params![p.repo, p.key, json, now_secs()],
+                );
+                for id in waiting {
+                    self.planned(id, &plan, false);
+                }
+            }
+            Err(e) => {
+                for id in waiting {
+                    self.setup_stage(id, "failed", &format!("Couldn't plan the setup: {e}"));
+                }
+            }
+        }
+    }
+
+    /// The setup stage of a task that's still setting up.
+    fn setup_of(&self, id: u64) -> Option<String> {
+        self.db.query_row("SELECT setup FROM tasks WHERE id = ?1 AND state = 'setup'", [id], |r| r.get(0)).optional().ok().flatten()
+    }
+
+    /// Kills plans and setups that ran out of time; reaping then records the failure.
+    fn time_out_setups(&mut self) {
+        let now = Instant::now();
+        let far = now + Duration::from_secs(3600);
+        for p in &mut self.plans {
+            if p.deadline <= now {
+                let _ = rustix::process::kill_process_group(Pid::from_child(&p.run.child), Signal::KILL);
+                p.deadline = far;
+            }
+        }
+        for (&id, (child, deadline)) in &mut self.setups {
+            if *deadline <= now {
+                if let Ok(mut log) = security::private_file(&self.data.join(format!("logs/{id}.setup")), true) {
+                    let _ = writeln!(log, "\n\x1b[31mstopped after {} minutes\x1b[0m", SETUP_TIMEOUT.as_secs() / 60);
+                }
+                let _ = rustix::process::kill_process_group(Pid::from_child(child), Signal::KILL);
+                *deadline = far;
+            }
+        }
+    }
+
+    /// Stops task `id`'s setup if it's running, and takes it off any plan it waits on.
+    fn stop_setup(&mut self, id: u64) {
+        if let Some((mut child, _)) = self.setups.remove(&id) {
+            let _ = rustix::process::kill_process_group(Pid::from_child(&child), Signal::KILL);
+            let _ = child.wait();
+        }
+        for p in &mut self.plans {
+            p.waiting.retain(|&w| w != id);
+        }
+    }
+
+    fn setup_action(&mut self, id: u64, action: proto::SetupAction) -> Result<(), String> {
+        use proto::SetupAction::*;
+        let stage = self.setup_of(id).ok_or(format!("task {id} isn't setting up"))?;
+        let (repo, key): (String, String) = self.db.query_row("SELECT repo, setup_key FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(e2s)?;
+        match (action, stage.as_str()) {
+            (Skip, _) => {
+                self.stop_setup(id);
+                self.setup_stage(id, "skipped", "");
+                self.setup_done(id);
+            }
+            (Approve, "approval") => {
+                let (plan, _) = self.stored_plan(&repo, &key).ok_or("its setup plan is gone; replan it")?;
+                self.db.execute("UPDATE setup_plans SET approved = 1 WHERE repo = ?1 AND key = ?2", params![repo, key]).map_err(e2s)?;
+                // Every task waiting on this plan goes ahead.
+                let mut stmt = self.db.prepare("SELECT id FROM tasks WHERE state = 'setup' AND setup = 'approval' AND repo = ?1 AND setup_key = ?2").map_err(e2s)?;
+                let ids: Vec<u64> = stmt.query_map(params![repo, key], |r| r.get(0)).map_err(e2s)?.filter_map(Result::ok).collect();
+                drop(stmt);
+                for id in ids {
+                    self.run_setup(id, &plan);
+                }
+            }
+            (Retry, "failed") => match self.stored_plan(&repo, &key) {
+                Some((plan, approved)) => self.planned(id, &plan, approved),
+                None => self.begin_setup(id),
+            },
+            (Replan, "approval" | "failed") => {
+                self.db.execute("DELETE FROM setup_plans WHERE repo = ?1 AND key = ?2", params![repo, key]).map_err(e2s)?;
+                self.begin_setup(id);
+            }
+            (action, stage) => return Err(format!("can't {} a setup that is {stage}", format!("{action:?}").to_lowercase())),
+        }
+        Ok(())
+    }
+
+    /// Starts a check run on task `id`'s worktree as it is now: `specs` one after another.
+    fn run_checks(&mut self, id: u64, specs: Vec<proto::CheckSpec>) -> Result<u64, String> {
+        if self.passes.contains_key(&id) {
+            return Err("checks are already running; stop them first".into());
+        }
+        let (state, wt): (String, String) = self
+            .db
+            .query_row("SELECT state, worktree FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .map_err(e2s)?
+            .ok_or(format!("no task {id}"))?;
+        if state == "setup" {
+            return Err("its worktree is still being set up".into());
+        }
+        if wt.is_empty() || !Path::new(&wt).exists() {
+            return Err(format!("task {id} has no worktree"));
+        }
+        let specs = checks::validate(specs)?;
+        let tree = checks::tree_hash(Path::new(&wt))?;
+        self.db
+            .execute("INSERT INTO check_runs (task, started, tree, state) VALUES (?1, ?2, ?3, 'running')", params![id, now_secs(), tree])
+            .map_err(e2s)?;
+        let run = self.db.last_insert_rowid() as u64;
+        let mut queue = std::collections::VecDeque::new();
+        for (pos, s) in specs.iter().enumerate() {
+            self.db
+                .execute(
+                    "INSERT INTO checks (run, task, pos, name, command, why, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
+                    params![run, id, pos, s.name, s.command, s.why],
+                )
+                .map_err(e2s)?;
+            queue.push_back(self.db.last_insert_rowid() as u64);
+        }
+        self.passes.insert(id, Pass { run, queue, current: None });
+        self.next_check(id);
+        Ok(run)
+    }
+
+    fn check_log(&self, check: u64) -> PathBuf {
+        self.data.join(format!("logs/checks/{check}.log"))
+    }
+
+    /// Starts the run's next check, or ends the run when none is left.
+    fn next_check(&mut self, task: u64) {
+        self.dirty = true;
+        loop {
+            let Some(check) = self.passes.get_mut(&task).and_then(|p| p.queue.pop_front()) else {
+                return self.end_run(task);
+            };
+            match self.spawn_check(task, check) {
+                Ok(child) => {
+                    let _ = self.db.execute("UPDATE checks SET state = 'running', started = ?1 WHERE id = ?2", params![now_secs(), check]);
+                    if let Some(p) = self.passes.get_mut(&task) {
+                        p.current = Some(Running { check, child, deadline: Instant::now() + CHECK_TIMEOUT, cut: None });
+                    }
+                    return;
+                }
+                Err(e) => {
+                    if let Ok(mut log) = security::private_file(&self.check_log(check), true) {
+                        let _ = writeln!(log, "\x1b[31mcouldn't start: {e}\x1b[0m");
+                    }
+                    let _ = self.db.execute("UPDATE checks SET state = 'failed', started = ?1, ended = ?1 WHERE id = ?2", params![now_secs(), check]);
+                }
+            }
+        }
+    }
+
+    fn spawn_check(&self, task: u64, check: u64) -> Result<std::process::Child, String> {
+        use std::os::unix::process::CommandExt;
+        let (command, wt, repo): (String, String, String) = self
+            .db
+            .query_row("SELECT c.command, t.worktree, t.repo FROM checks c JOIN tasks t ON t.id = c.task WHERE c.id = ?1", [check], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(e2s)?;
+        let log = security::private_file(&self.check_log(check), false).map_err(e2s)?;
+        log.set_len(0).map_err(e2s)?;
+        Command::new("sh")
+            .args(["-c", &command])
+            .current_dir(&wt)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().map_err(e2s)?)
+            .stderr(log)
+            .env("ARRANGER_TASK", task.to_string())
+            .env("ARRANGER_ROOT", &repo)
+            .env("ARRANGER_WORKTREE", &wt)
+            .env("PORT", task_port(task).to_string())
+            // Colour, though it's not a terminal: the console keeps it.
+            .env("TERM", "xterm-256color")
+            .env("FORCE_COLOR", "1")
+            .env("CLICOLOR_FORCE", "1")
+            .env("CARGO_TERM_COLOR", "always")
+            .process_group(0)
+            .spawn()
+            .map_err(e2s)
+    }
+
+    /// The run is over: failed if a check failed, stopped if one was stopped, else passed.
+    fn end_run(&mut self, task: u64) {
+        let Some(pass) = self.passes.remove(&task) else { return };
+        let count = |state: &str| -> u32 {
+            self.db.query_row("SELECT COUNT(*) FROM checks WHERE run = ?1 AND state = ?2", params![pass.run, state], |r| r.get(0)).unwrap_or(0)
+        };
+        let state = if count("failed") > 0 { "failed" } else if count("stopped") > 0 { "stopped" } else { "passed" };
+        let _ = self.db.execute("UPDATE check_runs SET state = ?1, ended = ?2 WHERE id = ?3", params![state, now_secs(), pass.run]);
+        self.dirty = true;
+    }
+
+    fn reap_checks(&mut self) {
+        let exited: Vec<(u64, Option<i32>, bool, Option<&'static str>)> = self
+            .passes
+            .iter_mut()
+            .filter_map(|(&task, p)| {
+                let r = p.current.as_mut()?;
+                match r.child.try_wait() {
+                    Ok(Some(status)) => Some((task, status.code(), status.success(), r.cut)),
+                    Ok(None) => None,
+                    Err(_) => Some((task, None, false, r.cut)),
+                }
+            })
+            .collect();
+        for (task, code, ok, cut) in exited {
+            let Some(r) = self.passes.get_mut(&task).and_then(|p| p.current.take()) else { continue };
+            let state = if ok && cut.is_none() { "passed" } else { "failed" };
+            let _ = self.db.execute(
+                "UPDATE checks SET state = ?1, exit = ?2, ended = ?3 WHERE id = ?4",
+                params![state, if cut.is_some() { None } else { code }, now_secs(), r.check],
+            );
+            self.next_check(task);
+        }
+    }
+
+    /// Stops checks that ran out of time or wrote too much; reaping records them as failed.
+    fn time_out_checks(&mut self) {
+        let now = Instant::now();
+        let mut cuts = Vec::new();
+        for p in self.passes.values_mut() {
+            let Some(r) = p.current.as_mut().filter(|r| r.cut.is_none()) else { continue };
+            let path = self.data.join(format!("logs/checks/{}.log", r.check));
+            let too_long = fs::metadata(&path).is_ok_and(|m| m.len() > CHECK_LOG_MAX);
+            if r.deadline <= now || too_long {
+                let why = if too_long { "its output passed 32 MiB" } else { "it ran for 10 minutes" };
+                r.cut = Some(why);
+                let _ = rustix::process::kill_process_group(Pid::from_child(&r.child), Signal::KILL);
+                cuts.push((path, why));
+            }
+        }
+        for (path, why) in cuts {
+            if let Ok(mut log) = security::private_file(&path, true) {
+                let _ = writeln!(log, "\n\x1b[31mstopped: {why}\x1b[0m");
+            }
+        }
+    }
+
+    fn stop_checks(&mut self, task: u64) -> Result<(), String> {
+        let mut pass = self.passes.remove(&task).ok_or(format!("task {task} has no checks running"))?;
+        if let Some(mut r) = pass.current.take() {
+            let _ = rustix::process::kill_process_group(Pid::from_child(&r.child), Signal::KILL);
+            let _ = r.child.wait();
+            if let Ok(mut log) = security::private_file(&self.check_log(r.check), true) {
+                let _ = writeln!(log, "\n\x1b[33mstopped\x1b[0m");
+            }
+        }
+        let now = now_secs();
+        let _ = self.db.execute("UPDATE checks SET state = 'stopped', ended = ?1 WHERE run = ?2 AND state IN ('pending', 'running')", params![now, pass.run]);
+        let _ = self.db.execute("UPDATE check_runs SET state = 'stopped', ended = ?1 WHERE id = ?2", params![now, pass.run]);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Task `id`'s check runs, newest first.
+    fn check_runs(&self, id: u64) -> Result<Vec<proto::CheckRun>, String> {
+        let mut stmt = self.db.prepare("SELECT id, started, ended, tree, state FROM check_runs WHERE task = ?1 ORDER BY id DESC LIMIT 30").map_err(e2s)?;
+        let mut runs: Vec<proto::CheckRun> = stmt
+            .query_map([id], |r| Ok(proto::CheckRun { id: r.get(0)?, started: r.get(1)?, ended: r.get(2)?, tree: r.get(3)?, state: r.get(4)?, checks: Vec::new() }))
+            .and_then(Iterator::collect)
+            .map_err(e2s)?;
+        let mut stmt = self.db.prepare("SELECT id, name, command, why, state, exit, started, ended FROM checks WHERE run = ?1 ORDER BY pos").map_err(e2s)?;
+        for run in &mut runs {
+            run.checks = stmt
+                .query_map([run.id], |r| {
+                    Ok(proto::CheckInfo { id: r.get(0)?, name: r.get(1)?, command: r.get(2)?, why: r.get(3)?, state: r.get(4)?, exit: r.get(5)?, started: r.get(6)?, ended: r.get(7)? })
+                })
+                .and_then(Iterator::collect)
+                .map_err(e2s)?;
+        }
+        Ok(runs)
+    }
+
+    /// Lines of a check's output: what its log has gained since last asked is parsed on.
+    fn console(&mut self, check: u64, start: usize, limit: usize) -> Result<Reply, String> {
+        use std::io::Seek;
+        let state: String = self
+            .db
+            .query_row("SELECT state FROM checks WHERE id = ?1", [check], |r| r.get(0))
+            .optional()
+            .map_err(e2s)?
+            .ok_or(format!("no check {check}"))?;
+        let path = self.check_log(check);
+        let entry = self.consoles.entry(check).or_default();
+        let len = match fs::File::open(&path) {
+            Ok(mut f) => {
+                let len = f.metadata().map_err(e2s)?.len();
+                if len > entry.1 {
+                    f.seek(io::SeekFrom::Start(entry.1)).map_err(e2s)?;
+                    let mut buf = Vec::new();
+                    (&mut f).take(8 << 20).read_to_end(&mut buf).map_err(e2s)?;
+                    entry.0.feed(&buf);
+                    entry.1 += buf.len() as u64;
+                }
+                len
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e2s(e)),
+        };
+        let done = !matches!(state.as_str(), "pending" | "running") && entry.1 >= len;
+        let reply = Reply::Console { check, start, total: entry.0.len(), done, lines: entry.0.lines(start, limit.min(5000)) };
+        // Keep the running ones and this one; the rest parse again if asked for.
+        if self.consoles.len() > 16 {
+            let running: Vec<u64> = self.passes.values().filter_map(|p| p.current.as_ref().map(|r| r.check)).collect();
+            self.consoles.retain(|c, _| *c == check || running.contains(c));
+        }
+        Ok(reply)
+    }
+
     fn kill(&mut self, id: u64) -> Result<(), String> {
         let (repo, wt): (String, String) = self
             .db
@@ -1469,10 +2056,19 @@ impl Daemon {
             self.finish(id, "killed");
         }
         self.close_shell(id);
+        self.stop_setup(id);
+        let _ = self.stop_checks(id);
+        let checks: Vec<u64> = self.db.prepare("SELECT id FROM checks WHERE task = ?1").and_then(|mut s| s.query_map([id], |r| r.get(0))?.collect()).unwrap_or_default();
+        for c in checks {
+            let _ = fs::remove_file(self.check_log(c));
+            self.consoles.remove(&c);
+        }
+        let _ = self.db.execute("DELETE FROM checks WHERE task = ?1", [id]);
+        let _ = self.db.execute("DELETE FROM check_runs WHERE task = ?1", [id]);
         if !wt.is_empty() && Path::new(&wt).exists() {
             git(git_in(Path::new(&repo)).args(["worktree", "remove", "--force"]).arg(&wt))?;
         }
-        for log in [format!("logs/{id}.zst"), format!("logs/{id}.jsonl.zst"), format!("logs/{id}.stderr")] {
+        for log in [format!("logs/{id}.zst"), format!("logs/{id}.jsonl.zst"), format!("logs/{id}.stderr"), format!("logs/{id}.setup")] {
             let _ = fs::remove_file(self.data.join(log));
         }
         let _ = fs::remove_file(headless::session_file(&self.data, id));
@@ -1488,7 +2084,7 @@ impl Daemon {
         let mut stmt =
             self.db.prepare(
                 "SELECT id, agent, branch, worktree, state, title, created, summary, shipped,
-                 MAX(created, updated, COALESCE((SELECT MAX(ts) FROM events WHERE task = tasks.id) / 1000, 0)), model, cloned_from, headless, effort, mode
+                 MAX(created, updated, COALESCE((SELECT MAX(ts) FROM events WHERE task = tasks.id) / 1000, 0)), model, cloned_from, headless, effort, mode, setup, setup_detail
                  FROM tasks ORDER BY id",
             ).map_err(e2s)?;
         let rows = stmt.query_map([], |r| {
@@ -1513,11 +2109,44 @@ impl Daemon {
                 headless: r.get(12)?,
                 effort: r.get(13)?,
                 mode: r.get(14)?,
+                setup: r.get(15)?,
+                setup_detail: r.get(16)?,
+                checks: proto::ChecksSummary::default(),
                 machine: 0,
             })
         });
         let mut tasks: Vec<TaskInfo> = rows.and_then(Iterator::collect).map_err(e2s)?;
+        drop(stmt);
+        // Each task's latest check run.
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT r.task, r.state, COALESCE(SUM(c.state = 'passed'), 0), COALESCE(SUM(c.state = 'failed'), 0), COUNT(c.id)
+                 FROM check_runs r LEFT JOIN checks c ON c.run = r.id
+                 WHERE r.id IN (SELECT MAX(id) FROM check_runs GROUP BY task) GROUP BY r.id",
+            )
+            .map_err(e2s)?;
+        let summaries: HashMap<u64, proto::ChecksSummary> = stmt
+            .query_map([], |r| Ok((r.get(0)?, proto::ChecksSummary { state: r.get(1)?, passed: r.get(2)?, failed: r.get(3)?, total: r.get(4)? })))
+            .and_then(Iterator::collect)
+            .map_err(e2s)?;
         for info in &mut tasks {
+            if let Some(s) = summaries.get(&info.id) {
+                info.checks = s.clone();
+            }
+        }
+        for info in &mut tasks {
+            if info.state == "setup" {
+                let needs_you = matches!(info.setup.as_str(), "approval" | "failed");
+                info.state = if needs_you { "setup-needs-you" } else { "setting-up" }.into();
+                info.action = match info.setup.as_str() {
+                    "planning" => "planning setup",
+                    "approval" => "setup waits for approval",
+                    "failed" => "setup failed",
+                    _ => "setting up",
+                }
+                .into();
+            }
             if let Some(task) = self.tasks.get(&info.id) {
                 info.state = task.activity.name().into();
                 info.action = task.action.clone();

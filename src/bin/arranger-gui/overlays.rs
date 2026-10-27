@@ -249,6 +249,8 @@ impl App {
             // The one thing to do next.
             let approve = g == 0 && task.asking && matches!(task.need, Some(Event::PermissionRequest { .. }));
             let (label, fill, fg) = match g {
+                // Its setup panel has the buttons.
+                0 if task.state == "setup-needs-you" => ("Set up", Some(t.needs), t.on_accent),
                 0 if approve => ("Approve", Some(t.needs), t.on_accent),
                 0 => ("Answer", Some(t.needs), t.on_accent),
                 3 => ("Review", Some(t.primary_bg), t.primary_fg),

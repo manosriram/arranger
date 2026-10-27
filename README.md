@@ -57,6 +57,25 @@ A soft ding plays when an agent finishes or needs your help. Toggle **Ding sound
 
 Each task gets its own worktree on a new branch, `arranger/<id>`, made from the base branch you pick when you start it (the current branch by default). The base branch only changes when you merge into it from Review.
 
+A new worktree has your tracked files but nothing git ignores, so before its agent starts arranger sets it up:
+- **Plan.** A short, read-only claude or codex run looks at the repository and plans the setup: which ignored files to copy from your checkout (`.env`, local config) and which commands install what the code needs.
+- **Reuse.** The plan is kept per repository and reused until its dependency files change.
+- **Approval.** Plain installs (`npm ci`, `cargo fetch`, `uv sync`…) run straight away; anything else waits for **Approve** once.
+- **Status.** The task shows the plan and the setup's output, and the header's pipeline strip shows where it is.
+- **Failure.** If setup fails, **Retry**, **Plan again** or **Skip setup**. From the CLI: `arranger setup <id> [approve|skip|retry|replan|log]`.
+
+Nothing is read from or written to the repository for this.
+
+**Checks** (the tab between Workspace and Review) run commands that prove a task's work holds up (tests, builds, linters) in its worktree, one after another:
+- **Running them.** Add commands under **Run checks** and press it; the next run starts with the last run's commands.
+- **The record.** Each run records exactly which state of the worktree it judged (uncommitted edits included), and each check its exit status and output.
+- **The output.** It shows as a console: colours kept, progress bars collapsed to their last state, error lines marked, and **Next error** to jump between them.
+- **Rerun, stop, copy.** **Rerun** runs one check again, **Stop** ends a run, **Copy output** copies a check's output.
+- **The pipeline strip** in the task's header shows how the latest run went.
+- **Vim keys.** With Vim keys on, `j`/`k` move between checks and `e` jumps to the next error.
+- **CLI.** `arranger checks <id>` lists runs, `arranger checks <id> --run [--wait] '<command>' …` starts one (`--wait` exits non-zero if a check fails), `arranger checks <id> --log <check>` prints a check's output and `arranger checks <id> --stop` stops a run.
+- **Limits.** Checks stop after 10 minutes or 32 MiB of output.
+
 **Run in worktree** in Review opens a terminal in the task’s checkout (over SSH for remote tasks). Run your app or tests there before merging; uncommitted edits are included. From the CLI, `arranger run <id>` opens a shell, or `arranger run <id> <command> [args…]` runs a command with its original exit status.
 
 If merging hits a conflict, `main` is left alone: the conflict lands in the agent's worktree, and Review offers to have the agent resolve it (or take one side) before merging again.

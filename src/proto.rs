@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub const MAX_FRAME: usize = 16 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 20;
+pub const VERSION: u32 = 22;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -72,6 +72,101 @@ pub enum Request {
     Shutdown,
     /// Switch a headless task's permission mode (one of `headless::MODES`); kept for its revives.
     SetMode { id: u64, mode: String },
+    /// Move a task's setup along: see `SetupAction`.
+    Setup { id: u64, action: SetupAction },
+    /// The task's setup output so far (raw, with colour); replied to with Log.
+    SetupLog { id: u64 },
+    /// Run these checks in the task's worktree, one after another. Replied to with Ok.
+    RunChecks { id: u64, checks: Vec<CheckSpec> },
+    /// Stop the task's running checks.
+    StopChecks { id: u64 },
+    /// The task's check runs, newest first; replied to with Checks.
+    Checks { id: u64 },
+    /// Lines `start..start + limit` of a check's output; replied to with Console.
+    Console { check: u64, start: usize, limit: usize },
+}
+
+/// A check to run: a shell command, and why it's worth running.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct CheckSpec {
+    pub name: String,
+    pub command: String,
+    pub why: String,
+}
+
+/// One go at a task's checks, on the worktree as it was (`tree`).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CheckRun {
+    pub id: u64,
+    /// Unix seconds; `ended` is 0 while it runs.
+    pub started: u64,
+    pub ended: u64,
+    /// The worktree's tree hash when it started, uncommitted edits included.
+    pub tree: String,
+    /// "running", "passed", "failed" or "stopped".
+    pub state: String,
+    pub checks: Vec<CheckInfo>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CheckInfo {
+    pub id: u64,
+    pub name: String,
+    pub command: String,
+    pub why: String,
+    /// "pending", "running", "passed", "failed" or "stopped".
+    pub state: String,
+    /// Its exit status; None if it didn't exit by itself (or hasn't yet).
+    pub exit: Option<i32>,
+    pub started: u64,
+    pub ended: u64,
+}
+
+/// Where a task's latest check run is, for its pipeline strip.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct ChecksSummary {
+    /// "" (never run), "running", "passed", "failed" or "stopped".
+    pub state: String,
+    pub passed: u32,
+    pub failed: u32,
+    pub total: u32,
+}
+
+/// A line of a check's output: runs of text in one style, and whether it looks like an error.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ConsoleLine {
+    pub spans: Vec<(String, Style)>,
+    pub error: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq)]
+pub struct Style {
+    pub fg: Option<Color>,
+    pub bg: Option<Color>,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum Color {
+    /// The 256-colour palette; 0-15 are the terminal's own.
+    Idx(u8),
+    Rgb(u8, u8, u8),
+}
+
+/// What to do with a task's setup (`TaskInfo::setup`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum SetupAction {
+    /// Run the planned setup, and remember the plan as approved for this repository.
+    Approve,
+    /// Start the agent without setting up.
+    Skip,
+    /// Run the same plan again (after a failure).
+    Retry,
+    /// Forget the plan and have the agent look at the repository again.
+    Replan,
 }
 
 /// What happens after the commit.
@@ -109,6 +204,10 @@ pub enum Reply {
     /// To a headless task's Prompt that only the agent's terminal can take: open one in the task's
     /// worktree with `command` typed, for the user to run.
     Terminal { command: String },
+    Checks(Vec<CheckRun>),
+    /// Lines `start..start + lines.len()` of `total` so far; `done`: the check has ended and
+    /// all its output is in.
+    Console { check: u64, start: usize, total: usize, done: bool, lines: Vec<ConsoleLine> },
 }
 
 /// One entry in a headless task's conversation.
@@ -167,6 +266,16 @@ pub struct TaskInfo {
     /// A headless agent's permission mode ("" if it has none arranger can switch).
     #[serde(default)]
     pub mode: String,
+    /// Where its setup is: "" (none: from before setup existed), "planning", "approval",
+    /// "running", "ok", "failed" or "skipped".
+    #[serde(default)]
+    pub setup: String,
+    /// The setup plan while it waits for approval, why it failed, or what it's running.
+    #[serde(default)]
+    pub setup_detail: String,
+    /// Its latest check run.
+    #[serde(default)]
+    pub checks: ChecksSummary,
     /// Which machine the GUI got this task from (an index into its machine list); not sent.
     #[serde(skip)]
     pub machine: usize,

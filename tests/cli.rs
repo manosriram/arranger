@@ -11,7 +11,11 @@ struct Home(PathBuf);
 impl Home {
     fn arranger(&self, dir: &Path, args: &[&str]) -> (bool, String) {
         // Inside an arranger task ARRANGER_CLI names that build; the daemon must be this one.
+        // Setup is planned by `<home>/planner` when a test writes one; never by a real agent.
+        let planner = self.0.join("planner");
+        let planner = if planner.exists() { planner.into_os_string() } else { "off".into() };
         let out = Command::new(env!("CARGO_BIN_EXE_arranger")).current_dir(dir).env("ARRANGER_HOME", &self.0).env_remove("ARRANGER_CLI")
+            .env("ARRANGER_PLANNER", planner)
             .env("CLAUDE_CONFIG_DIR", self.0.join("claude")).args(args).output().unwrap();
         (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr))
     }
@@ -498,4 +502,136 @@ fn headless_acp_task() {
         assert!(chat.contains(want), "{want} missing:\n{chat}");
     }
     assert!(!chat.contains("replayed"), "{chat}");
+}
+
+// Plans the setup: copy .env, then run whatever `<home>/setup-cmd` says.
+const PLANNER: &str = r#"#!/bin/sh
+cat > /dev/null
+echo plan >> "$(dirname "$0")/plans"
+printf '{"structured_output":{"copy":[".env"],"commands":[{"run":"%s","why":"deps"}],"note":"a test repo"}}' "$(cat "$(dirname "$0")/setup-cmd")"
+"#;
+
+// Sees what setup left in its worktree, then says it's done.
+const SETUP_AGENT: &str = r#"#!/bin/sh
+cat .env dep.txt > seen 2>&1
+echo '{"hook_event_name":"Stop","last_assistant_message":"Looked"}' | "$ARRANGER_BIN" hook claude
+"#;
+
+#[test]
+fn setup_is_planned_approved_and_reused() {
+    let home = Home(std::env::temp_dir().join(format!("arranger-setup-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&home.0);
+    let repo = home.0.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("package.json"), "{}\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), ".env\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    std::fs::write(repo.join(".env"), "KEY=1\n").unwrap();
+    let exe = |name: &str, body: &str| {
+        let p = home.0.join(name);
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        p
+    };
+    let agent = exe("agent.sh", SETUP_AGENT);
+    let agent = agent.to_str().unwrap();
+    std::fs::write(home.0.join("setup-cmd"), "echo dep > dep.txt; echo installed $PORT").unwrap();
+    exe("planner", PLANNER);
+    let wt = |id: u64| home.0.join(format!("worktrees/repo/{id}"));
+
+    // Not a plain install: it waits for approval, showing what it will run.
+    let (ok, out) = home.arranger(&repo, &["new", agent, "look"]);
+    assert!(ok, "{out}");
+    home.wait_task(&repo, 1, &["setup-needs-you"]);
+    let (_, setup) = home.arranger(&repo, &["setup", "1"]);
+    assert!(setup.contains("setup: approval") && setup.contains("copy .env") && setup.contains("$ echo dep > dep.txt"), "{setup}");
+    assert!(!wt(1).join("seen").exists(), "the agent started before setup");
+    assert!(home.arranger(&repo, &["setup", "1", "approve"]).0);
+    home.wait_task(&repo, 1, &["done", "exited"]);
+    assert_eq!(std::fs::read_to_string(wt(1).join("seen")).unwrap(), "KEY=1\ndep\n");
+    let (_, log) = home.arranger(&repo, &["setup", "1", "log"]);
+    assert!(log.contains("installed 20010"), "{log}");
+
+    // Same manifests: the approved plan runs again without planning or asking.
+    assert!(home.arranger(&repo, &["new", agent, "again"]).0);
+    home.wait_task(&repo, 2, &["done", "exited"]);
+    assert_eq!(std::fs::read_to_string(wt(2).join("seen")).unwrap(), "KEY=1\ndep\n");
+    assert_eq!(std::fs::read_to_string(home.0.join("plans")).unwrap().lines().count(), 1);
+
+    // New manifests: planned again. A failing setup waits on you; skipping starts the agent.
+    std::fs::write(repo.join("package.json"), "{\"a\":1}\n").unwrap();
+    git(&repo, &["commit", "-qam", "deps"]);
+    std::fs::write(home.0.join("setup-cmd"), "echo broken; exit 3").unwrap();
+    assert!(home.arranger(&repo, &["new", agent, "third"]).0);
+    home.wait_task(&repo, 3, &["setup-needs-you"]);
+    assert!(home.arranger(&repo, &["setup", "3", "approve"]).0);
+    let start = Instant::now();
+    let failed = loop {
+        let (_, setup) = home.arranger(&repo, &["setup", "3"]);
+        if setup.contains("setup: failed") {
+            break setup;
+        }
+        assert!(start.elapsed() < Duration::from_secs(15), "{setup}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(failed.contains("broken") && failed.contains("exited with 3"), "{failed}");
+    assert_eq!(std::fs::read_to_string(home.0.join("plans")).unwrap().lines().count(), 2);
+    let (ok, out) = home.arranger(&repo, &["setup", "3", "approve"]);
+    assert!(!ok && out.contains("can't approve a setup that is failed"), "{out}");
+    assert!(home.arranger(&repo, &["setup", "3", "skip"]).0);
+    home.wait_task(&repo, 3, &["done", "exited"]);
+    assert_eq!(std::fs::read_to_string(wt(3).join("seen")).unwrap().lines().next(), Some("KEY=1"));
+}
+
+#[test]
+fn checks_run_log_and_stop() {
+    let home = Home(std::env::temp_dir().join(format!("arranger-checks-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&home.0);
+    let repo = home.0.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README"), "hi\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    let agent = home.0.join("agent.sh");
+    std::fs::write(&agent, SETUP_AGENT).unwrap();
+    std::fs::set_permissions(&agent, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    assert!(home.arranger(&repo, &["new", agent.to_str().unwrap(), "look"]).0);
+    home.wait_state(&repo, &["done", "exited"]);
+
+    // One passes, one fails with coloured, overwritten output; the run fails and says so.
+    let failing = r"printf 'step 1\rstep 2\n\033[31merror: it broke\033[0m\n'; exit 2";
+    let (ok, out) = home.arranger(&repo, &["checks", "1", "--run", "--wait", "test -f seen && echo port $PORT", failing]);
+    assert!(!ok && out.contains("run 1 · failed · 1/2 passed") && out.contains("checks failed"), "{out}");
+    assert!(out.contains("✓ 1") && out.contains("✗ 2") && out.contains("exit 2"), "{out}");
+    let (ok, log) = home.arranger(&repo, &["checks", "1", "--log", "1"]);
+    assert!(ok && log == "port 20010\n", "{log:?}");
+    let (_, log) = home.arranger(&repo, &["checks", "1", "--log", "2"]);
+    assert_eq!(log, "step 2\nerror: it broke\n");
+    // It judged the worktree as it was: the agent's untracked file included.
+    let tree = git(&home.0.join("worktrees/repo/1"), &["write-tree"]);
+    let (_, list) = home.arranger(&repo, &["checks", "1"]);
+    assert!(!list.contains(&tree[..9]), "an index without the untracked file would give {tree}:\n{list}");
+
+    // A long check: a second run waits for it; stopping ends both it and the rest.
+    assert!(home.arranger(&repo, &["checks", "1", "--run", "echo started; sleep 30", "echo never"]).0);
+    let (ok, out) = home.arranger(&repo, &["checks", "1", "--run", "true"]);
+    assert!(!ok && out.contains("already running"), "{out}");
+    let start = Instant::now();
+    while home.arranger(&repo, &["checks", "1", "--log", "3"]).1 != "started\n" {
+        assert!(start.elapsed() < Duration::from_secs(10), "the check never started");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(home.arranger(&repo, &["checks", "1", "--stop"]).0);
+    let (_, list) = home.arranger(&repo, &["checks", "1"]);
+    assert!(list.starts_with("run 2 · stopped · 0/2 passed") && list.contains("– 3") && list.contains("– 4"), "{list}");
+    assert!(start.elapsed() < Duration::from_secs(10), "stop waited for the check");
+
+    // Deleting the task takes its checks and their logs.
+    assert!(home.0.join("logs/checks/1.log").exists());
+    assert!(home.arranger(&repo, &["kill", "1"]).0);
+    assert!(!home.0.join("logs/checks/1.log").exists());
+    assert!(!home.arranger(&repo, &["checks", "1", "--log", "1"]).0);
 }

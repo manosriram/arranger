@@ -4,10 +4,12 @@
 
 mod overlays;
 mod chat;
+mod checks;
 mod completion;
 mod sound;
 mod render;
 mod review;
+mod setup;
 mod theme;
 mod welcome;
 
@@ -15,7 +17,7 @@ use arranger::adapter;
 use arranger::headless;
 use arranger::client::{connect, connect_at, request_at};
 use arranger::machine::{self, Machine};
-use arranger::proto::{self, Event, Reply, Request, Ship, TaskInfo};
+use arranger::proto::{self, Event, Reply, Request, SetupAction, Ship, TaskInfo};
 use arranger::screen::Screen;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
@@ -40,6 +42,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use checks::{ChecksAction, ChecksView};
 use review::{ReviewAction, ReviewView, Tag};
 use theme::{AGENTS, Rgba, THEMES, Theme, accent, alpha, blend, efforts, models, readable};
 #[cfg(test)]
@@ -83,6 +86,10 @@ pub enum Msg {
     Paths(usize, String, Result<Reply, String>),
     /// A headless task's chat: its items so far, an older page, or a change.
     Chat(u64, Reply),
+    /// A task's setup output so far, without colour, fetched in this setup stage.
+    SetupLog(TaskKey, String, String),
+    /// Nothing changed, but something drawn is due to be refreshed.
+    Redraw,
 }
 
 /// How a machine's daemon is reachable.
@@ -160,6 +167,8 @@ enum Focus {
     HostRepo,
     /// A headless task's message box, under its chat.
     Message,
+    /// The Checks tab's field for a command to add.
+    CheckCmd,
 }
 
 #[derive(Default)]
@@ -306,6 +315,11 @@ enum Action {
     Clone(TaskKey),
     /// Send the message box to the selected headless task.
     SendChat,
+    /// Approve, skip, retry or replan a task's setup.
+    Setup(TaskKey, SetupAction),
+    /// Open the Checks tab on the selected task.
+    OpenChecks,
+    Checks(ChecksAction),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -365,6 +379,9 @@ struct App {
     welcome_error: String,
     /// Why the last Revive of a task failed, shown in its Revive bar.
     revive_error: Option<(TaskKey, String)>,
+    /// The selected task's setup output: (task, its setup stage then, output, when fetched).
+    setup_log: Option<(TaskKey, String, String, Instant)>,
+    setup_log_pending: bool,
     /// The machine whose every task shows in a popup (its sidebar header's "See all"), filtered to
     /// one state group (None: all) and by its own filter text.
     machine_tasks: Option<usize>,
@@ -386,6 +403,8 @@ struct App {
     /// A machine whose Remove was clicked once; the next click removes it.
     remove_armed: Option<usize>,
     review: Option<ReviewView>,
+    /// The Checks tab, open on a task.
+    checks: Option<ChecksView>,
     /// The Terminal tab is on (under Review, when that's open too).
     shell: bool,
     /// Whether each probed task has anything to review, keyed by the state it was probed in.
@@ -501,6 +520,9 @@ fn run() -> io::Result<()> {
         answered: None,
         prompts: Vec::new(),
         revive_error: None,
+        setup_log: None,
+        checks: None,
+        setup_log_pending: false,
         welcome: false,
         recent: Vec::new(),
         welcome_error: String::new(),
@@ -738,6 +760,13 @@ impl ApplicationHandler<Msg> for App {
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_REVIEW").is_some() {
                         self.open_review();
                     }
+                    // `ARRANGER_CHECKS=<check id>` (or anything) opens the Checks tab on it.
+                    if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_CHECKS").is_some() {
+                        self.open_checks();
+                        if let Some(check) = std::env::var("ARRANGER_CHECKS").ok().and_then(|v| v.parse().ok()) {
+                            self.checks_action(ChecksAction::Select(check));
+                        }
+                    }
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_TERMINAL").is_some() {
                         self.shell = true;
                     }
@@ -806,6 +835,11 @@ impl ApplicationHandler<Msg> for App {
             }
             Msg::Reply(tag, reply) => self.on_reply(tag, reply),
             Msg::Chat(seq, reply) => self.on_chat(seq, reply),
+            Msg::SetupLog(key, stage, text) => {
+                self.setup_log = Some((key, stage, text, Instant::now()));
+                self.setup_log_pending = false;
+            }
+            Msg::Redraw => {}
         }
         self.redraw();
     }
@@ -1001,6 +1035,11 @@ fn is_live(state: &str) -> bool {
     matches!(state, "running" | "needs-you" | "done")
 }
 
+/// Its worktree is being set up; the agent hasn't started.
+fn is_setup(state: &str) -> bool {
+    matches!(state, "setting-up" | "setup-needs-you")
+}
+
 /// Unix seconds of the task's latest activity, for ordering.
 fn last_event(t: &TaskInfo) -> u64 {
     t.updated.max(t.since).max(t.created)
@@ -1008,8 +1047,8 @@ fn last_event(t: &TaskInfo) -> u64 {
 
 fn group(state: &str) -> usize {
     match state {
-        "needs-you" => 0,
-        "running" => 1,
+        "needs-you" | "setup-needs-you" => 0,
+        "running" | "setting-up" => 1,
         "queued" => 2,
         "done" => 3,
         _ => 4, // the agent process is gone: exited, dead, failed
@@ -1059,6 +1098,15 @@ fn ago(t: u64) -> String {
 fn status_line(task: &TaskInfo, queue_pos: usize) -> String {
     let since = if task.since == 0 { String::new() } else { format!(" · {}", ago(task.since)) };
     let waiting = if task.since == 0 { String::new() } else { format!(" · waiting {}", ago(task.since)) };
+    if is_setup(&task.state) {
+        let first = |prefix: &str| task.setup_detail.lines().find_map(|l| l.strip_prefix(prefix)).map(|l| l.split("  · ").next().unwrap_or(l).to_string());
+        return match task.setup.as_str() {
+            "planning" => "planning setup".into(),
+            "approval" => format!("approve setup: $ {}", first("$ ").unwrap_or_default()),
+            "failed" => format!("setup failed: {}", task.setup_detail.lines().last().unwrap_or("")),
+            _ => format!("setting up · $ {}", first("$ ").unwrap_or_default()),
+        };
+    }
     match (group(&task.state), &task.need) {
         (0, Some(Event::PermissionRequest { tool, detail })) => match detail.strip_prefix("running ") {
             Some(cmd) => format!("$ {cmd}?{waiting}"),
@@ -1080,8 +1128,53 @@ fn status_line(task: &TaskInfo, queue_pos: usize) -> String {
     }
 }
 
+/// The header's stage strip: Setup → Working → Checks → Summary → Review → Merge, each with a
+/// mark for where it is. Summary isn't built yet.
+fn pipeline(t: &Theme, task: &TaskInfo) -> Vec<(String, Rgba)> {
+    let (todo, done) = (("○", t.text3), ("✓", t.done));
+    let setup = match task.setup.as_str() {
+        "ok" => done,
+        "planning" | "running" => ("●", t.work),
+        "approval" => ("■", t.needs),
+        "failed" => ("✗", t.del),
+        _ => ("–", t.text3), // skipped, or from before setup
+    };
+    let working = match (is_setup(&task.state), group(&task.state)) {
+        (true, _) | (_, 2) => todo,
+        (_, 0) => ("■", t.needs),
+        (_, 1) => ("●", t.work),
+        _ => done,
+    };
+    let checks = match task.checks.state.as_str() {
+        "passed" => done,
+        "running" => ("●", t.work),
+        "failed" => ("✗", t.del),
+        "stopped" => ("–", t.text3),
+        _ => todo,
+    };
+    let review = if task.shipped.is_empty() { todo } else { done };
+    let merge = if task.shipped == "merged" { done } else { todo };
+    let stages = [("Setup", setup), ("Working", working), ("Checks", checks), ("Summary", todo), ("Review", review), ("Merge", merge)];
+    let mut parts = Vec::new();
+    for (i, (name, (mark, color))) in stages.into_iter().enumerate() {
+        let sep = if i == 0 { "" } else { "  " };
+        parts.push((format!("{sep}{name} "), if color == t.text3 { t.text3 } else { t.text }));
+        parts.push((mark.to_string(), color));
+    }
+    parts
+}
+
 /// The header pill: why the task is where it is.
 fn reason(task: &TaskInfo) -> String {
+    if is_setup(&task.state) {
+        return match task.setup.as_str() {
+            "planning" => "Planning setup",
+            "approval" => "Approve setup",
+            "failed" => "Setup failed",
+            _ => "Setting up",
+        }
+        .into();
+    }
     match (&task.need, task.state.as_str()) {
         (Some(Event::PermissionRequest { .. }), _) => "Needs approval".into(),
         (Some(Event::Question { .. }), _) => "Asked a question".into(),
@@ -1548,8 +1641,12 @@ impl App {
     fn move_view(&mut self, forward: bool) {
         if self.review.is_some() {
             if !forward {
-                self.actions.push(Action::Shell(false));
+                self.actions.push(if self.checkable() { Action::OpenChecks } else { Action::Shell(false) });
             }
+        } else if self.checks.is_some() {
+            self.actions.push(if !forward { Action::Shell(false) } else if self.reviewable() { Action::OpenReview } else { return });
+        } else if forward && self.checkable() {
+            self.actions.push(Action::OpenChecks);
         } else if forward && self.reviewable() {
             self.actions.push(Action::OpenReview);
         } else if !forward && self.shell {
@@ -1595,6 +1692,20 @@ impl App {
             self.answering = None;
             return;
         }
+        // Setup waiting on you: y approves it (or retries a failed one), n skips it.
+        if (key == "y" || key == "n")
+            && self.machine_tasks.is_none()
+            && self.review.is_none()
+            && let Some(t) = self.current().filter(|t| t.state == "setup-needs-you")
+        {
+            let action = match (key.as_str(), t.setup.as_str()) {
+                ("n", _) => SetupAction::Skip,
+                (_, "failed") => SetupAction::Retry,
+                _ => SetupAction::Approve,
+            };
+            self.actions.push(Action::Setup((t.machine, t.id), action));
+            return;
+        }
         // The agent's menu is up: j/k move through it and ↵ picks, back in its terminal; Esc or i
         // leave it be.
         if self.answering.is_some() && self.machine_tasks.is_none() && self.review.is_none() {
@@ -1615,6 +1726,9 @@ impl App {
         let files = self.review.as_ref().and_then(|rv| rv.data.as_ref()).map_or(0, |d| d.files.len());
         let file = self.review.as_ref().map(|rv| rv.file);
         match key.as_str() {
+            "j" if self.checks.is_some() => self.actions.push(Action::Checks(ChecksAction::Step(1))),
+            "k" if self.checks.is_some() => self.actions.push(Action::Checks(ChecksAction::Step(-1))),
+            "e" if self.checks.is_some() => self.actions.push(Action::Checks(ChecksAction::NextError)),
             "j" if file.is_some() => self.actions.push(Action::Review(ReviewAction::File((file.unwrap() + 1).min(files.saturating_sub(1))))),
             "k" if file.is_some() => self.actions.push(Action::Review(ReviewAction::File(file.unwrap().saturating_sub(1)))),
             "j" => self.move_selection(1),
@@ -1634,6 +1748,7 @@ impl App {
             "i" if self.current().is_some() => {
                 self.machine_tasks = None;
                 self.review = None;
+                self.checks = None;
                 self.actions.push(Action::Focus(Focus::Term));
             }
             "h" | "l" if self.machine_tasks.is_none() => self.move_view(key == "l"),
@@ -1648,13 +1763,14 @@ impl App {
             "esc" if self.help => self.help = false,
             "esc" if self.machine_tasks.is_some() => self.actions.push(Action::MachineTasks(None)),
             "esc" if self.review.is_some() => self.actions.push(Action::Review(ReviewAction::Close)),
+            "esc" if self.checks.is_some() => self.actions.push(Action::Shell(false)),
             _ => {}
         }
     }
 
     /// The sidebar's or review rail's divider under `p`, which a press starts dragging.
     fn divider_at(&self, p: (f32, f32)) -> Option<Divider> {
-        if self.review.as_ref().is_some_and(|r| r.check_output.is_some()) || self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || p.1 < TITLE_H {
+        if self.review.as_ref().is_some_and(|r| r.check_output.is_some()) || self.checks.is_some() || self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || p.1 < TITLE_H {
             return None;
         }
         match &self.review {
@@ -1670,6 +1786,9 @@ impl App {
             return;
         }
         if self.confirm_delete.is_some() { return; }
+        if self.dialog.is_none() && self.checks.is_some() && self.scroll_checks(dy) {
+            return;
+        }
         if let Some(d) = self.dialog.as_mut() {
             if d.prompt_bounds.is_some_and(|b| b.contains(self.mouse)) {
                 d.prompt_scroll = (d.prompt_scroll - dy).max(0.0);
@@ -1820,7 +1939,7 @@ impl App {
 
     /// For a task that is no longer running, replays its PTY log so its chat stays readable.
     fn load_history(&mut self) {
-        let Some(task) = self.current().filter(|t| !is_live(&t.state) && t.state != "queued" && !t.headless) else {
+        let Some(task) = self.current().filter(|t| !is_live(&t.state) && !is_setup(&t.state) && t.state != "queued" && !t.headless) else {
             self.history = None;
             return;
         };
@@ -2236,6 +2355,7 @@ impl App {
             Key::Named(NamedKey::Enter) => match focus {
                 Focus::Note => self.actions.push(Action::Review(ReviewAction::SaveNote)),
                 Focus::CommitMsg => self.actions.push(Action::Review(ReviewAction::Commit(Ship::Commit))),
+                Focus::CheckCmd => self.actions.push(Action::Checks(ChecksAction::Add)),
                 Focus::Prompt | Focus::Base | Focus::Repo => self.actions.push(Action::Start),
                 Focus::Message => self.actions.push(Action::SendChat),
                 Focus::HostSsh | Focus::HostName | Focus::HostRepo => self.actions.push(Action::AddHost),
@@ -2271,6 +2391,9 @@ impl App {
         }
         if let (Focus::CommitMsg, Some(rv)) = (focus, &mut self.review) {
             return &mut rv.message;
+        }
+        if let (Focus::CheckCmd, Some(cv)) = (focus, &mut self.checks) {
+            return &mut cv.input;
         }
         if let Some(a) = &mut self.add_host {
             match focus {
@@ -2459,6 +2582,18 @@ impl App {
                     self.stats.remove(&key);
                     self.changes.remove(&key);
                 }
+                Action::OpenChecks => {
+                    if self.dialog.is_none() && self.checkable() {
+                        self.open_checks();
+                    }
+                }
+                Action::Checks(a) => self.checks_action(a),
+                Action::Setup((m, id), action) => {
+                    if let Ok(Reply::Error(e)) | Err(e) = request_at(self.sock(m).as_deref(), &Request::Setup { id, action }).map_err(|e| e.to_string()) {
+                        eprintln!("arranger: {e}");
+                    }
+                    self.setup_log = None;
+                }
                 Action::Answer((m, id), allow) => {
                     let _ = request_at(self.sock(m).as_deref(), &Request::Answer { id, allow, message: String::new() });
                 }
@@ -2503,7 +2638,7 @@ impl App {
                 Action::Review(a) => self.review_action(a),
                 Action::Shell(on) => {
                     if self.dialog.is_none() && (!on || self.shellable()) {
-                        (self.shell, self.review, self.machine_tasks) = (on, None, None);
+                        (self.shell, self.review, self.machine_tasks, self.checks) = (on, None, None, None);
                         self.focus = self.rest();
                         self.sync_session();
                     }
@@ -2646,11 +2781,13 @@ impl App {
             self.draw_welcome(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H));
         } else if self.review.is_some() {
             self.draw_review(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H - STATUS_H));
+        } else if self.checks.is_some() {
+            self.draw_checks(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H - STATUS_H));
         } else {
             self.draw_sidebar(r, t, h);
             self.draw_main(r, t, Rect::new(self.sidebar_w, TITLE_H, w - self.sidebar_w, h - TITLE_H - STATUS_H));
         }
-        if !self.welcome {
+        if !self.welcome && self.checks.is_none() {
             let (x, top) = if self.review.is_some() { (self.rail_w, TITLE_H + review::STRIP_H) } else { (self.sidebar_w, TITLE_H) };
             r.target(Rect::new(x - 4.0, top, 8.0, h - top - STATUS_H), Cursor::Resize);
         }
@@ -2743,10 +2880,11 @@ impl App {
             self.actions.push(Action::Welcome);
         }
 
-        // Views: Workspace | Review.
+        // Views: Workspace | Checks | Review.
         let mut nx = x + 26.0 + rw;
         let review = self.review.is_some();
-        let tabs = [("Workspace", !review && !self.shell), ("Review", review)];
+        let checks = self.checks.is_some();
+        let tabs = [("Workspace", !review && !checks && !self.shell), ("Checks", checks), ("Review", review)];
         for (label, on) in tabs.into_iter().filter(|_| !self.welcome) {
             let tw = r.measure(UI, 13.0, 500, label) + 24.0;
             let tab = Rect::new(nx, (TITLE_H - 30.0) / 2.0, tw, 30.0);
@@ -2755,12 +2893,14 @@ impl App {
             }
             let off = !on && match label {
                 "Review" => !self.reviewable(),
+                "Checks" => !self.checkable(),
                 _ => false,
             };
             r.text(tab.x + 12.0, r.center(tab, UI, 13.0), label, UI, 13.0, 500, if on { t.text } else if off { alpha(t.text3, 90) } else { t.text3 }, tw);
             if self.hit(r, tab) && !on && !off {
                 self.actions.push(match label {
                     "Review" => Action::OpenReview,
+                    "Checks" => Action::OpenChecks,
                     _ if review => Action::Review(ReviewAction::Close),
                     _ => Action::Shell(false),
                 });
@@ -3030,7 +3170,10 @@ impl App {
         let ask = Rect::new(text_x, top.y + top.h, card.w - 48.0, 20.0);
         r.text(ask.x, r.center(ask, UI, 12.5), &status_line(task, 0).replace('\n', " "), UI, 12.5, 400, t.needs, ask.w);
 
-        let buttons: Vec<(&str, bool, Vec<Action>)> = if self.multi_select.is_some() { vec![] } else if task.asking {
+        let buttons: Vec<(&str, bool, Vec<Action>)> = if self.multi_select.is_some() { vec![] } else if task.state == "setup-needs-you" {
+            let first = if task.setup == "failed" { ("Retry", SetupAction::Retry) } else { ("Approve", SetupAction::Approve) };
+            vec![(first.0, true, vec![Action::Setup(key, first.1)]), ("Skip setup", false, vec![Action::Setup(key, SetupAction::Skip)])]
+        } else if task.asking {
             vec![("Allow once", true, vec![Action::Answer(key, true)]), ("Deny", false, vec![Action::Answer(key, false)])]
         } else {
             vec![("Answer", true, vec![Action::Select(key), Action::Answering])]
@@ -3151,6 +3294,7 @@ impl App {
             ]
         } else {
             let mut details = vec![
+                ("Pipeline", pipeline(t, &task)),
                 ("Agent", vec![(if task.headless { format!("{kind} · headless") } else { kind.to_string() }, accent(kind))]),
                 ("Branch", vec![(branch, t.text)]),
                 ("Machine", vec![(host.name().to_string(), t.text)]),
@@ -3202,6 +3346,10 @@ impl App {
         r.rect(sec, 0.0, t.term);
         if self.hit_as(r, sec, Cursor::Text) {
             self.actions.push(Action::Focus(Focus::Term));
+        }
+        if is_setup(&task.state) && !self.shell {
+            self.draw_setup(r, t, sec, &task);
+            return;
         }
         if task.headless && !self.shell {
             self.draw_chat(r, t, sec, &task, ended);

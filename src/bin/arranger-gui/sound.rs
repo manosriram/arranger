@@ -1,7 +1,7 @@
 use std::process::{Command, Stdio};
 
 pub fn should_ding(previous: &str, current: &str) -> bool {
-    previous != current && matches!(current, "done" | "needs-you")
+    previous != current && matches!(current, "done" | "needs-you" | "setup-needs-you")
 }
 
 /// Keep file IO and audio playback off the window's event loop.

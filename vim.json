@@ -5,15 +5,16 @@
     "insert": "Keys go to a text field, the agent's message box (a chat) or its terminal. The status bar shows INSERT."
   },
   "move": {
-    "j / ↓": "Next agent (next file in Review)",
-    "k / ↑": "Previous agent (previous file in Review)",
+    "j / ↓": "Next agent (next file in Review, next check in Checks)",
+    "k / ↑": "Previous agent (previous file in Review, previous check in Checks)",
+    "e": "Next error line in the check's output (Checks)",
     "gg": "First agent",
     "G": "Last agent",
     "J": "Next agent that needs you",
     "K": "Previous agent that needs you",
     "H": "See all tasks on the selected agent's machine",
-    "h": "Previous view (Workspace ← Review)",
-    "l": "Next view (Workspace → Review)",
+    "h": "Previous view (Workspace ← Checks ← Review)",
+    "l": "Next view (Workspace → Checks → Review)",
     "/": "Filter agents"
   },
   "act": {
@@ -27,6 +28,7 @@
     "": "When the agent on screen asks for permission or a choice, normal mode switches on",
     "j / k": "Move through the agent's menu",
     "↵": "Pick, and go back to typing",
+    "y / n": "Allow once / deny a permission ask; approve (or retry) / skip a task's setup",
     "esc / i": "Leave the menu to the agent's terminal"
   },
   "mode": {

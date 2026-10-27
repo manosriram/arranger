@@ -120,6 +120,9 @@ pub enum Tag {
     Delete,
     /// A task's events, for the last prompt it was sent: the clone dialog shows it.
     LastPrompt(crate::TaskKey),
+    /// The Checks tab's runs, and a check's output.
+    CheckRuns(crate::TaskKey),
+    Console(crate::TaskKey, u64),
 }
 
 fn key(path: &str, header: &str) -> String {
@@ -258,6 +261,7 @@ impl App {
             shipping: None,
             flash: None,
         });
+        self.checks = None;
         self.focus = self.rest();
         self.review_action(ReviewAction::Refresh);
     }
@@ -271,6 +275,9 @@ impl App {
     }
 
     pub fn on_reply(&mut self, tag: Tag, reply: Result<Reply, String>) {
+        if matches!(tag, Tag::CheckRuns(_) | Tag::Console(..)) {
+            return self.on_checks_reply(tag, reply);
+        }
         if let Tag::Changes(key) = tag {
             // An error (no worktree, say) means there's nothing to look at either.
             let has = matches!(&reply, Ok(Reply::Review(d)) if !d.files.is_empty() || d.merging || !d.conflicts.is_empty());
