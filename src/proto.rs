@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub const MAX_FRAME: usize = 16 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 22;
+pub const VERSION: u32 = 23;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -84,6 +84,11 @@ pub enum Request {
     Checks { id: u64 },
     /// Lines `start..start + limit` of a check's output; replied to with Console.
     Console { check: u64, start: usize, limit: usize },
+    /// Run the planned checks waiting on approval; `always`: and don't ask about these
+    /// commands again in this repository.
+    ApproveChecks { id: u64, always: bool },
+    /// Stop requiring a check that failed before: it no longer runs again by itself.
+    DropCheck { id: u64, command: String },
 }
 
 /// A check to run: a shell command, and why it's worth running.
@@ -103,8 +108,14 @@ pub struct CheckRun {
     pub ended: u64,
     /// The worktree's tree hash when it started, uncommitted edits included.
     pub tree: String,
-    /// "running", "passed", "failed" or "stopped".
+    /// "planning", "approval", "running", "passed", "failed", "stopped", "stale" (the agent
+    /// started another turn), "skipped" (nothing needed checking), "unverified" (code changed and
+    /// no check covers it) or "error" (it couldn't be planned).
     pub state: String,
+    /// Arranger started it after the agent's turn (not you).
+    pub auto: bool,
+    /// Why it has no checks, or what went wrong.
+    pub note: String,
     pub checks: Vec<CheckInfo>,
 }
 
@@ -120,12 +131,16 @@ pub struct CheckInfo {
     pub exit: Option<i32>,
     pub started: u64,
     pub ended: u64,
+    /// "planned" (by the check planner), "sticky" (it failed before and must pass), or "manual".
+    pub origin: String,
+    /// What arranger saw: files it changed (and were put back), or why it was stopped.
+    pub note: String,
 }
 
 /// Where a task's latest check run is, for its pipeline strip.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct ChecksSummary {
-    /// "" (never run), "running", "passed", "failed" or "stopped".
+    /// "" (never run), or the latest run's state (`CheckRun::state`).
     pub state: String,
     pub passed: u32,
     pub failed: u32,

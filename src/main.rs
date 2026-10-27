@@ -28,7 +28,7 @@ const USAGE: &str = "usage: arranger            open the workspace window
        arranger [ls [--files] | new [--headless|--terminal] [--effort <e>] <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
                  | approve <id> | deny <id> [reason] | events <id> | chat <id> | diff <id> | revert <id> <path> <hunk#>
                  | run <id> [command ...] | send <id> <text> | interrupt <id> | mode <id> <default|acceptEdits|plan> | revive <id> [prompt] | clone <id> [--model <m>] [prompt] | commit <id> [--merge|--pr] [message]
-                 | setup <id> [approve|skip|retry|replan|log] | checks <id> [--run [--wait] <command> ... | --stop | --log <check>] | ping | stop | serve | hook <adapter>
+                 | setup <id> [approve|skip|retry|replan|log] | checks <id> [--run [--wait] <command> ... | --stop | --approve [--always] | --drop <command> | --log <check>] | ping | stop | serve | hook <adapter>
                  | machine [ls | add <name> <user@host> [repo] | rm <name>] | endpoint]";
 /// Ctrl-\, raw and in kitty keyboard encoding.
 const DETACH: &[&[u8]] = &[b"\x1c", b"\x1b[92;5u"];
@@ -85,6 +85,9 @@ fn main() {
         ["clone", id, "--model", model, ref text @ ..] => parse_id(id).and_then(|id| clone(id, Some(model), text)),
         ["clone", id, ref text @ ..] => parse_id(id).and_then(|id| clone(id, None, text)),
         ["checks", id] => parse_id(id).and_then(|id| show_checks(id, 30).map(drop)),
+        ["checks", id, "--approve"] => parse_id(id).and_then(|id| request(&Request::ApproveChecks { id, always: false }).map(drop)),
+        ["checks", id, "--approve", "--always"] => parse_id(id).and_then(|id| request(&Request::ApproveChecks { id, always: true }).map(drop)),
+        ["checks", id, "--drop", command] => parse_id(id).and_then(|id| request(&Request::DropCheck { id, command: command.into() }).map(drop)),
         ["checks", id, "--stop"] => parse_id(id).and_then(|id| request(&Request::StopChecks { id }).map(drop)),
         ["checks", _, "--log", check] => parse_id(check).and_then(print_console),
         ["checks", id, "--run", "--wait", ref commands @ ..] if !commands.is_empty() => parse_id(id).and_then(|id| run_checks(id, commands, true)),
@@ -194,12 +197,23 @@ fn show_checks(id: u64, runs: usize) -> io::Result<String> {
     for run in list.iter().take(runs) {
         let passed = run.checks.iter().filter(|c| c.state == "passed").count();
         let tree: String = run.tree.chars().take(9).collect();
-        println!("run {} · {} · {passed}/{} passed · tree {tree}", run.id, run.state, run.checks.len());
+        let after = if run.auto { " · after a turn" } else { "" };
+        println!("run {} · {} · {passed}/{} passed · tree {tree}{after}", run.id, run.state, run.checks.len());
+        if !run.note.is_empty() {
+            println!("  {}", run.note);
+        }
+        if run.state == "approval" {
+            println!("  waiting for approval: arranger checks {id} --approve [--always]   (or --stop)");
+        }
         for c in &run.checks {
             let mark = match c.state.as_str() { "passed" => "✓", "failed" => "✗", "running" => "●", "stopped" => "–", _ => "○" };
             let took = if c.ended >= c.started && c.started > 0 { format!(", {}s", c.ended - c.started) } else { String::new() };
             let exit = c.exit.map_or(String::new(), |e| format!("exit {e}"));
-            println!("  {mark} {:<5} {:<40} {exit}{took}", c.id, c.command);
+            let still = if c.origin == "sticky" { "  (failed before)" } else { "" };
+            println!("  {mark} {:<5} {:<40} {exit}{took}{still}", c.id, c.command);
+            if !c.note.is_empty() {
+                println!("          {}", c.note);
+            }
         }
     }
     Ok(list.first().map(|r| r.state.clone()).unwrap_or_default())

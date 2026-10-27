@@ -635,3 +635,121 @@ fn checks_run_log_and_stop() {
     assert!(!home.0.join("logs/checks/1.log").exists());
     assert!(!home.arranger(&repo, &["checks", "1", "--log", "1"]).0);
 }
+
+// One turn per `go<n>` file: says it's prompted, runs `edit<n>`, says it's done.
+const TURNS_AGENT: &str = r#"#!/bin/sh
+hook() { "$ARRANGER_BIN" hook claude; }
+n=0
+while :; do
+  if [ $n -gt 0 ]; then
+    while [ ! -f "$ARRANGER_HOME/go$n" ]; do sleep 0.05; done
+    echo "{\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"turn $n\"}" | hook
+  fi
+  sh "$ARRANGER_HOME/edit$n"
+  echo '{"hook_event_name":"Stop","last_assistant_message":"done"}' | hook
+  n=$((n+1))
+done
+"#;
+
+// Plans checks: keeps what it was asked, waits while `slow` exists, answers with `plan`.
+const CHECK_PLANNER: &str = r#"#!/bin/sh
+d=$(dirname "$0")
+cat > "$d/asked"
+echo plan >> "$d/plans"
+while [ -f "$d/slow" ]; do sleep 0.05; done
+printf '{"structured_output":%s}' "$(cat "$d/plan")"
+"#;
+
+#[test]
+fn checks_follow_turns() {
+    let home = Home(std::env::temp_dir().join(format!("arranger-turns-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&home.0);
+    let repo = home.0.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("lib.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(repo.join("README.md"), "hi\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    let write = |name: &str, body: &str| std::fs::write(home.0.join(name), body).unwrap();
+    let exe = |name: &str, body: &str| {
+        write(name, body);
+        std::fs::set_permissions(home.0.join(name), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    };
+    exe("agent.sh", TURNS_AGENT);
+    let plan = |checks: &[&str], none: &str| {
+        let checks: Vec<String> = checks.iter().map(|c| format!(r#"{{"name":"","command":"{c}","why":"covers it"}}"#)).collect();
+        write("plan", &format!(r#"{{"checks":[{}],"none_reason":"{none}"}}"#, checks.join(",")));
+    };
+    let until = |what: &str| {
+        let start = Instant::now();
+        loop {
+            let (_, out) = home.arranger(&repo, &["checks", "1"]);
+            if out.lines().next().is_some_and(|l| l.contains(what)) {
+                return out;
+            }
+            assert!(start.elapsed() < Duration::from_secs(15), "the latest run never got to {what}:\n{out}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    // Setup runs first (no plan for it here), so the planner only plans checks.
+    write("edit0", "echo 'fn b() {}' >> lib.rs");
+    plan(&["test -f lib.rs", "grep -q b lib.rs"], "");
+    exe("planner", "#!/bin/sh\ncat >/dev/null\nprintf '{\"structured_output\":{\"copy\":[],\"commands\":[],\"note\":\"\"}}'\n");
+    let agent = home.0.join("agent.sh");
+    assert!(home.arranger(&repo, &["new", agent.to_str().unwrap(), "add b"]).0);
+    home.wait_state(&repo, &["done"]);
+    exe("planner", CHECK_PLANNER);
+
+    // Its turn ended with changes: planned, and the command no rule allows waits on you.
+    let out = until("approval");
+    assert!(out.contains("after a turn") && out.contains("test -f lib.rs") && out.contains("grep -q b lib.rs"), "{out}");
+    home.wait_state(&repo, &["needs-you"]);
+    let asked = std::fs::read_to_string(home.0.join("asked")).unwrap();
+    assert!(asked.contains("+fn b() {}") && asked.contains("lib.rs | 1 +"), "the planner sees the diff:\n{asked}");
+    assert!(home.arranger(&repo, &["checks", "1", "--approve", "--always"]).0);
+    until("passed");
+    home.wait_state(&repo, &["done"]);
+
+    // Next turn: a check that leaves a file behind fails, and its file is put back.
+    write("edit1", "echo 'fn c() {}' >> lib.rs");
+    plan(&["grep -q c lib.rs", "touch made-by-check", "sed -i.bak s/a/z/ lib.rs"], "");
+    write("go1", "");
+    until("approval");
+    assert!(home.arranger(&repo, &["checks", "1", "--approve"]).0);
+    let out = until("failed");
+    assert!(out.contains("✓ 4") && out.contains("left made-by-check behind (removed)"), "a new file is only tidied away:\n{out}");
+    assert!(out.contains("✗ 5") && out.contains("changed lib.rs (put back)"), "{out}");
+    assert!(!home.0.join("worktrees/repo/1/lib.rs.bak").exists());
+    assert!(!home.0.join("worktrees/repo/1/made-by-check").exists());
+    assert!(std::fs::read_to_string(home.0.join("worktrees/repo/1/lib.rs")).unwrap().starts_with("fn a()"));
+
+    // The planner leaves it out next time, but it failed: it runs anyway, until dropped.
+    write("edit2", "echo 'fn d() {}' >> lib.rs");
+    plan(&["grep -q d lib.rs"], "");
+    write("go2", "");
+    let out = until("approval");
+    let newest = out.split("\nrun ").next().unwrap();
+    assert!(newest.contains("sed -i.bak s/a/z/ lib.rs") && newest.contains("(failed before)") && !newest.contains("touch made-by-check"), "{out}");
+    assert!(std::fs::read_to_string(home.0.join("asked")).unwrap().contains("Still failing from before (these run anyway; don't repeat them):\n- sed -i.bak s/a/z/ lib.rs"));
+    assert!(home.arranger(&repo, &["checks", "1", "--drop", "sed -i.bak s/a/z/ lib.rs"]).0);
+
+    // A new prompt while checks are planned makes them stale; code no check covers is unverified.
+    write("slow", "");
+    write("edit3", "echo 'fn e() {}' >> lib.rs");
+    plan(&[], "");
+    write("go3", "");
+    until("planning");
+    write("edit4", "echo 'fn f() {}' >> lib.rs");
+    write("go4", "");
+    let start = Instant::now();
+    while !home.arranger(&repo, &["checks", "1"]).1.contains("run 4 · stale") {
+        assert!(start.elapsed() < Duration::from_secs(15), "the planned run never went stale");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::fs::remove_file(home.0.join("slow")).unwrap();
+    let out = until("unverified");
+    assert!(out.starts_with("run 5 ") && out.contains("Code changed and no check covers it"), "{out}");
+    home.wait_state(&repo, &["done"]);
+}

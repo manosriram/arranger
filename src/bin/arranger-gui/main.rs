@@ -319,6 +319,8 @@ enum Action {
     Setup(TaskKey, SetupAction),
     /// Open the Checks tab on the selected task.
     OpenChecks,
+    /// Stop (or skip) a task's checks.
+    StopChecks(TaskKey),
     Checks(ChecksAction),
 }
 
@@ -1098,6 +1100,9 @@ fn ago(t: u64) -> String {
 fn status_line(task: &TaskInfo, queue_pos: usize) -> String {
     let since = if task.since == 0 { String::new() } else { format!(" · {}", ago(task.since)) };
     let waiting = if task.since == 0 { String::new() } else { format!(" · waiting {}", ago(task.since)) };
+    if task.checks.state == "approval" && task.state == "needs-you" {
+        return format!("approve its checks{waiting}");
+    }
     if is_setup(&task.state) {
         let first = |prefix: &str| task.setup_detail.lines().find_map(|l| l.strip_prefix(prefix)).map(|l| l.split("  · ").next().unwrap_or(l).to_string());
         return match task.setup.as_str() {
@@ -1139,18 +1144,18 @@ fn pipeline(t: &Theme, task: &TaskInfo) -> Vec<(String, Rgba)> {
         "failed" => ("✗", t.del),
         _ => ("–", t.text3), // skipped, or from before setup
     };
+    let checks_wait = task.checks.state == "approval" && task.state == "needs-you";
     let working = match (is_setup(&task.state), group(&task.state)) {
         (true, _) | (_, 2) => todo,
+        // It's its checks that wait on you, not the agent.
+        _ if checks_wait => done,
         (_, 0) => ("■", t.needs),
         (_, 1) => ("●", t.work),
         _ => done,
     };
     let checks = match task.checks.state.as_str() {
-        "passed" => done,
-        "running" => ("●", t.work),
-        "failed" => ("✗", t.del),
-        "stopped" => ("–", t.text3),
-        _ => todo,
+        "" => todo,
+        s => checks::state_mark(t, s),
     };
     let review = if task.shipped.is_empty() { todo } else { done };
     let merge = if task.shipped == "merged" { done } else { todo };
@@ -1166,6 +1171,9 @@ fn pipeline(t: &Theme, task: &TaskInfo) -> Vec<(String, Rgba)> {
 
 /// The header pill: why the task is where it is.
 fn reason(task: &TaskInfo) -> String {
+    if task.checks.state == "approval" && task.state == "needs-you" {
+        return "Approve checks".into();
+    }
     if is_setup(&task.state) {
         return match task.setup.as_str() {
             "planning" => "Planning setup",
@@ -1690,6 +1698,20 @@ impl App {
         {
             self.actions.push(Action::Answer((t.machine, t.id), key == "y"));
             self.answering = None;
+            return;
+        }
+        // Checks waiting on you: y runs them, n skips them.
+        if (key == "y" || key == "n")
+            && self.machine_tasks.is_none()
+            && self.review.is_none()
+            && let Some(t) = self.current().filter(|t| t.checks.state == "approval")
+        {
+            let key2 = (t.machine, t.id);
+            self.actions.push(if key == "y" { Action::Select(key2) } else { Action::StopChecks(key2) });
+            if key == "y" {
+                self.actions.push(Action::OpenChecks);
+                self.actions.push(Action::Checks(ChecksAction::Approve(false)));
+            }
             return;
         }
         // Setup waiting on you: y approves it (or retries a failed one), n skips it.
@@ -2588,6 +2610,9 @@ impl App {
                     }
                 }
                 Action::Checks(a) => self.checks_action(a),
+                Action::StopChecks((m, id)) => {
+                    let _ = request_at(self.sock(m).as_deref(), &Request::StopChecks { id });
+                }
                 Action::Setup((m, id), action) => {
                     if let Ok(Reply::Error(e)) | Err(e) = request_at(self.sock(m).as_deref(), &Request::Setup { id, action }).map_err(|e| e.to_string()) {
                         eprintln!("arranger: {e}");
@@ -3170,7 +3195,10 @@ impl App {
         let ask = Rect::new(text_x, top.y + top.h, card.w - 48.0, 20.0);
         r.text(ask.x, r.center(ask, UI, 12.5), &status_line(task, 0).replace('\n', " "), UI, 12.5, 400, t.needs, ask.w);
 
-        let buttons: Vec<(&str, bool, Vec<Action>)> = if self.multi_select.is_some() { vec![] } else if task.state == "setup-needs-you" {
+        let checks_wait = task.checks.state == "approval" && task.state == "needs-you";
+        let buttons: Vec<(&str, bool, Vec<Action>)> = if self.multi_select.is_some() { vec![] } else if checks_wait {
+            vec![("Review checks", true, vec![Action::Select(key), Action::OpenChecks]), ("Skip", false, vec![Action::StopChecks(key)])]
+        } else if task.state == "setup-needs-you" {
             let first = if task.setup == "failed" { ("Retry", SetupAction::Retry) } else { ("Approve", SetupAction::Approve) };
             vec![(first.0, true, vec![Action::Setup(key, first.1)]), ("Skip setup", false, vec![Action::Setup(key, SetupAction::Skip)])]
         } else if task.asking {

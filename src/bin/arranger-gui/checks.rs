@@ -62,6 +62,10 @@ pub enum ChecksAction {
     Copy,
     /// j/k in vim's normal mode: the next or previous check.
     Step(i32),
+    /// Run the planned checks waiting on you; `true`: and don't ask about them again here.
+    Approve(bool),
+    /// Stop requiring a check that failed before.
+    Drop(String),
 }
 
 impl App {
@@ -144,6 +148,20 @@ impl App {
                     set_clipboard(&text.join("\n"));
                 }
             }
+            ChecksAction::Approve(always) => {
+                let reply = request_at(self.sock(host).as_deref(), &Request::ApproveChecks { id, always });
+                if let (Ok(Reply::Error(e)), Some(cv)) = (reply, &mut self.checks) {
+                    cv.error = e;
+                }
+                self.refresh_runs();
+            }
+            ChecksAction::Drop(command) => {
+                let reply = request_at(self.sock(host).as_deref(), &Request::DropCheck { id, command });
+                if let (Ok(Reply::Error(e)), Some(cv)) = (reply, &mut self.checks) {
+                    cv.error = e;
+                }
+                self.refresh_runs();
+            }
             ChecksAction::Step(d) => {
                 let ids: Vec<u64> = cv.runs.iter().flat_map(|r| r.checks.iter().map(|c| c.id)).collect();
                 let at = cv.selected.and_then(|s| ids.iter().position(|&i| i == s)).unwrap_or(0) as i32;
@@ -191,7 +209,8 @@ impl App {
                     Ok(Reply::Checks(runs)) => {
                         // The next run starts as the last one's commands.
                         if first && cv.draft.is_empty() {
-                            cv.draft = runs.first().map(|r| r.checks.iter().map(|c| c.command.clone()).collect()).unwrap_or_default();
+                            let ran = runs.iter().find(|r| !matches!(r.state.as_str(), "planning" | "approval") && !r.checks.is_empty());
+                            cv.draft = ran.map(|r| r.checks.iter().map(|c| c.command.clone()).collect()).unwrap_or_default();
                         }
                         cv.runs = runs;
                         // Show something: the latest run's first failure, else what runs, else its first.
@@ -286,7 +305,7 @@ impl App {
         y += 28.0;
 
         // The next run: its commands, a field to add one, Run (or Stop while one runs).
-        let running = self.checks.as_ref().unwrap().runs.first().is_some_and(|r| r.state == "running");
+        let running = self.checks.as_ref().unwrap().runs.first().is_some_and(|r| matches!(r.state.as_str(), "running" | "planning"));
         r.text(x, y, "RUN CHECKS", UI, 11.0, 600, t.text3, w);
         y += 20.0;
         let draft = self.checks.as_ref().unwrap().draft.clone();
@@ -350,12 +369,48 @@ impl App {
             let passed = run.checks.iter().filter(|c| c.state == "passed").count();
             let (mark, color) = state_mark(t, &run.state);
             r.text(x, y, mark, UI, 12.0, 600, color, 14.0);
-            let head = format!("Run {} · {} · {passed}/{}", run.id, run.state, run.checks.len());
+            let state = match run.state.as_str() {
+                "planning" => "planning checks…",
+                "approval" => "waits for approval",
+                "skipped" => "no checks needed",
+                "stale" => "stale: the agent went on",
+                s => s,
+            };
+            let counts = if run.checks.is_empty() { String::new() } else { format!(" · {passed}/{}", run.checks.len()) };
+            let head = format!("Run {} · {state}{counts}", run.id);
             r.text(x + 18.0, y, &head, UI, 12.0, 600, t.text, w - 80.0);
             let when = if run.started == 0 { String::new() } else { ago(run.started) };
             let ww = r.measure(MONO, 11.0, 400, &when);
             r.text(x + w - ww, y, &when, MONO, 11.0, 400, t.text3, ww + 2.0);
-            y += 22.0;
+            y += 20.0;
+            let by = if run.auto { "after the agent's turn" } else { "run by you" };
+            r.text(x + 18.0, y, by, UI, 11.0, 400, t.text3, w - 18.0);
+            y += 18.0;
+            if !run.note.is_empty() {
+                let color = if matches!(run.state.as_str(), "unverified" | "error") { color } else { t.text2 };
+                y += self.wrapped(r, x + 18.0, y, w - 18.0, &run.note, UI, 11.5, color, 17.0) + 2.0;
+            }
+            // Planned checks that aren't plainly check-only wait for you.
+            if run.state == "approval" {
+                y += 4.0;
+                let mut bx = x + 18.0;
+                for (label, action, primary) in [("Approve", ChecksAction::Approve(false), true), ("Always allow", ChecksAction::Approve(true), false), ("Skip", ChecksAction::Stop, false)] {
+                    let bw = r.measure(UI, 12.0, 500, label) + 22.0;
+                    let b = Rect::new(bx, y, bw, 28.0);
+                    if primary {
+                        r.rect(b, 0.0, t.needs);
+                    } else {
+                        r.frame(b, 0.0, t.bg, t.border2);
+                    }
+                    r.text(b.x + 11.0, r.center(b, UI, 12.0), label, UI, 12.0, 500, if primary { t.on_accent } else { t.text }, bw);
+                    if self.hit(r, b) {
+                        self.actions.push(Action::Checks(action));
+                    }
+                    bx += bw + 8.0;
+                }
+                y += 36.0;
+            }
+            y += 4.0;
             for c in &run.checks {
                 let row = Rect::new(rail.x + 6.0, y - 4.0, rail.w - 13.0, 26.0);
                 let on = selected == Some(c.id);
@@ -369,6 +424,7 @@ impl App {
                     (s, 0) if s > 0 && c.state == "running" => ago(s),
                     _ => String::new(),
                 };
+                let took = if c.origin == "sticky" && took.is_empty() { "failed before".to_string() } else { took };
                 let tw = r.measure(MONO, 11.0, 400, &took);
                 r.text(x + 24.0, r.center(row, MONO, 11.5), &c.name, MONO, 11.5, if on { 600 } else { 400 }, if c.state == "pending" { t.text3 } else { t.text }, w - 34.0 - tw);
                 r.text(x + w - tw, r.center(row, MONO, 11.0), &took, MONO, 11.0, 400, t.text3, tw + 2.0);
@@ -428,10 +484,18 @@ impl App {
             (state, None) => format!("{state} · {}s", check.ended.saturating_sub(check.started)),
         };
         let sw = r.text(x, y, &status, UI, 12.0, 500, color, w);
-        if !check.why.is_empty() {
-            r.text(x + sw + 12.0, y, &format!("· {}", check.why), UI, 12.0, 400, t.text3, w - sw - 12.0);
+        let why = match (check.origin.as_str(), check.why.is_empty()) {
+            ("sticky", _) => format!("· failed before, so it runs until it passes{}", if check.why.is_empty() { String::new() } else { format!(" · {}", check.why) }),
+            (_, false) => format!("· {}", check.why),
+            _ => String::new(),
+        };
+        r.text(x + sw + 12.0, y, &why, UI, 12.0, 400, t.text3, w - sw - 12.0);
+        y += 22.0;
+        if !check.note.is_empty() {
+            r.text(x, y, &check.note, UI, 12.0, 500, t.del, w);
+            y += 22.0;
         }
-        y += 26.0;
+        y += 4.0;
         let errors = self.checks.as_ref().unwrap().console.as_ref().map_or(0, |c| c.lines.iter().filter(|l| l.error).count());
         let running = check.state == "running" || check.state == "pending";
         let mut buttons: Vec<(String, ChecksAction)> = Vec::new();
@@ -442,6 +506,9 @@ impl App {
             buttons.push((format!("Next error ({errors})"), ChecksAction::NextError));
         }
         buttons.push(("Copy output".into(), ChecksAction::Copy));
+        if check.state == "failed" {
+            buttons.push(("Don't require".into(), ChecksAction::Drop(check.command.clone())));
+        }
         let mut bx = x;
         for (label, action) in buttons {
             let bw = r.measure(UI, 12.0, 500, &label) + 24.0;
@@ -534,12 +601,15 @@ impl App {
 }
 
 /// A run's or check's state mark.
-fn state_mark(t: &Theme, state: &str) -> (&'static str, Rgba) {
+pub(super) fn state_mark(t: &Theme, state: &str) -> (&'static str, Rgba) {
     match state {
         "passed" => ("✓", t.done),
         "failed" => ("✗", t.del),
-        "running" => ("●", t.work),
-        "stopped" => ("–", t.text3),
+        "running" | "planning" => ("●", t.work),
+        "approval" => ("■", t.needs),
+        "unverified" => ("!", t.needs),
+        "error" => ("!", t.del),
+        "stopped" | "stale" | "skipped" => ("–", t.text3),
         _ => ("○", t.text3),
     }
 }

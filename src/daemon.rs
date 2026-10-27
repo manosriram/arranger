@@ -153,7 +153,24 @@ struct Daemon {
     passes: HashMap<u64, Pass>,
     /// Check output parsed so far, by check, and how many bytes of its log that took.
     consoles: HashMap<u64, (Console, u64)>,
+    /// Check planners under way, by task.
+    check_plans: HashMap<u64, CheckPlan>,
+    /// Tasks whose turn just ended, and when to see whether it needs checks.
+    auto_due: HashMap<u64, Instant>,
 }
+
+/// A side-run planning a task's checks after its turn.
+struct CheckPlan {
+    run: u64,
+    side: side::Run,
+    deadline: Instant,
+    repo: String,
+    /// Files changed since the work last passed: whether no checks means unverified.
+    changed: Vec<String>,
+}
+
+/// How long after a turn ends its checks are planned: claude may carry on with a queued prompt.
+const AUTO_AFTER: Duration = Duration::from_secs(2);
 
 /// A task's check run: the checks still to go, and the one running.
 struct Pass {
@@ -267,8 +284,21 @@ pub fn run() -> io::Result<()> {
             name TEXT NOT NULL, command TEXT NOT NULL, why TEXT NOT NULL, state TEXT NOT NULL, exit INTEGER,
             started INTEGER NOT NULL DEFAULT 0, ended INTEGER NOT NULL DEFAULT 0);
          CREATE INDEX IF NOT EXISTS checks_run ON checks (run);
-         UPDATE checks SET state = 'stopped', ended = CAST(strftime('%s', 'now') AS INTEGER) WHERE state IN ('pending', 'running');
-         UPDATE check_runs SET state = 'stopped', ended = CAST(strftime('%s', 'now') AS INTEGER) WHERE state = 'running';",
+         CREATE TABLE IF NOT EXISTS approved_checks (repo TEXT NOT NULL, command TEXT NOT NULL, PRIMARY KEY (repo, command));
+         CREATE TABLE IF NOT EXISTS dropped_checks (task INTEGER NOT NULL, command TEXT NOT NULL, PRIMARY KEY (task, command));",
+    )
+    .map_err(io::Error::other)?;
+    for col in ["check_runs ADD COLUMN auto INTEGER NOT NULL DEFAULT 0", "check_runs ADD COLUMN note TEXT NOT NULL DEFAULT ''",
+        "checks ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'", "checks ADD COLUMN note TEXT NOT NULL DEFAULT ''"] {
+        let _ = db.execute(&format!("ALTER TABLE {col}"), []);
+    }
+    // Checks that were running or being planned when the daemon stopped. Approvals still wait.
+    db.execute_batch(
+        "UPDATE checks SET state = 'stopped', ended = CAST(strftime('%s', 'now') AS INTEGER) WHERE state = 'running'
+            OR (state = 'pending' AND run IN (SELECT id FROM check_runs WHERE state = 'running'));
+         UPDATE check_runs SET state = 'stopped', ended = CAST(strftime('%s', 'now') AS INTEGER) WHERE state = 'running';
+         UPDATE check_runs SET state = 'error', note = 'Interrupted: the daemon stopped while it planned', ended = CAST(strftime('%s', 'now') AS INTEGER)
+            WHERE state = 'planning';",
     )
     .map_err(io::Error::other)?;
 
@@ -304,6 +334,8 @@ pub fn run() -> io::Result<()> {
         next_side: 0,
         passes: HashMap::new(),
         consoles: HashMap::new(),
+        check_plans: HashMap::new(),
+        auto_due: HashMap::new(),
     };
     d.start_queued();
 
@@ -345,6 +377,7 @@ pub fn run() -> io::Result<()> {
         }
         d.time_out_setups();
         d.time_out_checks();
+        d.auto_checks();
         let expired: Vec<Token> = d.conns.iter().filter(|(_, c)| (!c.received || !c.inbuf.is_empty()) && c.last_input.elapsed() > Duration::from_secs(30)).map(|(&t, _)| t).collect();
         for t in expired { d.close(t); }
         if d.dirty {
@@ -766,6 +799,14 @@ impl Daemon {
                 Err(e) => Reply::Error(e),
             },
             Request::Console { check, start, limit } => self.console(check, start, limit).unwrap_or_else(Reply::Error),
+            Request::ApproveChecks { id, always } => match self.approve_checks(id, always) {
+                Ok(()) => Reply::Ok,
+                Err(e) => Reply::Error(e),
+            },
+            Request::DropCheck { id, command } => match self.db.execute("INSERT OR IGNORE INTO dropped_checks (task, command) VALUES (?1, ?2)", params![id, command]) {
+                Ok(_) => Reply::Ok,
+                Err(e) => Reply::Error(e2s(e)),
+            },
             Request::Kill { id } => match self.kill(id) {
                 Ok(()) => Reply::Ok,
                 Err(e) => Reply::Error(e),
@@ -1098,6 +1139,11 @@ impl Daemon {
 
     /// Stores an event and updates the task's derived state and action line.
     fn record(&mut self, id: u64, event: Event) {
+        // Another turn: checks of the last one no longer judge the work, and mustn't run under it.
+        if matches!(event, Event::Prompt { .. }) && self.tasks.contains_key(&id) {
+            self.auto_due.remove(&id);
+            self.end_checks(id, "stale");
+        }
         let Some(task) = self.tasks.get_mut(&id) else { return };
         self.dirty = true;
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
@@ -1107,6 +1153,9 @@ impl Daemon {
         }
         if !accept_after_interrupt(&mut task.interrupted, &event) {
             return;
+        }
+        if matches!(event, Event::TurnDone) {
+            self.auto_due.insert(id, Instant::now() + AUTO_AFTER);
         }
         let (activity, action) = match &event {
             Event::Summary { text } => {
@@ -1347,6 +1396,7 @@ impl Daemon {
         }
         self.reap_setups();
         self.reap_checks();
+        self.reap_check_plans();
         let exited: Vec<u64> = self.shells.iter_mut().filter_map(|(&id, s)| matches!(s.pty.child.try_wait(), Ok(Some(_))).then_some(id)).collect();
         for id in exited {
             self.read_shell(id);
@@ -1820,11 +1870,25 @@ impl Daemon {
         Ok(())
     }
 
-    /// Starts a check run on task `id`'s worktree as it is now: `specs` one after another.
+    /// Runs `specs` on task `id`'s worktree as it is now, at your asking.
     fn run_checks(&mut self, id: u64, specs: Vec<proto::CheckSpec>) -> Result<u64, String> {
-        if self.passes.contains_key(&id) {
+        if self.passes.contains_key(&id) || self.check_plans.contains_key(&id) {
             return Err("checks are already running; stop them first".into());
         }
+        let wt = self.checkable_worktree(id)?;
+        let specs = checks::validate(specs)?;
+        let tree = checks::tree_hash(Path::new(&wt))?;
+        // Whatever waited on approval is replaced by this.
+        self.db.execute("UPDATE check_runs SET state = 'stopped', ended = ?1 WHERE task = ?2 AND state = 'approval'", params![now_secs(), id]).map_err(e2s)?;
+        let run = self.new_run(id, &tree, "running", false)?;
+        let specs: Vec<(proto::CheckSpec, &str)> = specs.into_iter().map(|s| (s, "manual")).collect();
+        self.add_checks(run, id, &specs)?;
+        self.start_run(id, run);
+        Ok(run)
+    }
+
+    /// The task's worktree, if checks can run in it now.
+    fn checkable_worktree(&self, id: u64) -> Result<String, String> {
         let (state, wt): (String, String) = self
             .db
             .query_row("SELECT state, worktree FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -1837,25 +1901,42 @@ impl Daemon {
         if wt.is_empty() || !Path::new(&wt).exists() {
             return Err(format!("task {id} has no worktree"));
         }
-        let specs = checks::validate(specs)?;
-        let tree = checks::tree_hash(Path::new(&wt))?;
+        Ok(wt)
+    }
+
+    fn new_run(&mut self, task: u64, tree: &str, state: &str, auto: bool) -> Result<u64, String> {
         self.db
-            .execute("INSERT INTO check_runs (task, started, tree, state) VALUES (?1, ?2, ?3, 'running')", params![id, now_secs(), tree])
+            .execute("INSERT INTO check_runs (task, started, tree, state, auto) VALUES (?1, ?2, ?3, ?4, ?5)", params![task, now_secs(), tree, state, auto])
             .map_err(e2s)?;
-        let run = self.db.last_insert_rowid() as u64;
-        let mut queue = std::collections::VecDeque::new();
-        for (pos, s) in specs.iter().enumerate() {
+        self.dirty = true;
+        Ok(self.db.last_insert_rowid() as u64)
+    }
+
+    fn add_checks(&mut self, run: u64, task: u64, specs: &[(proto::CheckSpec, &str)]) -> Result<(), String> {
+        for (pos, (s, origin)) in specs.iter().enumerate() {
             self.db
                 .execute(
-                    "INSERT INTO checks (run, task, pos, name, command, why, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
-                    params![run, id, pos, s.name, s.command, s.why],
+                    "INSERT INTO checks (run, task, pos, name, command, why, state, origin) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+                    params![run, task, pos, s.name, s.command, s.why, origin],
                 )
                 .map_err(e2s)?;
-            queue.push_back(self.db.last_insert_rowid() as u64);
         }
-        self.passes.insert(id, Pass { run, queue, current: None });
-        self.next_check(id);
-        Ok(run)
+        Ok(())
+    }
+
+    /// Runs the run's pending checks, from the worktree as it is now.
+    fn start_run(&mut self, task: u64, run: u64) {
+        let queue = self
+            .db
+            .prepare("SELECT id FROM checks WHERE run = ?1 AND state = 'pending' ORDER BY pos")
+            .and_then(|mut s| s.query_map([run], |r| r.get(0))?.collect())
+            .unwrap_or_default();
+        // The tree it judges is the tree now, which checks mustn't change.
+        if let Ok(tree) = self.checkable_worktree(task).and_then(|wt| checks::tree_hash(Path::new(&wt))) {
+            let _ = self.db.execute("UPDATE check_runs SET state = 'running', tree = ?1 WHERE id = ?2", params![tree, run]);
+        }
+        self.passes.insert(task, Pass { run, queue, current: None });
+        self.next_check(task);
     }
 
     fn check_log(&self, check: u64) -> PathBuf {
@@ -1941,12 +2022,48 @@ impl Daemon {
             .collect();
         for (task, code, ok, cut) in exited {
             let Some(r) = self.passes.get_mut(&task).and_then(|p| p.current.take()) else { continue };
-            let state = if ok && cut.is_none() { "passed" } else { "failed" };
+            let run = self.passes[&task].run;
+            // Leaving new files behind (a lockfile, a snapshot) is untidy; changing the work is failing.
+            let changed = self.guard_tree(task, run, r.check);
+            let state = if ok && cut.is_none() && changed.altered.is_empty() { "passed" } else { "failed" };
+            let note = match (cut, changed.altered.is_empty(), changed.added.is_empty()) {
+                (Some(why), ..) => format!("stopped: {why}"),
+                (None, false, _) => format!("changed {} (put back)", changed.altered.join(", ")),
+                (None, true, false) => format!("left {} behind (removed)", changed.added.join(", ")),
+                _ => String::new(),
+            };
             let _ = self.db.execute(
-                "UPDATE checks SET state = ?1, exit = ?2, ended = ?3 WHERE id = ?4",
-                params![state, if cut.is_some() { None } else { code }, now_secs(), r.check],
+                "UPDATE checks SET state = ?1, exit = ?2, ended = ?3, note = ?4 WHERE id = ?5",
+                params![state, if cut.is_some() { None } else { code }, now_secs(), note, r.check],
             );
             self.next_check(task);
+        }
+    }
+
+    /// Checks report; they mustn't change the work they judge. If this one changed the worktree
+    /// (while the agent wasn't working in it), its changes are undone; returns the files.
+    fn guard_tree(&mut self, task: u64, run: u64, check: u64) -> checks::Changes {
+        if self.tasks.get(&task).is_some_and(|t| t.activity == Activity::Running) {
+            return Default::default();
+        }
+        let Ok(wt) = self.checkable_worktree(task) else { return Default::default() };
+        let Ok(tree): Result<String, _> = self.db.query_row("SELECT tree FROM check_runs WHERE id = ?1", [run], |r| r.get(0)) else { return Default::default() };
+        if checks::tree_hash(Path::new(&wt)).is_ok_and(|now| now == tree) {
+            return Default::default();
+        }
+        match checks::restore_tree(Path::new(&wt), &tree) {
+            Ok(changed) => {
+                if let Ok(mut log) = security::private_file(&self.check_log(check), true) {
+                    if !changed.altered.is_empty() {
+                        let _ = writeln!(log, "\n\x1b[31mthis check changed files, which were put back: {}\x1b[0m", changed.altered.join(", "));
+                    }
+                    if !changed.added.is_empty() {
+                        let _ = writeln!(log, "\n\x1b[33mthis check left new files, which were removed: {}\x1b[0m", changed.added.join(", "));
+                    }
+                }
+                changed
+            }
+            Err(e) => checks::Changes { added: Vec::new(), altered: vec![format!("the worktree (couldn't put it back: {e})")] },
         }
     }
 
@@ -1970,36 +2087,281 @@ impl Daemon {
                 let _ = writeln!(log, "\n\x1b[31mstopped: {why}\x1b[0m");
             }
         }
+        let late: Vec<u64> = self.check_plans.iter().filter(|(_, p)| p.deadline <= now).map(|(&t, _)| t).collect();
+        for task in late {
+            if let Some(p) = self.check_plans.get_mut(&task) {
+                let _ = rustix::process::kill_process_group(Pid::from_child(&p.side.child), Signal::KILL);
+                p.deadline = now + Duration::from_secs(3600);
+            }
+        }
     }
 
     fn stop_checks(&mut self, task: u64) -> Result<(), String> {
-        let mut pass = self.passes.remove(&task).ok_or(format!("task {task} has no checks running"))?;
-        if let Some(mut r) = pass.current.take() {
-            let _ = rustix::process::kill_process_group(Pid::from_child(&r.child), Signal::KILL);
-            let _ = r.child.wait();
-            if let Ok(mut log) = security::private_file(&self.check_log(r.check), true) {
-                let _ = writeln!(log, "\n\x1b[33mstopped\x1b[0m");
+        if self.end_checks(task, "stopped") {
+            Ok(())
+        } else {
+            Err(format!("task {task} has no checks running or waiting"))
+        }
+    }
+
+    /// Ends whatever the task's checks are doing (planning, waiting on approval, running) as
+    /// `state`: "stopped" by you, or "stale" when the agent starts another turn. False if none.
+    fn end_checks(&mut self, task: u64, state: &str) -> bool {
+        let now = now_secs();
+        let mut ended = false;
+        if let Some(mut plan) = self.check_plans.remove(&task) {
+            let _ = rustix::process::kill_process_group(Pid::from_child(&plan.side.child), Signal::KILL);
+            let _ = plan.side.child.wait();
+            let _ = plan.side.finish(false);
+            let _ = self.db.execute("UPDATE check_runs SET state = ?1, ended = ?2 WHERE id = ?3", params![state, now, plan.run]);
+            ended = true;
+        }
+        if let Some(mut pass) = self.passes.remove(&task) {
+            if let Some(mut r) = pass.current.take() {
+                let _ = rustix::process::kill_process_group(Pid::from_child(&r.child), Signal::KILL);
+                let _ = r.child.wait();
+                if let Ok(mut log) = security::private_file(&self.check_log(r.check), true) {
+                    let _ = writeln!(log, "\n\x1b[33m{}\x1b[0m", if state == "stale" { "stopped: the agent started another turn" } else { "stopped" });
+                }
+            }
+            let _ = self.db.execute("UPDATE checks SET state = 'stopped', ended = ?1 WHERE run = ?2 AND state IN ('pending', 'running')", params![now, pass.run]);
+            let _ = self.db.execute("UPDATE check_runs SET state = ?1, ended = ?2 WHERE id = ?3", params![state, now, pass.run]);
+            ended = true;
+        }
+        let waiting = self.db.execute("UPDATE check_runs SET state = ?1, ended = ?2 WHERE task = ?3 AND state = 'approval'", params![state, now, task]).unwrap_or(0);
+        if waiting > 0 {
+            let _ = self.db.execute("UPDATE checks SET state = 'stopped' WHERE task = ?1 AND state = 'pending'", [task]);
+            ended = true;
+        }
+        self.dirty |= ended;
+        ended
+    }
+
+    /// After a turn: plans checks for what it changed, unless nothing changed since the last
+    /// checks, or nobody can plan them.
+    fn plan_checks(&mut self, id: u64) -> Result<(), String> {
+        let (agent, repo, model, base_commit): (String, String, String, String) = self
+            .db
+            .query_row("SELECT agent, repo, model, base_commit FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map_err(e2s)?;
+        let Some(planner) = side::planner(&agent) else { return Ok(()) };
+        let wt = self.checkable_worktree(id)?;
+        let wtp = Path::new(&wt);
+        let tree = checks::tree_hash(wtp)?;
+        let last: Option<String> = self
+            .db
+            .query_row("SELECT tree FROM check_runs WHERE task = ?1 AND state NOT IN ('stale', 'stopped', 'error') ORDER BY id DESC LIMIT 1", [id], |r| r.get(0))
+            .optional()
+            .map_err(e2s)?;
+        let base = if base_commit.is_empty() { "HEAD".to_string() } else { base_commit };
+        let base_tree = git(git_in(wtp).args(["rev-parse", &format!("{base}^{{tree}}")]))?.trim().to_string();
+        if last.as_deref().unwrap_or(&base_tree) == tree {
+            return Ok(());
+        }
+        // What changed since the work last passed (or since its base).
+        let passed: Option<String> = self
+            .db
+            .query_row("SELECT tree FROM check_runs WHERE task = ?1 AND state = 'passed' ORDER BY id DESC LIMIT 1", [id], |r| r.get(0))
+            .optional()
+            .map_err(e2s)?;
+        let from = passed.unwrap_or(base_tree);
+        let stat = git(git_in(wtp).args(["diff", "--stat", &from, &tree])).unwrap_or_default();
+        let mut diff = git(git_in(wtp).args(["diff", &from, &tree])).unwrap_or_default();
+        if diff.len() > 100 << 10 {
+            let cut = (0..=100 << 10).rev().find(|&i| diff.is_char_boundary(i)).unwrap_or(0);
+            diff.truncate(cut);
+            diff.push_str("\n… (the diff goes on; read the files for the rest)");
+        }
+        let changed = checks::changed_files(wtp, &from, &tree).unwrap_or_default();
+        let manifests: Vec<String> = git(git_in(wtp).args(["ls-files"]))
+            .unwrap_or_default()
+            .lines()
+            .filter(|p| p.matches('/').count() <= 2 && setup::MANIFESTS.contains(&p.rsplit('/').next().unwrap_or(p)))
+            .take(40)
+            .map(str::to_string)
+            .collect();
+        let prompts = turn_prompts(&self.events(id).unwrap_or_default());
+        let previous: Vec<(String, String)> = self
+            .db
+            .prepare("SELECT command, state, exit FROM checks WHERE run = (SELECT MAX(id) FROM check_runs WHERE task = ?1 AND state NOT IN ('planning', 'approval')) ORDER BY pos")
+            .and_then(|mut s| {
+                s.query_map([id], |r| {
+                    let (state, exit): (String, Option<i32>) = (r.get(1)?, r.get(2)?);
+                    Ok((r.get(0)?, exit.map_or(state.clone(), |e| format!("{state} (exit {e})"))))
+                })?
+                .collect()
+            })
+            .unwrap_or_default();
+        let sticky = self.sticky_checks(id);
+        let prompt = checks::plan_prompt(&checks::Trip { prompts: &prompts, stat: &stat, diff: &diff, manifests: &manifests, previous: &previous, sticky: &sticky });
+        let same = matches!((&planner, adapter::kind(&agent)), (side::Planner::Claude, "claude") | (side::Planner::Codex, "codex"));
+        let name = format!("checks-{}", self.next_side);
+        self.next_side += 1;
+        let run = self.new_run(id, &tree, "planning", true)?;
+        match side::start(planner, wtp, &prompt, &checks::plan_schema(), if same { &model } else { "" }, &self.data.join("side"), &name) {
+            Ok(side) => {
+                self.check_plans.insert(id, CheckPlan { run, side, deadline: Instant::now() + PLAN_TIMEOUT, repo, changed });
+            }
+            Err(e) => {
+                let _ = self.db.execute("UPDATE check_runs SET state = 'error', note = ?1, ended = ?2 WHERE id = ?3", params![format!("Couldn't start the planner: {e}"), now_secs(), run]);
             }
         }
-        let now = now_secs();
-        let _ = self.db.execute("UPDATE checks SET state = 'stopped', ended = ?1 WHERE run = ?2 AND state IN ('pending', 'running')", params![now, pass.run]);
-        let _ = self.db.execute("UPDATE check_runs SET state = 'stopped', ended = ?1 WHERE id = ?2", params![now, pass.run]);
-        self.dirty = true;
         Ok(())
+    }
+
+    /// Checks that failed in an earlier run and haven't passed since (unless you dropped them):
+    /// they run again whatever the planner says.
+    fn sticky_checks(&self, id: u64) -> Vec<proto::CheckSpec> {
+        let rows: Vec<(String, String, String, String)> = self
+            .db
+            .prepare("SELECT name, command, why, state FROM checks WHERE task = ?1 AND state IN ('passed', 'failed') ORDER BY run, pos")
+            .and_then(|mut s| s.query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect())
+            .unwrap_or_default();
+        let dropped: Vec<String> = self
+            .db
+            .prepare("SELECT command FROM dropped_checks WHERE task = ?1")
+            .and_then(|mut s| s.query_map([id], |r| r.get(0))?.collect())
+            .unwrap_or_default();
+        let mut failing: Vec<proto::CheckSpec> = Vec::new();
+        for (name, command, why, state) in rows {
+            failing.retain(|c| c.command != command);
+            if state == "failed" && !dropped.contains(&command) {
+                failing.push(proto::CheckSpec { name, command, why });
+            }
+        }
+        failing
+    }
+
+    fn reap_check_plans(&mut self) {
+        let done: Vec<(u64, bool)> = self
+            .check_plans
+            .iter_mut()
+            .filter_map(|(&task, p)| match p.side.child.try_wait() {
+                Ok(Some(status)) => Some((task, status.success())),
+                Ok(None) => None,
+                Err(_) => Some((task, false)),
+            })
+            .collect();
+        for (task, ok) in done {
+            let plan = self.check_plans.remove(&task).unwrap();
+            self.check_plan_made(task, plan, ok);
+        }
+    }
+
+    /// The planner answered: its checks plus the ones still failing, run now or after approval.
+    fn check_plan_made(&mut self, task: u64, plan: CheckPlan, ok: bool) {
+        let (run, repo, changed) = (plan.run, plan.repo.clone(), plan.changed.clone());
+        let answer = plan.side.finish(ok).and_then(|(answer, _cost)| checks::plan_from(answer));
+        let sticky = self.sticky_checks(task);
+        let (planned, note) = match answer {
+            Ok((planned, reason)) => (planned, reason),
+            Err(e) if !sticky.is_empty() => (Vec::new(), format!("Couldn't plan checks ({e}); running the ones still failing")),
+            Err(e) => {
+                let _ = self.db.execute("UPDATE check_runs SET state = 'error', note = ?1, ended = ?2 WHERE id = ?3", params![format!("Couldn't plan checks: {e}"), now_secs(), run]);
+                self.dirty = true;
+                return;
+            }
+        };
+        let mut specs: Vec<(proto::CheckSpec, &str)> = planned.into_iter().map(|s| (s, "planned")).collect();
+        for s in sticky {
+            if !specs.iter().any(|(p, _)| p.command == s.command) {
+                specs.push((s, "sticky"));
+            }
+        }
+        specs.truncate(checks::MAX_CHECKS);
+        if specs.is_empty() {
+            let (state, note) = if checks::code_changed(&changed) {
+                ("unverified", if note.is_empty() { "Code changed and no check covers it".to_string() } else { note })
+            } else {
+                ("skipped", if note.is_empty() { "Nothing here needs checking".to_string() } else { note })
+            };
+            let _ = self.db.execute("UPDATE check_runs SET state = ?1, note = ?2, ended = ?3 WHERE id = ?4", params![state, note, now_secs(), run]);
+            self.dirty = true;
+            return;
+        }
+        let _ = self.db.execute("UPDATE check_runs SET note = ?1 WHERE id = ?2", params![note, run]);
+        if let Err(e) = self.add_checks(run, task, &specs) {
+            let _ = self.db.execute("UPDATE check_runs SET state = 'error', note = ?1 WHERE id = ?2", params![e, run]);
+            return;
+        }
+        let wt = self.checkable_worktree(task).unwrap_or_default();
+        let asking = specs.iter().filter(|(s, _)| !self.check_allowed(&repo, Path::new(&wt), &s.command)).count();
+        if asking == 0 {
+            self.start_run(task, run);
+        } else {
+            let _ = self.db.execute("UPDATE check_runs SET state = 'approval' WHERE id = ?1", [run]);
+            self.dirty = true;
+        }
+    }
+
+    fn check_allowed(&self, repo: &str, wt: &Path, command: &str) -> bool {
+        checks::allowed(command, wt)
+            || self.db.query_row("SELECT 1 FROM approved_checks WHERE repo = ?1 AND command = ?2", params![repo, command], |_| Ok(())).is_ok()
+    }
+
+    fn approve_checks(&mut self, id: u64, always: bool) -> Result<(), String> {
+        let run: u64 = self
+            .db
+            .query_row("SELECT id FROM check_runs WHERE task = ?1 AND state = 'approval' ORDER BY id DESC LIMIT 1", [id], |r| r.get(0))
+            .optional()
+            .map_err(e2s)?
+            .ok_or(format!("task {id} has no checks waiting for approval"))?;
+        if self.passes.contains_key(&id) || self.check_plans.contains_key(&id) {
+            return Err("checks are already running; stop them first".into());
+        }
+        if always {
+            let repo: String = self.db.query_row("SELECT repo FROM tasks WHERE id = ?1", [id], |r| r.get(0)).map_err(e2s)?;
+            let commands: Vec<String> = self.db.prepare("SELECT command FROM checks WHERE run = ?1").and_then(|mut s| s.query_map([run], |r| r.get(0))?.collect()).map_err(e2s)?;
+            for c in commands {
+                self.db.execute("INSERT OR IGNORE INTO approved_checks (repo, command) VALUES (?1, ?2)", params![repo, c]).map_err(e2s)?;
+            }
+        }
+        self.start_run(id, run);
+        Ok(())
+    }
+
+    /// After the agent's turn: once it's idle a moment later, checks for what it changed.
+    fn auto_checks(&mut self) {
+        let now = Instant::now();
+        let due: Vec<u64> = self.auto_due.iter().filter(|(_, at)| **at <= now).map(|(&id, _)| id).collect();
+        for id in due {
+            self.auto_due.remove(&id);
+            let idle = self.tasks.get(&id).is_some_and(|t| t.activity == Activity::Done && t.need.is_none() && t.queued == 0 && !t.headless.as_ref().is_some_and(Agent::asking))
+                && !self.asks.iter().any(|a| a.0 == id);
+            if !idle || self.passes.contains_key(&id) || self.check_plans.contains_key(&id) {
+                continue;
+            }
+            if let Err(e) = self.plan_checks(id) {
+                eprintln!("task {id}: checks: {e}");
+            }
+        }
     }
 
     /// Task `id`'s check runs, newest first.
     fn check_runs(&self, id: u64) -> Result<Vec<proto::CheckRun>, String> {
-        let mut stmt = self.db.prepare("SELECT id, started, ended, tree, state FROM check_runs WHERE task = ?1 ORDER BY id DESC LIMIT 30").map_err(e2s)?;
+        let mut stmt = self.db.prepare("SELECT id, started, ended, tree, state, auto, note FROM check_runs WHERE task = ?1 ORDER BY id DESC LIMIT 30").map_err(e2s)?;
         let mut runs: Vec<proto::CheckRun> = stmt
-            .query_map([id], |r| Ok(proto::CheckRun { id: r.get(0)?, started: r.get(1)?, ended: r.get(2)?, tree: r.get(3)?, state: r.get(4)?, checks: Vec::new() }))
+            .query_map([id], |r| {
+                Ok(proto::CheckRun { id: r.get(0)?, started: r.get(1)?, ended: r.get(2)?, tree: r.get(3)?, state: r.get(4)?, auto: r.get(5)?, note: r.get(6)?, checks: Vec::new() })
+            })
             .and_then(Iterator::collect)
             .map_err(e2s)?;
-        let mut stmt = self.db.prepare("SELECT id, name, command, why, state, exit, started, ended FROM checks WHERE run = ?1 ORDER BY pos").map_err(e2s)?;
+        let mut stmt = self.db.prepare("SELECT id, name, command, why, state, exit, started, ended, origin, note FROM checks WHERE run = ?1 ORDER BY pos").map_err(e2s)?;
         for run in &mut runs {
             run.checks = stmt
                 .query_map([run.id], |r| {
-                    Ok(proto::CheckInfo { id: r.get(0)?, name: r.get(1)?, command: r.get(2)?, why: r.get(3)?, state: r.get(4)?, exit: r.get(5)?, started: r.get(6)?, ended: r.get(7)? })
+                    Ok(proto::CheckInfo {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        command: r.get(2)?,
+                        why: r.get(3)?,
+                        state: r.get(4)?,
+                        exit: r.get(5)?,
+                        started: r.get(6)?,
+                        ended: r.get(7)?,
+                        origin: r.get(8)?,
+                        note: r.get(9)?,
+                    })
                 })
                 .and_then(Iterator::collect)
                 .map_err(e2s)?;
@@ -2065,6 +2427,8 @@ impl Daemon {
         }
         let _ = self.db.execute("DELETE FROM checks WHERE task = ?1", [id]);
         let _ = self.db.execute("DELETE FROM check_runs WHERE task = ?1", [id]);
+        let _ = self.db.execute("DELETE FROM dropped_checks WHERE task = ?1", [id]);
+        self.auto_due.remove(&id);
         if !wt.is_empty() && Path::new(&wt).exists() {
             git(git_in(Path::new(&repo)).args(["worktree", "remove", "--force"]).arg(&wt))?;
         }
@@ -2159,6 +2523,16 @@ impl Daemon {
             }
             if with_files {
                 info.files = self.files(info.id).map_err(e2s)?;
+            }
+        }
+        for info in &mut tasks {
+            // Planned checks waiting on you put an idle agent in needs-you.
+            if info.checks.state == "approval" && info.state == "done" {
+                info.state = "needs-you".into();
+                info.need = Some(Event::Attention { text: "Approve its checks".into() });
+                info.action = "checks wait for approval".into();
+            } else if matches!(info.checks.state.as_str(), "planning" | "running") && info.state == "done" {
+                info.action = if info.checks.state == "planning" { "planning checks" } else { "running checks" }.into();
             }
         }
         Ok(tasks)
@@ -2330,6 +2704,22 @@ impl Daemon {
     }
 }
 
+/// What the agent was asked in its latest turn: the prompts after the turn before it ended.
+fn turn_prompts(events: &[(u64, Event)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (_, e) in events.iter().rev() {
+        match e {
+            // The turn that just ended.
+            Event::TurnDone if out.is_empty() => {}
+            Event::TurnDone => break,
+            Event::Prompt { text } => out.push(text.clone()),
+            _ => {}
+        }
+    }
+    out.reverse();
+    out
+}
+
 /// Esc, Vim's double Esc, or Ctrl-C (not the start of a terminal escape sequence).
 fn is_interrupt(bytes: &[u8]) -> bool {
     matches!(bytes, b"\x1b" | b"\x1b\x1b" | b"\x03")
@@ -2375,6 +2765,15 @@ mod tests {
         assert!(accept_after_interrupt(&mut interrupted, &Event::Prompt { text: "try again".into() }));
         assert!(!interrupted);
         assert!(accept_after_interrupt(&mut interrupted, &Event::ToolEnd { ok: true }));
+    }
+
+    #[test]
+    fn a_turns_prompts_are_the_ones_since_the_turn_before() {
+        let p = |t: &str| (0, Event::Prompt { text: t.into() });
+        let events = vec![p("first"), (0, Event::TurnDone), p("second"), (0, Event::ToolEnd { ok: true }), p("and also"), (0, Event::TurnDone)];
+        assert_eq!(turn_prompts(&events), ["second", "and also"]);
+        assert_eq!(turn_prompts(&events[..2]), ["first"]);
+        assert!(turn_prompts(&[]).is_empty());
     }
 
     #[test]

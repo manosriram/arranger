@@ -66,7 +66,7 @@ pub fn schema() -> Value {
 }
 
 /// Files whose contents decide what a worktree needs installed.
-const MANIFESTS: &[&str] = &[
+pub const MANIFESTS: &[&str] = &[
     "package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "yarn.lock", "bun.lockb", "bun.lock",
     ".nvmrc", ".node-version", ".tool-versions", ".python-version", "mise.toml", ".mise.toml",
     "Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml", "go.mod", "go.sum",
