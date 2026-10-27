@@ -266,10 +266,80 @@ fn recipe(worktree: &Path, files: &[&str], name: &str) -> bool {
     })
 }
 
+/// A failed check, for telling the agent about it.
+pub struct Failure {
+    pub name: String,
+    pub command: String,
+    pub exit: Option<i32>,
+    pub note: String,
+    /// Its output, one plain line each, and which lines look like errors.
+    pub lines: Vec<(String, bool)>,
+}
+
+/// What to tell the agent when its checks fail: each failure's command, how it ended, and the
+/// part of its output that matters (from just before the first error, else the end).
+pub fn failure_report(failures: &[Failure]) -> String {
+    const PER_CHECK: usize = 4000;
+    let mut out = String::from(
+        "These checks failed on your last change. Fix what they found (not the checks themselves), then finish your turn; they run again after it.\n",
+    );
+    for f in failures {
+        let how = match f.exit {
+            Some(code) => format!("exit {code}"),
+            None => "stopped".into(),
+        };
+        let name = if f.name == f.command { String::new() } else { format!("{}: ", f.name) };
+        out.push_str(&format!("\n✗ {name}`{}` ({how})\n", f.command));
+        if !f.note.is_empty() {
+            out.push_str(&format!("{}\n", f.note));
+        }
+        let first = f.lines.iter().position(|l| l.1);
+        let (from, to) = match first {
+            Some(i) => (i.saturating_sub(5), (i + 80).min(f.lines.len())),
+            None => (f.lines.len().saturating_sub(60), f.lines.len()),
+        };
+        let mut body = String::new();
+        if from > 0 {
+            body.push_str(&format!("… ({from} lines above)\n"));
+        }
+        for (line, _) in &f.lines[from..to] {
+            if body.len() + line.len() > PER_CHECK {
+                body.push_str("… (cut)\n");
+                break;
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+        if to < f.lines.len() && !body.ends_with("(cut)\n") {
+            body.push_str(&format!("… ({} lines below)\n", f.lines.len() - to));
+        }
+        if !body.trim().is_empty() {
+            out.push_str(&format!("```\n{body}```\n"));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn reports_show_each_failure_from_its_first_error() {
+        let mut lines: Vec<(String, bool)> = (0..200).map(|i| (format!("line {i}"), false)).collect();
+        lines[150].1 = true;
+        let report = failure_report(&[
+            Failure { name: "unit".into(), command: "cargo test".into(), exit: Some(101), note: String::new(), lines },
+            Failure { name: "fmt".into(), command: "touch x".into(), exit: Some(0), note: "changed lib.rs (put back)".into(), lines: vec![] },
+        ]);
+        assert!(report.contains("✗ unit: `cargo test` (exit 101)\n```\n… (145 lines above)\nline 145\n"), "{report}");
+        assert!(report.contains("line 199\n```") && !report.contains("line 144\n"), "{report}");
+        assert!(report.contains("✗ fmt: `touch x` (exit 0)\nchanged lib.rs (put back)\n"), "{report}");
+        // No error line: the end of it.
+        let tail = failure_report(&[Failure { name: "x".into(), command: "x".into(), exit: None, note: String::new(), lines: (0..100).map(|i| (format!("l{i}"), false)).collect() }]);
+        assert!(tail.contains("✗ `x` (stopped)\n```\n… (40 lines above)\nl40\n") && tail.contains("l99\n```"), "{tail}");
+    }
 
     #[test]
     fn check_only_commands_run_without_asking() {

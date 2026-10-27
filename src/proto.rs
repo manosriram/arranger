@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub const MAX_FRAME: usize = 16 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 23;
+pub const VERSION: u32 = 24;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -89,6 +89,13 @@ pub enum Request {
     ApproveChecks { id: u64, always: bool },
     /// Stop requiring a check that failed before: it no longer runs again by itself.
     DropCheck { id: u64, command: String },
+    /// Go on despite the latest run's failures. Replied to with Ok.
+    AcceptChecks { id: u64 },
+    /// What to tell the agent about its latest run's failures; replied to with Text.
+    CheckReport { id: u64 },
+    /// A daemon setting ("auto_fix": rounds of failures sent to the agent by themselves), set
+    /// to `value` if given; replied to with Text (its value now).
+    Setting { key: String, value: Option<String> },
 }
 
 /// A check to run: a shell command, and why it's worth running.
@@ -116,6 +123,8 @@ pub struct CheckRun {
     pub auto: bool,
     /// Why it has no checks, or what went wrong.
     pub note: String,
+    /// It failed, and you chose to go on anyway.
+    pub accepted: bool,
     pub checks: Vec<CheckInfo>,
 }
 
@@ -145,6 +154,11 @@ pub struct ChecksSummary {
     pub passed: u32,
     pub failed: u32,
     pub total: u32,
+    /// The run, and when it started (unix seconds).
+    pub run: u64,
+    pub started: u64,
+    /// It failed and you went on anyway.
+    pub accepted: bool,
 }
 
 /// A line of a check's output: runs of text in one style, and whether it looks like an error.
@@ -220,6 +234,7 @@ pub enum Reply {
     /// worktree with `command` typed, for the user to run.
     Terminal { command: String },
     Checks(Vec<CheckRun>),
+    Text(String),
     /// Lines `start..start + lines.len()` of `total` so far; `done`: the check has ended and
     /// all its output is in.
     Console { check: u64, start: usize, total: usize, done: bool, lines: Vec<ConsoleLine> },
