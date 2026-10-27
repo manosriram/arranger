@@ -461,6 +461,11 @@ fn hook(adapter: &str) -> io::Result<()> {
                 }
             } else {
                 sock.write_all(&proto::frame(&Request::Event { task, event }))?;
+                // Events have no reply. A ping on the same connection ensures the daemon
+                // processes this event before the agent resumes and changes the worktree.
+                sock.write_all(&proto::frame(&Request::Ping))?;
+                let reply: Reply = proto::read_msg(&mut sock)?;
+                if !matches!(reply, Reply::Pong) { return Err(unexpected(reply)); }
             }
         }
     }

@@ -223,7 +223,7 @@ pub enum Reply {
     Exited,
     Error(String),
     Version(u32),
-    Review(Review),
+    Review(Box<Review>),
     JobDone { ok: bool, output: String },
     Log(Vec<u8>),
     Paths(Vec<String>),

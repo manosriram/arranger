@@ -995,6 +995,7 @@ for line in sys.stdin:
   assert m['params']['threadId']=='working-session'
   assert m['params']['sandbox']=='read-only' and m['params']['approvalPolicy']=='never'
   assert m['params']['ephemeral']
+  assert m['params']['excludeTurns'] is True
   emit({'id':m['id'],'result':{'thread':{'id':'summary-session'}}})
  elif m.get('method')=='turn/start':
   assert m['params']['threadId']=='summary-session'

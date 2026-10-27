@@ -57,7 +57,11 @@ pub fn codex_worker(binary: &str, session: &str, model: &str) -> io::Result<()> 
                 send(&mut input, json!({"method":"initialized","params":{}}))?;
                 let mut params = json!({"sandbox":"read-only","approvalPolicy":"never","ephemeral":true,"cwd":std::env::current_dir()?});
                 if !model.is_empty() { params["model"] = json!(model); }
-                if !session.is_empty() { params["threadId"] = json!(session); }
+                if !session.is_empty() {
+                    params["threadId"] = json!(session);
+                    // Ephemeral forks must omit turn history from the response.
+                    params["excludeTurns"] = json!(true);
+                }
                 send(&mut input, json!({"id":1,"method":if session.is_empty() {"thread/start"} else {"thread/fork"},"params":params}))?;
             } else if m["id"] == 1 && m.get("result").is_some() {
                 thread = m["result"]["thread"]["id"].as_str().ok_or_else(|| io::Error::other("missing forked thread id"))?.to_string();
