@@ -52,6 +52,39 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+#[test]
+fn stop_works_across_daemon_versions() {
+    use arranger::{proto::{self, Reply, Request}, security};
+    use std::io::Write;
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+
+    let home = Home(std::env::temp_dir().join(format!("arranger-old-daemon-{}", std::process::id())));
+    security::private_dir(&home.0).unwrap();
+    let socket = home.0.join("arranger.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let daemon = std::thread::spawn(move || {
+        // Normal clients must still reject a daemon with an older protocol.
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert!(matches!(proto::read_msg::<Request>(&mut stream).unwrap(), Request::Version));
+        stream.write_all(&proto::frame(&Reply::Version(proto::VERSION - 1))).unwrap();
+        drop(stream);
+
+        // Recovery must send Shutdown directly, without a version handshake.
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert!(matches!(proto::read_msg::<Request>(&mut stream).unwrap(), Request::Shutdown));
+        drop(listener);
+        stream.write_all(&proto::frame(&Reply::Ok)).unwrap();
+    });
+    let (ok, out) = home.arranger(&home.0, &["ping"]);
+    assert!(!ok && out.contains("different arranger build"), "{out}");
+    let (ok, out) = home.arranger(&home.0, &["stop"]);
+    daemon.join().unwrap();
+    assert!(ok, "{out}");
+}
+
 /// The Terminal tab's shell on task 1: a `cd` out of the worktree steps back in, and on macOS
 /// the main checkout can't be read nor anything written beside the worktree. Exiting ends it.
 fn shell_stays_in_worktree(home: &Home, repo: &Path) {

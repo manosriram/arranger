@@ -42,7 +42,11 @@ pub fn connect_at(sock: Option<&Path>) -> io::Result<UnixStream> {
 /// Stops the daemon over its protected socket and waits for it to go.
 pub fn stop() -> io::Result<()> {
     let path = proto::socket_path();
-    let mut stream = connect_at(Some(&path))?;
+    // Shutdown's wire format stays stable across protocol versions. In particular,
+    // don't use connect_at: its version check would prevent stopping an old daemon
+    // after an upgrade, which is exactly when users need this command.
+    security::check_socket(&path)?;
+    let mut stream = UnixStream::connect(&path)?;
     stream.write_all(&proto::frame(&Request::Shutdown))?;
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     match proto::read_msg(&mut stream)? {
