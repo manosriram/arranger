@@ -679,7 +679,7 @@ impl Daemon {
                 Err(e) => Reply::Error(format!("no log for task {id}: {e}")),
             },
             Request::Review { id } => match self.review(id) {
-                Ok(r) => Reply::Review(r),
+                Ok(r) => Reply::Review(Box::new(r)),
                 Err(e) => Reply::Error(e),
             },
             Request::Revive { id, prompt } => match self.revive(id, &prompt) {
@@ -2382,11 +2382,11 @@ impl Daemon {
 
     fn schedule_summary(&mut self, id: u64) {
         if self.summaries.contains_key(&id) { return; }
-        if let Err(error) = self.start_summary(id) {
-            if let Ok(tree) = self.checkable_worktree(id).and_then(|wt| checks::tree_hash(Path::new(&wt))) {
-                let _ = self.db.execute("INSERT INTO summaries (task, tree, state, error, updated) VALUES (?1, ?2, 'error', ?3, ?4) ON CONFLICT(task, tree) DO UPDATE SET state = 'error', error = excluded.error, updated = excluded.updated", params![id, tree, error, now_secs()]);
-                self.dirty = true;
-            }
+        if let Err(error) = self.start_summary(id)
+            && let Ok(tree) = self.checkable_worktree(id).and_then(|wt| checks::tree_hash(Path::new(&wt)))
+        {
+            let _ = self.db.execute("INSERT INTO summaries (task, tree, state, error, updated) VALUES (?1, ?2, 'error', ?3, ?4) ON CONFLICT(task, tree) DO UPDATE SET state = 'error', error = excluded.error, updated = excluded.updated", params![id, tree, error, now_secs()]);
+            self.dirty = true;
         }
     }
 

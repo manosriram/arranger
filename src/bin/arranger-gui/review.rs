@@ -357,7 +357,7 @@ impl App {
                     rv.default_message.clear();
                 }
                 rv.file = rv.file.min(data.files.len().saturating_sub(1));
-                rv.data = Some(data);
+                rv.data = Some(*data);
                 if !rv.busy && !rv.error {
                     rv.status.clear();
                 }

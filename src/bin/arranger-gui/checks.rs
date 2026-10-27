@@ -36,6 +36,7 @@ struct ConsoleView {
     check: u64,
     lines: Vec<ConsoleLine>,
     total: usize,
+    errors: usize,
     done: bool,
     pending: bool,
     fetched: Instant,
@@ -288,11 +289,13 @@ impl App {
                 con.fetched = Instant::now();
                 if let Ok(Reply::Console { start, total, done, lines, .. }) = reply {
                     // The last line may have grown since: lines from `start` on are replaced.
+                    con.errors -= con.lines[start.min(con.lines.len())..].iter().filter(|l| l.error).count();
+                    con.errors += lines.iter().filter(|l| l.error).count();
                     con.lines.truncate(start);
                     con.lines.extend(lines);
                     con.total = total;
                     con.done = done && con.lines.len() >= total;
-                    con.rows.1.clear();
+                    con.rows.1.truncate(start);
                     let more = con.lines.len() < total;
                     if more || !con.done {
                         let p = self.proxy.clone();
@@ -486,6 +489,10 @@ impl App {
             y += 4.0;
             for c in &run.checks {
                 let row = Rect::new(rail.x + 6.0, y - 4.0, rail.w - 13.0, 26.0);
+                if row.y + row.h < list.y || row.y > list.y + list.h {
+                    y += 26.0;
+                    continue;
+                }
                 let on = selected == Some(c.id);
                 if on {
                     r.rect(row, 0.0, t.sel);
@@ -521,6 +528,7 @@ impl App {
             check: check.id,
             lines: Vec::new(),
             total: 0,
+            errors: 0,
             done: false,
             pending: false,
             fetched: Instant::now() - CONSOLE_EVERY,
@@ -569,7 +577,7 @@ impl App {
             y += 22.0;
         }
         y += 4.0;
-        let errors = self.checks.as_ref().unwrap().console.as_ref().map_or(0, |c| c.lines.iter().filter(|l| l.error).count());
+        let errors = self.checks.as_ref().unwrap().console.as_ref().map_or(0, |c| c.errors);
         let running = check.state == "running" || check.state == "pending";
         let mut buttons: Vec<(String, ChecksAction)> = Vec::new();
         if !running {
@@ -604,14 +612,7 @@ impl App {
         let visible = ((pane.h - 16.0) / CON_LINE).floor().max(1.0);
         let con = self.checks.as_mut().unwrap().console.as_mut().unwrap();
         con.area = pane;
-        if con.rows.0 != cols || con.rows.1.len() != con.lines.len() {
-            let mut acc = 0;
-            con.rows = (cols, con.lines.iter().map(|l| {
-                let n: usize = l.spans.iter().map(|s| s.0.chars().count()).sum();
-                acc += n.div_ceil(cols).max(1);
-                acc
-            }).collect());
-        }
+        update_rows(&con.lines, cols, &mut con.rows);
         let total_rows = con.rows.1.last().copied().unwrap_or(0) as f32;
         let bottom = (total_rows - visible).max(0.0);
         if con.follow || con.top >= bottom {
@@ -673,6 +674,20 @@ impl App {
     }
 }
 
+/// Keep the unchanged prefix when a console page replaces its trailing lines.
+fn update_rows(lines: &[ConsoleLine], cols: usize, rows: &mut (usize, Vec<usize>)) {
+    if rows.0 != cols {
+        rows.0 = cols;
+        rows.1.clear();
+    }
+    let mut acc = rows.1.last().copied().unwrap_or(0);
+    for line in &lines[rows.1.len()..] {
+        let n: usize = line.spans.iter().map(|s| s.0.chars().count()).sum();
+        acc += n.div_ceil(cols).max(1);
+        rows.1.push(acc);
+    }
+}
+
 /// A run's or check's state mark.
 pub(super) fn state_mark(t: &Theme, state: &str) -> (&'static str, Rgba) {
     match state {
@@ -717,6 +732,25 @@ fn chunks(text: &str, col: usize, cols: usize) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapping_updates_replaced_tail_and_resize() {
+        let line = |text: &str| ConsoleLine { spans: vec![(text.into(), Style::default())], error: false };
+        let mut lines = vec![line("abcd"), line("✓✓✓✓✓"), line("")];
+        let mut rows = (0, Vec::new());
+        update_rows(&lines, 4, &mut rows);
+        assert_eq!(rows.1, [1, 3, 4]);
+        // A live output reply replaces the last line and appends more output.
+        rows.1.truncate(2);
+        lines[2] = line("123456789");
+        lines.push(line("next"));
+        update_rows(&lines, 4, &mut rows);
+        assert_eq!(rows.1, [1, 3, 6, 7]);
+        update_rows(&lines, 8, &mut rows);
+        assert_eq!(rows.1, [1, 2, 4, 5]);
+        update_rows(&lines, 8, &mut rows);
+        assert_eq!(rows.1, [1, 2, 4, 5]);
+    }
 
     #[test]
     fn spans_split_at_row_ends() {
