@@ -1063,7 +1063,7 @@ fn host_summary(tasks: &[TaskInfo]) -> String {
     for t in tasks {
         counts[group(&t.state)] += 1;
     }
-    let names = ["needs you", "running", "queued", "done", "ended"];
+    let names = ["needs you", "running", "queued", "done"];
     let parts: Vec<String> = counts.iter().zip(names).filter(|(n, _)| **n > 0).map(|(n, s)| format!("{n} {s}")).collect();
     if parts.is_empty() { "no tasks".into() } else { parts.join(" · ") }
 }
