@@ -434,6 +434,9 @@ struct App {
     chat_selection: Option<(TaskKey, (i32, usize), (i32, usize))>,
     chat_drag: bool,
     chat_copy: String,
+    ask_scroll: f32,
+    ask_bounds: Option<Rect>,
+    ask_identity: Option<(TaskKey, u64, String)>,
     /// The field and byte offset under a press or drag, found while drawing that field.
     text_hit: std::cell::Cell<Option<(Focus, usize)>>,
     /// Caret in the focused field, as a byte offset; None (or another field) is its end.
@@ -562,6 +565,9 @@ fn run() -> io::Result<()> {
         chat_selection: None,
         chat_drag: false,
         chat_copy: String::new(),
+        ask_scroll: 0.0,
+        ask_bounds: None,
+        ask_identity: None,
         text_hit: Default::default(),
         caret: None,
         sidebar_w: SIDEBAR_W,
@@ -1945,6 +1951,10 @@ impl App {
         }
         if self.machine_tasks.is_some() {
             self.mt_scroll = (self.mt_scroll - dy).max(0.0);
+        } else if self.review.is_none() && !self.welcome && self.chat.is_some()
+            && self.ask_identity.as_ref().is_some_and(|(key, since, _)| self.ask() == Some((*key, *since)))
+            && self.ask_bounds.is_some_and(|b| b.contains(self.mouse)) {
+            self.ask_scroll = (self.ask_scroll - dy).max(0.0);
         } else if let Some(rv) = self.review.as_mut().filter(|_| self.mouse.1 > TITLE_H + review::STRIP_H) {
             let s = if self.mouse.0 < self.rail_w { &mut rv.rail_scroll } else { &mut rv.scroll };
             *s = (*s - dy).max(0.0);

@@ -627,6 +627,7 @@ impl App {
 
     /// The conversation, what's waiting on you and the message box, in `sec` under the header.
     pub(super) fn draw_chat(&mut self, r: &mut Renderer, t: &Theme, sec: Rect, task: &TaskInfo, ended: bool) {
+        self.ask_bounds = None;
         let key = (task.machine, task.id);
         let focused = self.focus == Focus::Message && self.dialog.is_none();
 
@@ -640,7 +641,7 @@ impl App {
         let w = (sec.w - 2.0 * PAD).min(MAX_W);
         let x = sec.x + PAD;
         if task.asking {
-            bottom = self.draw_ask(r, t, x, w, bottom, task);
+            bottom = self.draw_ask(r, t, x, w, bottom, sec.y, task);
         }
         if task.state == "running" {
             let cy = bottom - 16.0;
@@ -695,6 +696,58 @@ impl App {
             self.chat_copy.clear();
             self.focus = Focus::Term;
         }
+        // Resolve the moving endpoint before painting so every row highlights the same
+        // range. Clamp drags to the nearest visible text row, including margins and gaps.
+        if pressed || self.chat_drag {
+            let mut nearest = None;
+            let mut distance = f32::INFINITY;
+            let mut interactive_press = false;
+            let mut row_y = area.y + 18.0 - top;
+            for (i, h) in heights.iter().enumerate() {
+                let laid = c.laid[i].as_ref().unwrap();
+                for (j, row) in laid.rows.iter().enumerate() {
+                    let ry = row_y + row.y;
+                    let text = row_text(row);
+                    if pressed && Rect::new(x, ry, w, row.h).contains(self.mouse)
+                        && (row.toggle || (task.machine == 0 && image_path(&text).is_some())) {
+                        interactive_press = true;
+                    }
+                    if ry + row.h < area.y || ry > area.y + area.h
+                        || row.toggle || text.is_empty()
+                        || (task.machine == 0 && image_path(&text).is_some()) {
+                        continue;
+                    }
+                    let dy = (self.mouse.1 - self.mouse.1.clamp(ry, ry + row.h)).abs();
+                    if dy < distance {
+                        distance = dy;
+                        nearest = Some((i, j));
+                    }
+                }
+                row_y += h + GAP;
+            }
+            if let Some((i, j)) = nearest.filter(|_| !interactive_press) {
+                let row = &c.laid[i].as_ref().unwrap().rows[j];
+                let mut offset = 0;
+                for run in &row.runs {
+                    if offset > 0 { offset += 1; }
+                    let mut rx = x + run.x;
+                    for ch in run.text.chars() {
+                        let advance = r.advance(run.font, run.size, run.weight, ch);
+                        if self.mouse.0 < rx + advance / 2.0 { break; }
+                        offset += ch.len_utf8();
+                        rx += advance;
+                    }
+                    if self.mouse.0 < rx + 1.0 { break; }
+                }
+                let point = (c.start + i, j, offset.min(row_text(row).len()));
+                if pressed {
+                    c.selection = Some((point, point));
+                    self.chat_drag = true;
+                } else if let Some(selection) = &mut c.selection {
+                    selection.1 = point;
+                }
+            }
+        }
         let mut y = area.y + 18.0 - top;
         if c.start > 0 && y > area.y {
             r.text(x, y - 16.0, "Loading earlier messages…", UI, 11.5, 400, t.faint, w);
@@ -728,25 +781,6 @@ impl App {
                     }
                     if !row.toggle && !text.is_empty() && linked_image.is_none() {
                         r.target(band, Cursor::Text);
-                        if (pressed || self.chat_drag) && band.contains(self.mouse) {
-                            let mut offset = 0;
-                            for run in &row.runs {
-                                if offset > 0 { offset += 1; }
-                                let mut rx = x + run.x;
-                                for ch in run.text.chars() {
-                                    let advance = r.advance(run.font, run.size, run.weight, ch);
-                                    if self.mouse.0 < rx + advance / 2.0 { break; }
-                                    offset += ch.len_utf8();
-                                    rx += advance;
-                                }
-                                if self.mouse.0 < rx + 1.0 { break; }
-                            }
-                            let point = (c.start + i, row_index, offset.min(text.len()));
-                            if pressed {
-                                c.selection = Some((point, point));
-                                self.chat_drag = true;
-                            } else if let Some(selection) = &mut c.selection { selection.1 = point; }
-                        }
                     }
                     let mut run_start = 0;
                     for run in &row.runs {
@@ -801,7 +835,7 @@ impl App {
 
     /// What the agent waits on, pinned above the message box: Allow/Deny, or a question's options
     /// (or type an answer). Returns the y above it.
-    fn draw_ask(&mut self, r: &mut Renderer, t: &Theme, x: f32, w: f32, bottom: f32, task: &TaskInfo) -> f32 {
+    fn draw_ask(&mut self, r: &mut Renderer, t: &Theme, x: f32, w: f32, bottom: f32, top: f32, task: &TaskInfo) -> f32 {
         let key = (task.machine, task.id);
         let (label, text, options): (&str, String, Vec<String>) = match &task.need {
             // Its detail is the action line ("running cargo test"); asked, it reads "run cargo test".
@@ -815,7 +849,7 @@ impl App {
         };
         let question = matches!(task.need, Some(Event::Question { .. }));
         // The text runs from 90 to the card's right edge, or to the Deny button (at w - 180).
-        let text_w = if question { w - 104.0 } else { w - 280.0 }.max(80.0);
+        let text_w = if question { w - 104.0 } else { w - 36.0 }.max(80.0);
         let lines = wrap(r, &text, UI, 12.5, text_w);
         // A question's options as buttons, as many rows as they take, the hint after the last.
         let hint = "or type an answer below";
@@ -833,12 +867,42 @@ impl App {
         }
         let hint_at = if bx + hint_w > right && bx > left { (left, row + 1) } else { (bx, row) };
         let rows = hint_at.1 + 1;
-        let h = (20.0 + lines.len() as f32 * 19.0).max(42.0) + if question { rows as f32 * 34.0 + 6.0 } else { 0.0 };
+        let h = if question {
+            (20.0 + lines.len() as f32 * 19.0).max(42.0) + rows as f32 * 34.0 + 6.0
+        } else {
+            (54.0 + lines.len() as f32 * 19.0).min(220.0).min((bottom - top - 16.0).max(73.0))
+        };
         let card = Rect::new(x, bottom - h - 12.0, w, h);
         r.frame(card, 0.0, t.needs_bg, t.needs_line);
         r.text(card.x + 14.0, card.y + 10.0, label, UI, 12.0, 600, t.needs, 80.0);
-        for (i, line) in lines.iter().enumerate() {
-            r.text(card.x + 90.0, card.y + 10.0 + i as f32 * 19.0, line, UI, 12.5, 400, t.text, text_w);
+        if question {
+            for (i, line) in lines.iter().enumerate() {
+                r.text(card.x + 90.0, card.y + 10.0 + i as f32 * 19.0, line, UI, 12.5, 400, t.text, text_w);
+            }
+        } else {
+            let identity = (key, task.since, text);
+            if self.ask_identity.as_ref() != Some(&identity) {
+                self.ask_scroll = 0.0;
+                self.ask_identity = Some(identity);
+            }
+            let viewport = Rect::new(card.x + 14.0, card.y + 44.0, w - 28.0, h - 54.0);
+            self.ask_bounds = Some(viewport);
+            let content_h = lines.len() as f32 * 19.0;
+            self.ask_scroll = self.ask_scroll.min((content_h - viewport.h).max(0.0));
+            let old_clip = r.clip();
+            r.set_clip(Some(viewport));
+            for (i, line) in lines.iter().enumerate() {
+                let y = viewport.y + i as f32 * 19.0 - self.ask_scroll;
+                if y + 19.0 > viewport.y && y < viewport.y + viewport.h {
+                    r.text(viewport.x, y, line, UI, 12.5, 400, t.text, text_w);
+                }
+            }
+            r.set_clip(old_clip);
+            if content_h > viewport.h {
+                let thumb_h = (viewport.h * viewport.h / content_h).max(12.0).min(viewport.h);
+                let thumb_y = viewport.y + (viewport.h - thumb_h) * self.ask_scroll / (content_h - viewport.h);
+                r.rect(Rect::new(card.x + w - 7.0, thumb_y, 3.0, thumb_h), 1.5, t.text3);
+            }
         }
         if question {
             // Anything not among the options is typed in the message box.
