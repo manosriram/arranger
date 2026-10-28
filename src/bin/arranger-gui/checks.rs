@@ -220,8 +220,11 @@ impl App {
             }
             ChecksAction::Step(d) => {
                 let ids: Vec<u64> = cv.runs.iter().filter(|r| cv.expanded_runs.contains(&r.id)).flat_map(|r| r.checks.iter().map(|c| c.id)).collect();
+                if ids.is_empty() {
+                    return;
+                }
                 let at = cv.selected.and_then(|s| ids.iter().position(|&i| i == s)).unwrap_or(0) as i32;
-                if let Some(&next) = ids.get((at + d).clamp(0, ids.len() as i32 - 1).max(0) as usize) {
+                if let Some(&next) = ids.get((at + d).clamp(0, ids.len() as i32 - 1) as usize) {
                     cv.selected = Some(next);
                     cv.console = None;
                 }
