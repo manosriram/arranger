@@ -2448,6 +2448,13 @@ impl App {
                     recall(&earlier, &mut d.hist, &mut d.prompt, up)
                 }
                 (Focus::Prompt, Some(d)) => recall(&self.prompts, &mut d.hist, &mut d.prompt, up),
+                (Focus::Message, None) if !m.shift_key() && !m.control_key() && !m.alt_key() && !app_mod(m) && self.anchor.is_none() => {
+                    if let Some(c) = self.chat.as_mut().filter(|c| Some(c.key) == self.selected) {
+                        c.recall_prompt(self.drafts.entry(c.key).or_default(), up)
+                    } else {
+                        false
+                    }
+                }
                 _ => false,
             };
             if recalled {

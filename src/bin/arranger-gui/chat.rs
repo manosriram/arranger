@@ -82,6 +82,7 @@ struct Laid {
 }
 
 pub struct ChatView {
+    hist: Option<usize>,
     selection: Option<((usize, usize, usize), (usize, usize, usize))>,
     slash: Slash,
     pub key: TaskKey,
@@ -112,6 +113,14 @@ impl Drop for ChatView {
 }
 
 impl ChatView {
+    pub(super) fn recall_prompt(&mut self, text: &mut String, up: bool) -> bool {
+        let prompts: Vec<String> = self.items.iter().filter_map(|item| match item {
+            ChatItem::User { text } => Some(text.clone()),
+            _ => None,
+        }).collect();
+        recall(&prompts, &mut self.hist, text, up)
+    }
+
     fn is_open(&self, i: usize) -> bool {
         if let Some(&o) = self.open.get(&(self.start + i)) {
             return o;
@@ -439,6 +448,7 @@ impl App {
             }
         });
         self.chat = Some(ChatView {
+            hist: None,
             selection: None,
             slash: Slash::default(),
             key,
@@ -503,6 +513,9 @@ impl App {
         let text = text.trim().to_string();
         if text.is_empty() {
             return;
+        }
+        if let Some(c) = &mut self.chat {
+            c.hist = None;
         }
         if !is_live(&task.state) {
             self.actions.push(Action::Revive(key, text));
@@ -916,7 +929,7 @@ impl App {
         let mut hx = b.x + 2.0;
         let fy = b.y + b.h + 7.0;
         let esc = if self.vim { "Esc Esc" } else { "Esc" };
-        for (k, what) in [("↵", "send"), ("⇧↵", "new line"), (esc, "interrupt")] {
+        for (k, what) in [("↵", "send"), ("⇧↵", "new line"), ("↑", "previous prompts"), (esc, "interrupt")] {
             hx += r.text(hx, fy, k, UI, 11.0, 500, t.text3, 80.0) + 6.0;
             hx += r.text(hx, fy, what, UI, 11.0, 400, t.faint, 120.0) + 18.0;
         }
@@ -993,7 +1006,7 @@ mod tests {
         let line = |kind| arranger::proto::DiffLine { kind, old: 0, new: 0, text: "x\n".into() };
         let tool = |ok, diff| ChatItem::Tool { id: "t".into(), name: "Edit".into(), kind: ToolKind::Edit, target: "a".into(), input: String::new(), output: "out".into(), ok, diff };
         let (sock, _) = UnixStream::pair().unwrap();
-        let mut c = ChatView { selection: None, slash: Slash::default(), key: (0, 1), seq: 0, writer: sock, start: 10, items: vec![tool(Some(true), vec![line('+')]), tool(Some(false), vec![]), tool(Some(true), vec![line('+'); SMALL_DIFF + 1])], laid: vec![None, None, None], loaded: true, loading: false, width: 0.0, open: HashMap::new(), top: None, max_top: 0.0, prepended: 0 };
+        let mut c = ChatView { hist: None, selection: None, slash: Slash::default(), key: (0, 1), seq: 0, writer: sock, start: 10, items: vec![tool(Some(true), vec![line('+')]), tool(Some(false), vec![]), tool(Some(true), vec![line('+'); SMALL_DIFF + 1])], laid: vec![None, None, None], loaded: true, loading: false, width: 0.0, open: HashMap::new(), top: None, max_top: 0.0, prepended: 0 };
         assert_eq!((c.is_open(0), c.is_open(1), c.is_open(2)), (true, true, false));
         c.toggle(0);
         assert!(!c.is_open(0) && c.open.get(&10) == Some(&false), "kept by conversation index");
@@ -1002,5 +1015,22 @@ mod tests {
         assert_eq!(c.top, Some(400.0));
         c.scroll(-200.0);
         assert_eq!(c.top, None, "back at the bottom it follows again");
+        c.items = vec![
+            ChatItem::User { text: "first prompt".into() },
+            ChatItem::Assistant { text: "reply".into() },
+            ChatItem::User { text: "second\nprompt 🦀".into() },
+        ];
+        let mut draft = String::new();
+        assert!(c.recall_prompt(&mut draft, true));
+        assert_eq!(draft, "second\nprompt 🦀");
+        assert!(c.recall_prompt(&mut draft, true));
+        assert_eq!(draft, "first prompt");
+        assert!(c.recall_prompt(&mut draft, false));
+        assert_eq!(draft, "second\nprompt 🦀");
+        assert!(c.recall_prompt(&mut draft, false));
+        assert!(draft.is_empty());
+        draft.push_str("new draft");
+        assert!(!c.recall_prompt(&mut draft, true));
+        assert_eq!(draft, "new draft");
     }
 }
