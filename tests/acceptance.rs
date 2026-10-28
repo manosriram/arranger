@@ -98,6 +98,7 @@ elif 'coverage' in schema:
     command = 'sh scenario.sh' if mode != 'gap' else 'test -f double.sh && echo unrelated-smoke-passed'
     if mode == 'skipped': command = "printf 'running 0 tests\\n'"
     if mode == 'slow': command = 'sh slow.sh'
+    if (home / 'check-command').exists(): command = (home / 'check-command').read_text()
     checks = [dict(name='Behavior', command=command, why='Exercise positive and negative numbers')]
     answer = dict(checks=checks, none_reason='', coverage=[dict(requirement=1, commands=[command], reason='')])
     if mode == 'missing': answer['coverage'] = []
@@ -114,6 +115,29 @@ else:
     answer = dict(results=[dict(requirement=1, verified=verified, check=999999 if mode=='fabricated' else check['id'], assertion='scenario.sh asserts -3 → -6 and 7 → 14', excerpt=excerpt, reason='' if verified else 'An unrelated smoke check did not exercise doubling')], summary='Positive and negative doubling tested' if verified else 'Doubling has not been tested')
 print(json.dumps(answer))
 "#;
+
+#[test]
+fn long_and_multiline_checks_execute_after_approval() {
+    let f = Fixture::new();
+    let commands = [
+        format!("sh scenario.sh # {}", "long check ".repeat(60)),
+        "set -eu\nsh <<'CHECK'\nset -eu\ntest \"$(sh double.sh -3)\" = -6\ntest \"$(sh double.sh 7)\" = 14\necho 'double: negative and positive assertions passed'\nCHECK".into(),
+    ];
+    for (i, command) in commands.into_iter().enumerate() {
+        f.write("check-command", &command);
+        f.ok(&["checks", "1", "--run"]);
+        f.until(|| f.state() != "planning");
+        assert_eq!(f.state(), "approval", "{}", f.cli(&["checks", "1"]).1);
+        f.ok(&["checks", "1", "--approve"]);
+        f.until(|| !matches!(f.state().as_str(), "planning" | "running"));
+        assert_eq!(f.state(), "passed", "{}", f.cli(&["checks", "1"]).1);
+        let log = f.ok(&["checks", "1", "--log", &(i + 2).to_string()]);
+        assert_eq!(log, "double: negative and positive assertions passed\n");
+    }
+    // A script's failing assertion must still fail the run, not just pass validation.
+    f.write("worktrees/repo/1/double.sh", "echo $(( $1 + 1 ))\n");
+    f.run("failed");
+}
 
 #[test]
 fn evidence_is_required_for_normal_merge_and_bound_to_source_and_instructions() {

@@ -62,7 +62,7 @@ pub fn tree_hash(worktree: &Path) -> Result<String, String> {
     tree
 }
 
-/// Trims and checks the specs: one-line commands of sane length, a name for each.
+/// Trims and checks the specs: bounded shell commands or scripts, a name for each.
 pub fn validate(specs: Vec<CheckSpec>) -> Result<Vec<CheckSpec>, String> {
     if specs.is_empty() {
         return Err("no checks to run".into());
@@ -77,12 +77,16 @@ pub fn validate(specs: Vec<CheckSpec>) -> Result<Vec<CheckSpec>, String> {
             if s.command.is_empty() {
                 return Err("a check has no command".to_string());
             }
-            if s.command.contains('\n') || s.command.len() > 500 {
-                return Err(format!("a check's command is too long or spans lines: {}", s.command.chars().take(80).collect::<String>()));
+            // Leave room below the shell's argument-size limit for inline assertion scripts.
+            if s.command.len() > 64 << 10 {
+                return Err("a check's command exceeds 64 KiB; put the script in the repository and invoke it instead".into());
+            }
+            if s.command.contains('\0') {
+                return Err("a check's command contains a NUL byte".into());
             }
             s.name = s.name.lines().next().unwrap_or("").trim().chars().take(80).collect();
             if s.name.is_empty() {
-                s.name = s.command.chars().take(80).collect();
+                s.name = s.command.lines().next().unwrap_or("").chars().take(80).collect();
             }
             s.why = s.why.lines().next().unwrap_or("").trim().chars().take(200).collect();
             Ok(s)
@@ -200,7 +204,9 @@ is broad or touches shared code;
 - the compiler or type checker, and the linter the project uses, scoped to what changed when the tool allows;
 - only commands that report: never formatters or linters that rewrite files (use --check variants), never installs, \
 network calls, servers, deploys, or commands that wait for input;
-- each should finish in under 10 minutes; use the project's own scripts (package.json, Makefile, justfile…) when it has them.
+- each should finish in under 10 minutes; use the project's own scripts (package.json, Makefile, justfile…) when it has them;
+- commands run in sh, not necessarily bash. Multiline scripts and heredocs are supported. Keep each command within \
+64 KiB; for larger checks, invoke a script already in the repository.
 Give each a short name and say why it covers this change. Include relevant runtime/tool versions in check output where \
 useful. If there is no executable coverage, return no checks and explain the gap in none_reason; that is not a pass. \
 Only an explicitly non-executable request can be exempt. Otherwise leave none_reason empty.
@@ -246,7 +252,7 @@ pub fn plan_from(answer: serde_json::Value) -> Result<(Vec<CheckSpec>, String), 
 /// Check-only commands that run without asking: common test, build, type and lint commands,
 /// with no shell operators, and the project's own scripts whose names say they check.
 pub fn allowed(command: &str, worktree: &Path) -> bool {
-    if ["&&", "||", ";", "|", ">", "<", "`", "$(", "&"].iter().any(|op| command.contains(op)) {
+    if ["\n", "\r", "&&", "||", ";", "|", ">", "<", "`", "$(", "&"].iter().any(|op| command.contains(op)) {
         return false;
     }
     let words: Vec<&str> = command.split_whitespace().collect();
@@ -381,7 +387,8 @@ mod tests {
             assert!(allowed(ok, &dir), "{ok}");
         }
         for ask in ["cargo fmt", "npm run deploy", "npm run lint:fix", "npm run typecheck", "just deploy", "make install", "cargo test && rm -rf /",
-            "cargo test | tee x", "curl x", "eslint --fix .", "npx jest -u", "rm -rf target", "cargo test > out"] {
+            "cargo test | tee x", "curl x", "eslint --fix .", "npx jest -u", "rm -rf target", "cargo test > out",
+            "cargo test\ntouch unexpected", "cargo test\r\ncargo check"] {
             assert!(!allowed(ask, &dir), "{ask}");
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -393,7 +400,8 @@ mod tests {
         assert_eq!((checks.len(), checks[0].command.as_str(), reason.as_str()), (1, "cargo test", ""));
         let (checks, reason) = plan_from(json!({"checks": [], "none_reason": "docs only\nmore"})).unwrap();
         assert!(checks.is_empty() && reason == "docs only");
-        assert!(plan_from(json!({"checks": [{"name": "a", "command": "a\nb", "why": ""}], "none_reason": ""})).is_err());
+        let (checks, _) = plan_from(json!({"checks": [{"name": "a", "command": "set -eu\nsh scenario.sh", "why": ""}], "none_reason": ""})).unwrap();
+        assert_eq!(checks[0].command, "set -eu\nsh scenario.sh");
         assert_eq!(plan_schema()["required"], json!(["checks", "none_reason"]), "plans are checks and a reason, nothing more");
         assert!(!code_changed(&["README.md".into(), "docs/a.png".into(), "LICENSE".into()]));
         assert!(code_changed(&["README.md".into(), "src/a.rs".into()]));
@@ -481,7 +489,12 @@ mod tests {
         assert_eq!(v[1].name, "lint");
         assert!(validate(vec![]).is_err());
         assert!(validate(vec![spec("", "  ")]).is_err());
-        assert!(validate(vec![spec("", "a\nb")]).is_err());
+        let v = validate(vec![spec("", "set -eu\nsh scenario.sh"), spec("long", &"x".repeat(64 << 10))]).unwrap();
+        assert_eq!(v[0].name, "set -eu");
+        assert_eq!(v[0].command, "set -eu\nsh scenario.sh");
+        assert_eq!(v[1].command.len(), 64 << 10);
+        assert!(validate(vec![spec("", &"x".repeat((64 << 10) + 1))]).unwrap_err().contains("exceeds 64 KiB"));
+        assert!(validate(vec![spec("", "echo bad\0command")]).unwrap_err().contains("NUL"));
         assert!(validate(vec![spec("", "true"); MAX_CHECKS + 1]).is_err());
     }
 }
