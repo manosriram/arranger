@@ -298,10 +298,11 @@ enum Action {
     ToggleUsage,
     ToggleVim,
     ToggleDing,
-    /// Opens the popup of every task on this machine, or closes it (None).
+    /// Opens the global task popup, or closes it (None).
     MachineTasks(Option<usize>),
     /// Filters that popup to one state group (None: all).
     MtGroup(Option<usize>),
+    MtMachine(Option<usize>),
     /// Loads the popup's next page of rows.
     MtMore,
     /// Open this folder as the project, or pick one first (None).
@@ -390,9 +391,9 @@ struct App {
     /// The selected task's setup output: (task, its setup stage then, output, when fetched).
     setup_log: Option<(TaskKey, String, String, Instant)>,
     setup_log_pending: bool,
-    /// The machine whose every task shows in a popup (its sidebar header's "See all"), filtered to
-    /// one state group (None: all) and by its own filter text.
+    /// Whether the global See all popup is open, with machine, state and text filters.
     machine_tasks: Option<usize>,
+    mt_machine: Option<usize>,
     mt_group: Option<usize>,
     mt_filter: String,
     mt_scroll: f32,
@@ -540,6 +541,7 @@ fn run() -> io::Result<()> {
         recent: Vec::new(),
         welcome_error: String::new(),
         machine_tasks: None,
+        mt_machine: None,
         mt_group: None,
         mt_filter: String::new(),
         mt_scroll: 0.0,
@@ -1676,17 +1678,16 @@ impl App {
         self.all_tasks().filter(|t| matches!(group(&t.state), 1 | 2)).count() > DENSE_AT
     }
 
-    /// The machine popup's rows: by state, most recently active first, through its filter and state tabs.
+    /// Global popup rows: by machine, then state and most recent activity.
     fn mt_tasks(&self) -> Vec<&TaskInfo> {
-        let Some(h) = self.machine_tasks.and_then(|m| self.hosts.get(m)) else { return Vec::new() };
+        if self.machine_tasks.is_none() { return Vec::new(); }
         let f = self.mt_filter.to_lowercase();
-        let mut v: Vec<&TaskInfo> = h
-            .tasks
-            .iter()
+        let mut v: Vec<&TaskInfo> = self.all_tasks()
+            .filter(|t| self.mt_machine.is_none_or(|m| t.machine == m))
             .filter(|t| self.mt_group.is_none_or(|g| group(&t.state) == g))
             .filter(|t| f.is_empty() || format!("{} {} {}", title(t), t.agent, t.branch).to_lowercase().contains(&f))
             .collect();
-        v.sort_by_key(|t| (group(&t.state), std::cmp::Reverse(last_event(t)), std::cmp::Reverse(t.id)));
+        v.sort_by_key(|t| (t.machine, group(&t.state), std::cmp::Reverse(last_event(t)), std::cmp::Reverse(t.id)));
         v
     }
 
@@ -1966,12 +1967,8 @@ impl App {
             "G" => self.move_selection(1 << 20),
             "J" => self.jump_needs(true),
             "K" => self.jump_needs(false),
-            "H" => {
-                if let Some((machine, _)) = self.selected {
-                    self.actions.push(Action::MachineTasks(Some(machine)));
-                }
-            }
-            "/" => self.actions.push(Action::Focus(Focus::Filter)),
+            "H" => self.actions.push(Action::MachineTasks(Some(0))),
+            "/" => self.actions.push(Action::Focus(if self.machine_tasks.is_some() { Focus::TasksFilter } else { Focus::Filter })),
             // Insert: the selected agent's terminal, from whichever view.
             "i" if self.current().is_some() => {
                 self.machine_tasks = None;
@@ -2776,11 +2773,17 @@ impl App {
                 }
                 Action::MachineTasks(m) => {
                     self.machine_tasks = m;
+                    self.mt_machine = None;
                     self.mt_reveal = None;
                     (self.mt_group, self.mt_scroll, self.mt_shown) = (None, 0.0, overlays::MT_PAGE);
                     self.mt_filter.clear();
                     // Typing goes to its filter at once; vim keeps normal mode, for j/k.
                     self.focus = if m.is_some() && !self.vim { Focus::TasksFilter } else { self.rest() };
+                }
+                Action::MtMachine(m) => {
+                    self.mt_machine = m;
+                    self.mt_reveal = None;
+                    (self.mt_scroll, self.mt_shown) = (0.0, overlays::MT_PAGE);
                 }
                 Action::MtGroup(g) => {
                     self.mt_reveal = None;
