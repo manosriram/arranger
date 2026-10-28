@@ -323,6 +323,33 @@ else
   git log -1 --format='committed %h %s'
 fi"#;
 
+/// The worktree's contents as a git tree, uncommitted and untracked (not ignored) files
+/// included, without touching its index: a copy of the index takes the changes.
+pub fn tree_hash(worktree: &Path) -> Result<String, String> {
+    let git = |index: Option<&Path>, args: &[&str]| {
+        let mut c = Command::new("git");
+        c.arg("-C").arg(worktree).args(args);
+        if let Some(i) = index {
+            c.env("GIT_INDEX_FILE", i);
+        }
+        let out = c.output().map_err(|e| format!("git: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let real = git(None, &["rev-parse", "--path-format=absolute", "--git-path", "index"])?;
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let copy = std::env::temp_dir().join(format!("arranger-index-{}-{nanos}", std::process::id()));
+    // Its stat cache spares hashing every file again; a fresh one starts from HEAD.
+    if std::fs::copy(&real, &copy).is_err() {
+        git(Some(&copy), &["read-tree", "HEAD"])?;
+    }
+    let tree = git(Some(&copy), &["add", "-A"]).and_then(|_| git(Some(&copy), &["write-tree"]));
+    let _ = std::fs::remove_file(&copy);
+    tree
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,31 +493,4 @@ mod tests {
         assert_eq!(diff(&dir, &main, None).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
-
-/// The worktree's contents as a git tree, uncommitted and untracked (not ignored) files
-/// included, without touching its index: a copy of the index takes the changes.
-pub fn tree_hash(worktree: &Path) -> Result<String, String> {
-    let git = |index: Option<&Path>, args: &[&str]| {
-        let mut c = Command::new("git");
-        c.arg("-C").arg(worktree).args(args);
-        if let Some(i) = index {
-            c.env("GIT_INDEX_FILE", i);
-        }
-        let out = c.output().map_err(|e| format!("git: {e}"))?;
-        if !out.status.success() {
-            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    };
-    let real = git(None, &["rev-parse", "--path-format=absolute", "--git-path", "index"])?;
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    let copy = std::env::temp_dir().join(format!("arranger-index-{}-{nanos}", std::process::id()));
-    // Its stat cache spares hashing every file again; a fresh one starts from HEAD.
-    if std::fs::copy(&real, &copy).is_err() {
-        git(Some(&copy), &["read-tree", "HEAD"])?;
-    }
-    let tree = git(Some(&copy), &["add", "-A"]).and_then(|_| git(Some(&copy), &["write-tree"]));
-    let _ = std::fs::remove_file(&copy);
-    tree
 }
