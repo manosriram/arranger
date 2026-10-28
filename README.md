@@ -14,7 +14,7 @@ Threads can be saved with **Bookmark** in the thread header, or **Bookmark threa
 ## Install
 
 ```sh
-curl -fsSL https://github.com/manosriram/arranger/releases/latest/download/install.sh | sh
+curl -fsSL https://arranger.dev/install.sh | sh
 ```
 
 On macOS this also puts **arranger.app** in `~/Applications`: open it from Finder, Spotlight or the Dock, then pick a project folder (any folder works; arranger sets up git in it).
