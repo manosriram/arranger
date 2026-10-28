@@ -119,7 +119,7 @@ The **usage** chip in the status bar shows how much of each agent's plan is spen
 
 Prefer vim keys? Turn on **Vim keys** in **Settings** (top right). The bindings are in [vim.json](vim.json), and `?` shows them in the app.
 
-In normal mode, `h` moves left and `l` moves right through **Workspace → Review**, skipping unavailable tabs and stopping at either end. Press `H` (Shift+H) to open **See all** for the selected task's machine. Press `d` on a task in Workspace to open a confirmation dialog before deleting the thread and its worktree; `y` confirms and `n` or Esc cancels.
+In normal mode, `h` moves left and `l` moves right through **Workspace → Review**, skipping unavailable tabs and stopping at either end. Press `H` (Shift+H) to open global **See all**, grouped by machine, with machine, status, and text filters. Press `d` on a task in Workspace to open a confirmation dialog before deleting the thread and its worktree; `y` confirms and `n` or Esc cancels.
 
 Everything also works from the terminal:
 

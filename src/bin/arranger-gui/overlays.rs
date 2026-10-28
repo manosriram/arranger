@@ -87,7 +87,7 @@ impl App {
     /// top, then rows grouped by state, each with the one thing to do next (Revive for an agent
     /// that has ended). Rows load a page at a time as the list scrolls.
     pub fn draw_machine_tasks(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
-        let Some(m) = self.machine_tasks else { return };
+        if self.machine_tasks.is_none() { return; }
         let mut acts = Vec::new();
         let colors = [t.needs, t.work, t.faint, t.done, t.faint];
         r.rect(Rect::new(0.0, 0.0, w, h), 0.0, t.scrim);
@@ -101,17 +101,10 @@ impl App {
             acts.push(Action::MachineTasks(None));
         }
 
-        // Header: ■ This Mac  local · 14 tasks                    esc
-        let host = &self.hosts[m];
         let head = Rect::new(pop.x, pop.y, pop.w, HEAD_H);
         r.rect(Rect::new(pop.x, head.y + head.h - 1.0, pop.w, 1.0), 0.0, t.border);
-        let up = matches!(host.link, Link::Up(_));
-        r.rect(Rect::new(head.x + 20.0, head.y + head.h / 2.0 - 4.0, 8.0, 8.0), 0.0, if up { t.done } else { t.del });
-        let nw = r.text(head.x + 38.0, r.center(head, UI, 15.0), host.name(), UI, 15.0, 600, t.text, 300.0);
-        let addr = host.cfg.as_ref().map_or("local", |c| c.ssh.as_str());
-        let total = host.tasks.len();
-        let sub = format!("{addr} · {total} task{}", if total == 1 { "" } else { "s" });
-        r.text(head.x + 50.0 + nw, r.center(head, UI, 12.5), &sub, UI, 12.5, 400, t.text3, pop.w - nw - 160.0);
+        let total = self.all_tasks().filter(|task| self.mt_machine.is_none_or(|m| task.machine == m)).count();
+        r.text(head.x + 20.0, r.center(head, UI, 15.0), &format!("All machines · {total} tasks"), UI, 15.0, 600, t.text, pop.w - 100.0);
         let esc = Rect::new(head.x + head.w - 64.0, head.y + (head.h - 28.0) / 2.0, 44.0, 28.0);
         r.frame(esc, 0.0, t.dialog, t.border2);
         r.text(esc.x + 9.0, r.center(esc, MONO, 12.0), "esc", MONO, 12.0, 400, t.text3, 40.0);
@@ -127,7 +120,7 @@ impl App {
             acts.push(Action::Focus(Focus::TasksFilter));
         }
         let mut counts = [0; 5];
-        for task in &host.tasks {
+        for task in self.all_tasks().filter(|task| self.mt_machine.is_none_or(|m| task.machine == m)) {
             counts[group(&task.state)] += 1;
         }
         let mut x = f.x + f.w + 10.0;
@@ -154,6 +147,19 @@ impl App {
             x += tw + 1.0;
         }
 
+        let machines = Rect::new(pop.x, bar.y + bar.h, pop.w, TOOLBAR_H);
+        let label = self.mt_machine.and_then(|m| self.hosts.get(m)).map_or("All machines", |host| host.name());
+        let label = format!("Machine: {label}  →");
+        let button = Rect::new(machines.x + 20.0, machines.y + 9.0, (r.measure(UI, 12.5, 400, &label) + 20.0).min(pop.w - 40.0), 30.0);
+        r.frame(button, 0.0, t.raised, t.border2);
+        r.text(button.x + 10.0, r.center(button, UI, 12.5), &label, UI, 12.5, 400, t.text2, button.w - 20.0);
+        if self.hit(r, button) {
+            let next = self.hosts.iter().enumerate()
+                .find(|(m, host)| !host.removed && self.mt_machine.is_none_or(|current| *m > current))
+                .map(|(m, _)| m);
+            acts.push(Action::MtMachine(next));
+        }
+
         // Columns: icon | Task | Agent | Branch | Latest | Time | action.
         let inner = pop.w - 40.0;
         let fixed = 30.0 + 80.0 + 60.0 + 104.0;
@@ -164,7 +170,7 @@ impl App {
 
         // Rows, grouped by state; the first `mt_shown` of them.
         let foot = Rect::new(pop.x, pop.y + pop.h - FOOT_H, pop.w, FOOT_H);
-        let list = Rect::new(pop.x + 1.0, bar.y + bar.h, pop.w - 2.0, foot.y - bar.y - bar.h);
+        let list = Rect::new(pop.x + 1.0, machines.y + machines.h, pop.w - 2.0, foot.y - machines.y - machines.h);
         r.set_clip(Some(list));
         let clicked = |p: Option<(f32, f32)>| p.is_some_and(|p| list.contains(p));
         let reveal = self.mt_reveal.take();
@@ -176,7 +182,7 @@ impl App {
             let mut top = 0.0;
             let mut previous_group = None;
             for task in &tasks[..=index] {
-                let g = group(&task.state);
+                let g = (task.machine, group(&task.state));
                 if previous_group != Some(g) { top += GROUP_ROW_H; }
                 previous_group = Some(g);
                 top += ROW_H;
@@ -188,20 +194,20 @@ impl App {
         }
         let mut y = list.y - scroll;
         if tasks.is_empty() {
-            let note = if total == 0 { format!("No tasks on {} yet", host.name()) } else { "No matches".into() };
-            r.text(pop.x + 50.0, y + 18.0, &note, UI, 13.0, 400, t.text3, pop.w - 100.0);
+            let note = if total == 0 { "No tasks yet" } else { "No matches" };
+            r.text(pop.x + 50.0, y + 18.0, note, UI, 13.0, 400, t.text3, pop.w - 100.0);
         }
         let mut last_group = None;
         for task in &tasks[..shown] {
             let g = group(&task.state);
-            if last_group != Some(g) {
-                last_group = Some(g);
+            if last_group != Some((task.machine, g)) {
+                last_group = Some((task.machine, g));
                 let row = Rect::new(list.x, y, list.w, GROUP_ROW_H);
                 r.rect(row, 0.0, t.panel);
                 r.rect(Rect::new(row.x, row.y + row.h - 1.0, row.w, 1.0), 0.0, t.border);
                 r.rect(Rect::new(pop.x + 20.0, row.y + row.h / 2.0 - 3.0, 6.0, 6.0), 0.0, colors[g]);
-                let lw = r.text(pop.x + 34.0, r.center(row, UI, 11.5), &GROUPS[g].to_uppercase(), UI, 11.5, 600, t.text3, 200.0);
-                r.text(pop.x + 42.0 + lw, r.center(row, MONO, 11.5), &counts[g].to_string(), MONO, 11.5, 400, t.faint, 40.0);
+                let lw = r.text(pop.x + 34.0, r.center(row, UI, 11.5), &format!("{} · {}", self.hosts[task.machine].name(), GROUPS[g].to_uppercase()), UI, 11.5, 600, t.text3, 200.0);
+                r.text(pop.x + 42.0 + lw, r.center(row, MONO, 11.5), &self.hosts[task.machine].tasks.iter().filter(|task| group(&task.state) == g).count().to_string(), MONO, 11.5, 400, t.faint, 40.0);
                 y += GROUP_ROW_H;
             }
             let row = Rect::new(list.x, y, list.w, ROW_H);
@@ -232,7 +238,7 @@ impl App {
             let (x, w) = col("branch");
             r.text(x, r.center(row, MONO, 12.0), &task.branch, MONO, 12.0, 400, t.text3, w);
             let (x, w) = col("latest");
-            let queue_pos = host.tasks.iter().filter(|q| q.state == "queued" && q.id <= task.id).count();
+            let queue_pos = self.hosts[task.machine].tasks.iter().filter(|q| q.state == "queued" && q.id <= task.id).count();
             let (latest, lc) = match self.revive_error.as_ref().filter(|e| e.0 == key) {
                 Some((_, e)) => (format!("couldn't revive: {e}"), t.del),
                 None => (status_line(task, queue_pos).replace('\n', " "), if g == 0 { t.needs } else { t.text3 }),
@@ -527,7 +533,7 @@ impl App {
     /// Vim's keybinding sheet, above the status bar on the right.
     pub fn draw_help(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
         const SECTIONS: [(&str, &[(&str, &str)]); 3] = [
-            ("MOVE", &[("j / k", "next / prev agent"), ("gg  G", "first / last"), ("J / K", "next / prev needing you"), ("h / l", "prev / next view"), ("H", "see all on machine"), ("/", "filter agents")]),
+            ("MOVE", &[("j / k", "next / prev agent"), ("gg  G", "first / last"), ("J / K", "next / prev needing you"), ("h / l", "prev / next view"), ("H", "see all machines"), ("/", "filter agents")]),
             ("ACT", &[("o  ↵", "type into agent"), ("j / k", "its menu, when it asks"), ("↵", "pick from the menu"), ("y / n", "allow once / deny"),("r", "review diff"), ("V", "Select multiple tasks"), ("d", "delete selected tasks"), ("c", "clone task"), ("n", "new task"), ("m", "add machine")]),
             ("MODE", &[("i", "type into agent"), ("esc", "normal mode"), ("esc esc", "stop the agent"), ("?", "this sheet")]),
         ];
