@@ -415,6 +415,8 @@ pub enum Event {
     Usage { tokens: u64, cost: Option<f64> },
     /// How much of a plan's usage window is spent, as the agent reported it.
     Limit(PlanLimit),
+    /// A recoverable failure: the agent is waiting to retry without user input.
+    Retrying { message: String },
 }
 
 /// One usage window of an agent's subscription (claude's 5-hour session, codex's week...).
@@ -457,6 +459,7 @@ impl Event {
             Event::TurnDone => "done".into(),
             Event::Summary { text } => format!("summary: {text}"),
             Event::Error { message } => format!("error: {message}"),
+            Event::Retrying { message } => message.clone(),
             Event::Usage { tokens, cost: Some(cost) } => format!("{tokens} tokens, ${cost:.4}"),
             Event::Usage { tokens, cost: None } => format!("{tokens} tokens"),
             Event::Limit(l) => format!("{} {}: {}", l.agent, l.window, l.used.map_or(l.status.clone(), |u| format!("{u:.0}% used"))),

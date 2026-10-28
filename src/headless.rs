@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) use acp::tool_kind as acp_tool_kind;
 pub(crate) use codex::command as codex_command;
+pub(crate) use codex::retry_message as codex_retry_message;
 
 /// Agents that can run headless.
 pub fn supported(agent: &str) -> bool {

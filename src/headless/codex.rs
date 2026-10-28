@@ -171,6 +171,31 @@ fn chat_line(method: &str) -> bool {
     )
 }
 
+/// Keep the provider's retry timing and details; the protocol has no dedicated delay field.
+pub(crate) fn retry_message(error: &Value) -> String {
+    let message = error_message(error, "codex");
+    let details = string(&error["additionalDetails"]);
+    let text = if details.is_empty() || message.contains(&details) { message } else { format!("{message}: {details}") };
+    let lower = text.to_ascii_lowercase();
+    let info = &error["codexErrorInfo"];
+    let limited = info == "rateLimitExceeded" || info == "usageLimitExceeded"
+        || info.as_object().is_some_and(|o| o.values().any(|v| v["httpStatusCode"] == 429))
+        || lower.contains("429") || lower.contains("rate limit") || lower.contains("too many requests");
+    let reason = if limited { "Rate limited" } else { "Request interrupted" };
+    let delay = lower.match_indices("in ").find_map(|(offset, _)| {
+        let tail = &text[offset + 3..];
+        let n = tail.bytes().take_while(|b| b.is_ascii_digit() || *b == b'.').count();
+        let seconds = tail[..n].parse::<f64>().ok()?;
+        let unit = tail[n..].trim_start();
+        let seconds = if unit.starts_with("ms") { seconds / 1000.0 }
+            else if unit.starts_with('s') { seconds }
+            else if unit.starts_with('m') { seconds * 60.0 }
+            else { return None };
+        (seconds.is_finite() && seconds >= 0.0).then(|| format!("in {:.0}s", seconds.ceil()))
+    });
+    format!("{reason}; will retry {}. {text}", delay.as_deref().unwrap_or("automatically (wait time unavailable)"))
+}
+
 impl Transport for Codex {
     fn core(&self) -> &Core {
         &self.c
@@ -310,7 +335,8 @@ impl Transport for Codex {
                 self.c.done(error, events);
                 events.extend(self.start_next());
             }
-            "error" if p["willRetry"] != true => events.push(Event::Error { message: error_message(&p["error"], "codex") }),
+            "error" if p["willRetry"] == true => events.push(Event::Retrying { message: retry_message(&p["error"]) }),
+            "error" => events.push(Event::Error { message: error_message(&p["error"], "codex") }),
             "account/rateLimits/updated" => events.extend(crate::adapter::codex_limits(&p["rateLimits"])),
             "thread/tokenUsage/updated" => {
                 if let Some(tokens) = p["tokenUsage"]["total"]["totalTokens"].as_u64() {
@@ -456,5 +482,18 @@ mod tests {
         assert_eq!(events, vec![Event::Error { message: "usage limit".into() }]);
         let mut fresh = start("codex", Path::new("/repo"), "", "", "", None, false).1;
         assert_eq!(receive(&mut fresh, json!({"id":0,"error":{"message":"not logged in"}})), vec![Event::Error { message: "codex didn't start: not logged in".into() }]);
+    }
+
+    #[test]
+    fn retries_surface_without_ending_the_turn() {
+        let (mut a, _) = started(None, false);
+        a.prompt("go".into());
+        let error = json!({"message":"Reconnecting... 1/5", "codexErrorInfo":{"responseTooManyFailedAttempts":{"httpStatusCode":429}},
+            "additionalDetails":"Too Many Requests; retrying in 350.998089458s"});
+        let events = receive(&mut a, json!({"method":"error","params":{"threadId":"th-2","willRetry":true,"error":error}}));
+        assert!(matches!(&events[..], [Event::Retrying { message }] if message.starts_with("Rate limited; will retry in 351s.") && message.contains("Reconnecting... 1/5")));
+        assert!(a.busy(), "Codex still owns the retry and running turn");
+        assert!(retry_message(&json!({"message":"retrying", "codexErrorInfo":"rateLimitExceeded"})).starts_with("Rate limited; will retry automatically (wait time unavailable)."));
+        assert!(retry_message(&json!({"message":"stream disconnected; retrying in 500ms"})).starts_with("Request interrupted; will retry in 1s."));
     }
 }

@@ -36,7 +36,8 @@ impl Chat {
                     _ => {}
                 }
             }
-            "error" if p["willRetry"] != true => self.notice(string(&p["error"]["message"]), true),
+            "error" if p["willRetry"] == true => self.notice(crate::headless::codex_retry_message(&p["error"]), false),
+            "error" => self.notice(string(&p["error"]["message"]), true),
             "thread/compacted" => self.notice("Conversation compacted".into(), false),
             _ => {}
         }
@@ -131,6 +132,15 @@ mod tests {
 
     fn note(method: &str, params: Value) -> Value {
         json!({"method":method,"params":params})
+    }
+
+    #[test]
+    fn retry_notice_survives_chat_replay() {
+        let mut c = Chat::new("codex", "/repo");
+        feed(&mut c, &[note("error", json!({"willRetry":true,"error":{
+            "message":"429 Too Many Requests; retrying in 12 seconds"
+        }}))]);
+        assert!(matches!(&c.items[..], [ChatItem::Notice { text, error: false }] if text.starts_with("Rate limited; will retry in 12s.")));
     }
 
     #[test]

@@ -1215,6 +1215,7 @@ impl Daemon {
             }
             Event::TurnDone => (Activity::Done, event.describe()),
             Event::ToolStart { .. } => (Activity::Running, event.describe()),
+            Event::Retrying { .. } => (Activity::Running, event.describe()),
             Event::Prompt { .. } | Event::ToolEnd { .. } => (Activity::Running, "working".into()),
         };
         match &event {
@@ -1223,7 +1224,7 @@ impl Daemon {
             Event::TurnDone => task.queued = 0,
             _ => {}
         }
-        let action = if activity == Activity::Running && task.queued > 0 { queued_label(task.queued) } else { action };
+        let action = if activity == Activity::Running && task.queued > 0 && !matches!(event, Event::Retrying { .. }) { queued_label(task.queued) } else { action };
         task.need = (activity == Activity::NeedsYou).then(|| event.clone());
         if (task.activity, &task.action) != (activity, &action) {
             task.since = now();
