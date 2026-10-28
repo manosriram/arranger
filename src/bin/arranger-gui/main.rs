@@ -3454,7 +3454,10 @@ impl App {
         let bottom = if ended { input_area.y } else { area.y + area.h };
         let mut sec = Rect::new(area.x, area.y + HEADER_H, area.w, bottom - area.y - HEADER_H);
         r.rect(sec, 0.0, t.term);
-        if self.hit_as(r, sec, Cursor::Text) {
+        // Headless chat handles focus separately for its transcript and composer. A queued
+        // Focus(Term) here would be remapped to Message after drawing, stealing focus from
+        // the transcript selection and routing the copy shortcut to the composer instead.
+        if !(task.headless && !self.shell) && self.hit_as(r, sec, Cursor::Text) {
             self.actions.push(Action::Focus(Focus::Term));
         }
         if is_setup(&task.state) && !self.shell {
