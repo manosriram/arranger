@@ -283,7 +283,7 @@ impl App {
                             });
                             cv.console = None;
                         }
-                        if cv.runs.first().is_some_and(|r| r.state == "running") {
+                        if cv.runs.first().is_some_and(|r| run_needs_polling(&r.state)) {
                             let p = self.proxy.clone();
                             thread::spawn(move || {
                                 thread::sleep(RUNS_EVERY);
@@ -343,9 +343,9 @@ impl App {
             self.checks = None;
             return;
         };
-        // Fetch the runs when the task's checks moved on, and while one runs.
+        // Fetch the runs when the task's checks moved on, and through planning and execution.
         let cv = self.checks.as_mut().unwrap();
-        let stale = !cv.loaded || cv.seen != task.checks || (cv.runs.first().is_some_and(|r| r.state == "running") && cv.runs_at.elapsed() >= RUNS_EVERY);
+        let stale = !cv.loaded || cv.seen != task.checks || (cv.runs.first().is_some_and(|r| run_needs_polling(&r.state)) && cv.runs_at.elapsed() >= RUNS_EVERY);
         if stale && !cv.runs_pending {
             cv.seen = task.checks.clone();
             self.refresh_runs();
@@ -437,6 +437,12 @@ impl App {
             self.wrapped(r, x, y, w, note, UI, 12.0, t.text3, 18.0);
         }
         for run in &runs {
+            let latest_passed = run.state == "passed" && runs.first().is_some_and(|latest| latest.id == run.id);
+            let header = Rect::new(rail.x + 6.0, y - 4.0, rail.w - 13.0, 24.0);
+            if latest_passed {
+                r.rect(header, 3.0, blend(t.panel, t.done, 0.12));
+                r.rect(Rect::new(header.x, header.y, 3.0, header.h), 0.0, t.done);
+            }
             let passed = run.checks.iter().filter(|c| c.state == "passed").count();
             let (mark, color) = state_mark(t, &run.state);
             r.text(x, y, mark, UI, 12.0, 600, color, 14.0);
@@ -452,11 +458,10 @@ impl App {
             let expanded = expanded_runs.contains(&run.id);
             let arrow = if expanded { "▾" } else { "▸" };
             let head = format!("{arrow} Run {} · {state}{counts}", run.number);
-            let header = Rect::new(rail.x + 6.0, y - 4.0, rail.w - 13.0, 24.0);
             if header.y + header.h >= list.y && header.y <= list.y + list.h && self.hit(r, header) {
                 self.actions.push(Action::Checks(ChecksAction::ToggleRun(run.id)));
             }
-            r.text(x + 18.0, y, &head, UI, 12.0, 600, t.text, w - 80.0);
+            r.text(x + 18.0, y, &head, UI, 12.0, 600, if latest_passed { t.done } else { t.text }, w - 80.0);
             let when = if run.started == 0 { String::new() } else { ago(run.started) };
             let ww = r.measure(MONO, 11.0, 400, &when);
             r.text(x + w - ww, y, &when, MONO, 11.0, 400, t.text3, ww + 2.0);
@@ -711,6 +716,11 @@ fn update_rows(lines: &[ConsoleLine], cols: usize, rows: &mut (usize, Vec<usize>
     }
 }
 
+/// Planning and approval can change without a task summary push. Keep the open view live.
+fn run_needs_polling(state: &str) -> bool {
+    matches!(state, "planning" | "approval" | "running")
+}
+
 /// A run's or check's state mark.
 pub(super) fn state_mark(t: &Theme, state: &str) -> (&'static str, Rgba) {
     match state {
@@ -755,6 +765,16 @@ fn chunks(text: &str, col: usize, cols: usize) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn polls_until_the_latest_run_finishes() {
+        for state in ["planning", "approval", "running"] {
+            assert!(run_needs_polling(state), "{state}");
+        }
+        for state in ["", "passed", "failed", "stopped", "stale", "skipped", "unverified", "error"] {
+            assert!(!run_needs_polling(state), "{state}");
+        }
+    }
 
     #[test]
     fn wrapping_updates_replaced_tail_and_resize() {

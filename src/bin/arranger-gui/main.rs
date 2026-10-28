@@ -2934,7 +2934,12 @@ impl App {
                 "Checks" => !self.checkable(),
                 _ => false,
             };
-            r.text(tab.x + 12.0, r.center(tab, UI, 13.0), label, UI, 13.0, 500, if on { t.text } else if off { alpha(t.text3, 90) } else { t.text3 }, tw);
+            // The summary describes only the latest run; an older pass must not keep this green.
+            let passed = label == "Checks" && self.current().is_some_and(|task| task.checks.state == "passed");
+            if passed {
+                r.rect(Rect::new(tab.x, tab.y + tab.h - 2.0, tab.w, 2.0), 0.0, t.done);
+            }
+            r.text(tab.x + 12.0, r.center(tab, UI, 13.0), label, UI, 13.0, 500, if passed { t.done } else if on { t.text } else if off { alpha(t.text3, 90) } else { t.text3 }, tw);
             if self.hit(r, tab) && !on && !off {
                 self.actions.push(match label {
                     "Review" => Action::OpenReview,
