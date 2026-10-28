@@ -76,7 +76,8 @@ pub enum Request {
     Setup { id: u64, action: SetupAction },
     /// The task's setup output so far (raw, with colour); replied to with Log.
     SetupLog { id: u64 },
-    /// Run these checks in the task's worktree, one after another. Replied to with Ok.
+    /// Retired checks operations. Keep their wire positions for older clients and hooks.
+    /// The daemon rejects these requests.
     RunChecks { id: u64, checks: Vec<CheckSpec> },
     /// Stop the task's running checks.
     StopChecks { id: u64 },
@@ -89,8 +90,7 @@ pub enum Request {
     /// What to tell the agent about its latest run's failures; replied to with Text.
     CheckReport { id: u64 },
     GenerateSummary { id: u64 },
-    /// A daemon setting ("auto_fix": rounds of failures sent to the agent by themselves), set
-    /// to `value` if given; replied to with Text (its value now).
+    /// Retired check setting, retained for wire compatibility.
     Setting { key: String, value: Option<String> },
 }
 

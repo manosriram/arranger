@@ -27,8 +27,8 @@ macro_rules! eprintln {
 const USAGE: &str = "usage: arranger            open the workspace window
        arranger [ls [--files] | new [--headless|--terminal] [--effort <e>] <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
                  | approve <id> | deny <id> [reason] | events <id> | chat <id> | diff <id> | revert <id> <path> <hunk#>
-                 | run <id> [command ...] | send <id> <text> | interrupt <id> | mode <id> <default|acceptEdits|plan> | revive <id> [prompt] | clone <id> [--model <m>] [prompt] | commit <id> [--merge [--force]|--pr] [message]
-                 | setup <id> [approve|skip|retry|replan|log] | checks <id> [--run [--wait] [<command> ...] | --stop | --log <check> | --report | --accept] | summary <id> [--regenerate] | settings auto_fix [0..10] | ping | stop | serve | hook <adapter>
+                 | run <id> [command ...] | send <id> <text> | interrupt <id> | mode <id> <default|acceptEdits|plan> | revive <id> [prompt] | clone <id> [--model <m>] [prompt] | commit <id> [--merge|--pr] [message]
+                 | setup <id> [approve|skip|retry|replan|log] | summary <id> [--regenerate] | ping | stop | serve | hook <adapter>
                  | machine [ls | add <name> <user@host> [repo] | rm <name>] | endpoint]";
 /// Ctrl-\, raw and in kitty keyboard encoding.
 const DETACH: &[&[u8]] = &[b"\x1c", b"\x1b[92;5u"];
@@ -91,16 +91,6 @@ fn main() {
         ["attach", id] => parse_id(id).and_then(attach),
         ["clone", id, "--model", model, ref text @ ..] => parse_id(id).and_then(|id| clone(id, Some(model), text)),
         ["clone", id, ref text @ ..] => parse_id(id).and_then(|id| clone(id, None, text)),
-        ["settings", key] => print_text(Request::Setting { key: key.to_string(), value: None }),
-        ["settings", key, value] => print_text(Request::Setting { key: key.to_string(), value: Some(value.to_string()) }),
-        ["checks", id, "--accept"] => parse_id(id).and_then(|id| request(&Request::AcceptChecks { id }).map(drop)),
-        ["checks", id, "--report"] => parse_id(id).and_then(|id| print_text(Request::CheckReport { id })),
-        ["checks", id] => parse_id(id).and_then(|id| show_checks(id, 30).map(drop)),
-        ["checks", id, "--stop"] => parse_id(id).and_then(|id| request(&Request::StopChecks { id }).map(drop)),
-        ["checks", _, "--log", check] => parse_id(check).and_then(print_console),
-        ["checks", id, "--run"] => parse_id(id).and_then(|id| request(&Request::RunChecks { id, checks: Vec::new() }).map(drop)),
-        ["checks", id, "--run", "--wait", ref commands @ ..] => parse_id(id).and_then(|id| run_checks(id, commands, true)),
-        ["checks", id, "--run", ref commands @ ..] if !commands.is_empty() => parse_id(id).and_then(|id| run_checks(id, commands, false)),
         ["setup", id] => parse_id(id).and_then(show_setup),
         ["setup", id, "log"] => parse_id(id).and_then(|id| match request(&Request::SetupLog { id })? {
             Reply::Log(bytes) => io::stdout().write_all(&bytes),
@@ -196,110 +186,6 @@ fn ls(files: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Task `id`'s latest check runs, the newest first; returns the newest run's state.
-fn print_text(req: Request) -> io::Result<()> {
-    match request(&req)? {
-        Reply::Text(text) => { println!("{text}"); Ok(()) }
-        reply => Err(unexpected(reply)),
-    }
-}
-
-fn show_checks(id: u64, runs: usize) -> io::Result<String> {
-    let reply = request(&Request::Checks { id })?;
-    let Reply::Checks(list) = reply else { return Err(unexpected(reply)) };
-    if list.is_empty() {
-        println!("no checks have run on task {id}");
-    }
-    for run in list.iter().take(runs) {
-        let passed = run.checks.iter().filter(|c| c.state == "passed").count();
-        let tree: String = run.tree.chars().take(9).collect();
-        let after = if run.auto { " · after a turn" } else { "" };
-        println!("run {} · {} · {passed}/{} passed · tree {tree}{after}", run.id, run.state, run.checks.len());
-        if run.accepted { println!("  failed checks accepted"); }
-        if !run.note.is_empty() {
-            println!("  {}", run.note);
-        }
-        for c in &run.checks {
-            let mark = match c.state.as_str() { "passed" => "✓", "failed" => "✗", "running" => "●", "stopped" => "–", _ => "○" };
-            let took = if c.ended >= c.started && c.started > 0 { format!(", {}s", c.ended - c.started) } else { String::new() };
-            let exit = c.exit.map_or(String::new(), |e| format!("exit {e}"));
-            println!("  {mark} {:<5} {:<40} {exit}{took}", c.id, c.command);
-            if !c.note.is_empty() {
-                println!("          {}", c.note);
-            }
-        }
-    }
-    Ok(list.first().map(|r| r.state.clone()).unwrap_or_default())
-}
-
-/// Runs these commands as checks; with `wait`, until they end, failing if one does.
-fn run_checks(id: u64, commands: &[&str], wait: bool) -> io::Result<()> {
-    let checks = commands.iter().map(|c| proto::CheckSpec { name: String::new(), command: c.to_string(), why: String::new() }).collect();
-    match request(&Request::RunChecks { id, checks })? {
-        Reply::Ok => {}
-        reply => return Err(unexpected(reply)),
-    }
-    if !wait {
-        return Ok(());
-    }
-    loop {
-        let reply = request(&Request::Checks { id })?;
-        let Reply::Checks(list) = reply else { return Err(unexpected(reply)) };
-        if list.first().is_none_or(|r| r.state != "running") {
-            break;
-        }
-        thread::sleep(std::time::Duration::from_millis(200));
-    }
-    match show_checks(id, 1)?.as_str() {
-        "passed" => Ok(()),
-        state => Err(io::Error::other(format!("checks {state}"))),
-    }
-}
-
-/// A check's output, as the console shows it; coloured when printing to a terminal.
-fn print_console(check: u64) -> io::Result<()> {
-    use std::io::IsTerminal;
-    let colour = io::stdout().is_terminal();
-    let mut start = 0;
-    let mut out = io::stdout().lock();
-    loop {
-        let reply = request(&Request::Console { check, start, limit: 5000 })?;
-        let Reply::Console { total, lines, .. } = reply else { return Err(unexpected(reply)) };
-        for line in &lines {
-            for (text, style) in &line.spans {
-                let text = arranger::security::terminal_text(text);
-                match (colour, sgr(style)) {
-                    (true, Some(code)) => write!(out, "[{code}m{text}[0m")?,
-                    _ => write!(out, "{text}")?,
-                }
-            }
-            writeln!(out)?;
-        }
-        start += lines.len();
-        if lines.is_empty() || start >= total {
-            return Ok(());
-        }
-    }
-}
-
-fn sgr(s: &proto::Style) -> Option<String> {
-    let mut codes = Vec::new();
-    for (on, code) in [(s.bold, "1"), (s.dim, "2"), (s.italic, "3"), (s.underline, "4")] {
-        if on {
-            codes.push(code.to_string());
-        }
-    }
-    for (color, base) in [(s.fg, 38), (s.bg, 48)] {
-        match color {
-            Some(proto::Color::Idx(n)) => codes.push(format!("{base};5;{n}")),
-            Some(proto::Color::Rgb(r, g, b)) => codes.push(format!("{base};2;{r};{g};{b}")),
-            None => {}
-        }
-    }
-    (!codes.is_empty()).then(|| codes.join(";"))
-}
-
-/// Where task `id`'s setup is, and what it will run or why it failed.
 fn show_setup(id: u64) -> io::Result<()> {
     let reply = request(&Request::List { files: false })?;
     let Reply::Tasks(tasks) = reply else { return Err(unexpected(reply)) };
@@ -341,7 +227,7 @@ fn diff(id: u64) -> io::Result<()> {
     let reply = request(&Request::Review { id })?;
     let Reply::Review(r) = reply else { return Err(unexpected(reply)) };
     println!("{} -> {}", r.branch, r.base);
-    println!("Checks: {} · Summary: {}", r.verification, r.summary_state);
+    println!("Summary: {}", r.summary_state);
     for f in r.files {
         println!("\n{} {}  +{} -{}{}", f.status, f.path, f.added, f.removed, if f.binary { "  (binary)" } else { "" });
         for (i, h) in f.hunks.iter().enumerate() {

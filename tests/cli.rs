@@ -195,9 +195,6 @@ fn task_lifecycle() {
     let (ok, diff) = home.arranger(&repo, &["diff", "1"]);
     assert!(ok && diff.contains("arranger/1 -> main") && diff.contains("A hello.txt  +1 -0"), "{diff}");
 
-    // Agent-reported tests do not authorize a merge: Arranger runs its own checks first.
-    let (ok, out) = home.arranger(&repo, &["checks", "1", "--run", "--wait", "test -f hello.txt"]);
-    assert!(ok, "{out}");
     // Merge lands the work on main, which is checked out in the repo itself.
     let (ok, out) = home.arranger(&repo, &["commit", "1", "--merge", "add hello"]);
     assert!(ok, "{out}");
@@ -706,246 +703,7 @@ fn setup_is_planned_approved_and_reused() {
 }
 
 #[test]
-fn checks_run_log_and_stop() {
-    let home = Home(std::env::temp_dir().join(format!("arranger-checks-{}", std::process::id())));
-    let _ = std::fs::remove_dir_all(&home.0);
-    let repo = home.0.join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
-    std::fs::write(repo.join("README"), "hi\n").unwrap();
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "-q", "-m", "init"]);
-    let agent = home.0.join("agent.sh");
-    std::fs::write(&agent, SETUP_AGENT).unwrap();
-    std::fs::set_permissions(&agent, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    assert!(home.arranger(&repo, &["new", agent.to_str().unwrap(), "look"]).0);
-    home.wait_state(&repo, &["done", "exited"]);
-
-    // One passes, one fails with coloured, overwritten output; the run fails and says so.
-    let failing = r"printf 'step 1\rstep 2\n\033[31merror: it broke\033[0m\n'; exit 2";
-    let (ok, out) = home.arranger(&repo, &["checks", "1", "--run", "--wait", "test -f seen && echo port $PORT", failing]);
-    assert!(!ok && out.contains("run 1 · failed · 1/2 passed") && out.contains("checks failed"), "{out}");
-    assert!(out.contains("✓ 1") && out.contains("✗ 2") && out.contains("exit 2"), "{out}");
-    let (ok, log) = home.arranger(&repo, &["checks", "1", "--log", "1"]);
-    assert!(ok && log == "port 20010\n", "{log:?}");
-    let (_, log) = home.arranger(&repo, &["checks", "1", "--log", "2"]);
-    assert_eq!(log, "step 2\nerror: it broke\n");
-    // It judged the worktree as it was: the agent's untracked file included.
-    let tree = git(&home.0.join("worktrees/repo/1"), &["write-tree"]);
-    let (_, list) = home.arranger(&repo, &["checks", "1"]);
-    assert!(!list.contains(&tree[..9]), "an index without the untracked file would give {tree}:\n{list}");
-
-    let (ok, report) = home.arranger(&repo, &["checks", "1", "--report"]);
-    assert!(ok && report.contains("exit 2") && report.contains("error: it broke") && !report.contains('\x1b'), "{report}");
-    assert!(!report.contains("port 20010"), "passing checks aren't failures: {report}");
-    let wt = home.0.join("worktrees/repo/1");
-    std::fs::write(wt.join("changed"), "new work").unwrap();
-    let (ok, out) = home.arranger(&repo, &["checks", "1", "--accept"]);
-    assert!(!ok && out.contains("worktree changed"), "{out}");
-    std::fs::remove_file(wt.join("changed")).unwrap();
-    assert!(home.arranger(&repo, &["checks", "1", "--accept"]).0);
-    assert!(home.arranger(&repo, &["checks", "1"]).1.contains("failed checks accepted"));
-
-    // A long check: a second run waits for it; stopping ends both it and the rest.
-    assert!(home.arranger(&repo, &["checks", "1", "--run", "echo started; sleep 30", "echo never"]).0);
-    let (ok, out) = home.arranger(&repo, &["checks", "1", "--run", "true"]);
-    assert!(!ok && out.contains("already running"), "{out}");
-    let start = Instant::now();
-    while home.arranger(&repo, &["checks", "1", "--log", "3"]).1 != "started\n" {
-        assert!(start.elapsed() < Duration::from_secs(10), "the check never started");
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(home.arranger(&repo, &["checks", "1", "--stop"]).0);
-    let (_, list) = home.arranger(&repo, &["checks", "1"]);
-    assert!(list.starts_with("run 2 · stopped · 0/2 passed") && list.contains("– 3") && list.contains("– 4"), "{list}");
-    assert!(start.elapsed() < Duration::from_secs(10), "stop waited for the check");
-
-    // Long multiline commands and heredocs execute fully, including failed assertions.
-    let script = format!("# {}\nset -eu\npython3 - <<'PY'\nassert -3 * 2 == -6\nassert 7 * 2 == 14\nprint('inline assertions passed')\nPY", "x".repeat(600));
-    let failing = "set -eu\npython3 - <<'PY'\nassert 7 * 2 == 15\nPY";
-    let (ok, out) = home.arranger(&repo, &["checks", "1", "--run", "--wait", &script, failing]);
-    assert!(!ok && out.contains("run 3 · failed · 1/2 passed"), "{out}");
-    assert_eq!(home.arranger(&repo, &["checks", "1", "--log", "5"]).1, "inline assertions passed\n");
-    assert!(home.arranger(&repo, &["checks", "1", "--log", "6"]).1.contains("AssertionError"));
-
-    // Deleting the task takes its checks and their logs.
-    assert!(home.0.join("logs/checks/1.log").exists());
-    assert!(home.arranger(&repo, &["kill", "1"]).0);
-    assert!(!home.0.join("logs/checks/1.log").exists());
-    assert!(!home.arranger(&repo, &["checks", "1", "--log", "1"]).0);
-}
-
-// One turn per `go<n>` file: says it's prompted, runs `edit<n>`, says it's done.
-const TURNS_AGENT: &str = r#"#!/bin/sh
-hook() { "$ARRANGER_BIN" hook claude; }
-n=0
-while :; do
-  if [ $n -gt 0 ]; then
-    while [ ! -f "$ARRANGER_HOME/go$n" ]; do sleep 0.05; done
-    echo "{\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"turn $n\"}" | hook
-  fi
-  sh "$ARRANGER_HOME/edit$n"
-  echo '{"hook_event_name":"Stop","last_assistant_message":"done"}' | hook
-  n=$((n+1))
-done
-"#;
-
-#[test]
-fn explicit_checks_follow_changed_turns() {
-    let home = Home(std::env::temp_dir().join(format!("arranger-turns-{}", std::process::id())));
-    let _ = std::fs::remove_dir_all(&home.0);
-    let repo = home.0.join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
-    std::fs::write(repo.join("lib.rs"), "fn a() {}\n").unwrap();
-    std::fs::write(repo.join("README.md"), "hi\n").unwrap();
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "-q", "-m", "init"]);
-    let write = |name: &str, body: &str| std::fs::write(home.0.join(name), body).unwrap();
-    let exe = |name: &str, body: &str| {
-        write(name, body);
-        std::fs::set_permissions(home.0.join(name), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    };
-    exe("agent.sh", TURNS_AGENT);
-    let until = |what: &str| {
-        let start = Instant::now();
-        loop {
-            let (_, out) = home.arranger(&repo, &["checks", "1"]);
-            if out.lines().next().is_some_and(|l| l.contains(what)) {
-                return out;
-            }
-            assert!(start.elapsed() < Duration::from_secs(15), "the latest run never got to {what}:\n{out}");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    };
-
-    // Even a completed turn with code changes does not invent checks.
-    write("edit0", "echo 'fn b() {}' >> lib.rs");
-    let agent = home.0.join("agent.sh");
-    assert!(home.arranger(&repo, &["new", agent.to_str().unwrap(), "add b"]).0);
-    home.wait_state(&repo, &["done"]);
-    let db = rusqlite::Connection::open(home.0.join("arranger.db")).unwrap();
-    let run_count = || db.query_row("SELECT COUNT(*) FROM check_runs WHERE task = 1", [], |r| r.get::<_, u64>(0)).unwrap();
-    let commands = || {
-        db.prepare("SELECT command FROM checks WHERE run = (SELECT MAX(id) FROM check_runs WHERE task = 1) ORDER BY pos").unwrap()
-            .query_map([], |r| r.get::<_, String>(0)).unwrap().map(Result::unwrap).collect::<Vec<_>>()
-    };
-    std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(run_count(), 0);
-    let (ok, out) = home.arranger(&repo, &["checks", "1", "--run", "--wait"]);
-    assert!(!ok && out.contains("add commands"), "{out}");
-    assert_eq!(run_count(), 0, "an empty request must not save a run");
-
-    let checks = ["test -f lib.rs", "grep -q b lib.rs"];
-    let (ok, out) = home.arranger(&repo, &["checks", "1", "--run", "--wait", checks[0], checks[1]]);
-    assert!(ok, "{out}");
-    assert_eq!(commands(), checks);
-
-    // An explicit empty rerun and subsequent changed turns use exactly the saved list.
-    let (ok, out) = home.arranger(&repo, &["checks", "1", "--run", "--wait"]);
-    assert!(ok && out.starts_with("run 2 · passed"), "{out}");
-    assert_eq!(commands(), checks);
-    write("edit1", "echo 'fn c() {}' >> lib.rs");
-    write("go1", "");
-    until("run 3 · passed");
-    home.wait_state(&repo, &["done"]);
-    assert_eq!(commands(), checks);
-    write("edit2", ":");
-    write("go2", "");
-    let start = Instant::now();
-    while !home.arranger(&repo, &["events", "1"]).1.contains("prompt: turn 2") {
-        assert!(start.elapsed() < Duration::from_secs(10));
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    home.wait_state(&repo, &["done"]);
-    std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(run_count(), 3, "an unchanged successful tree needs no rerun");
-    write("edit3", "echo more >> README.md");
-    write("go3", "");
-    until("run 4 · passed");
-    home.wait_state(&repo, &["done"]);
-    assert_eq!(commands(), checks, "docs changes also rerun the explicit commands");
-
-    // Check commands still cannot leave edits to the verified tree behind.
-    let (ok, out) = home.arranger(&repo, &["checks", "1", "--run", "--wait", "touch made-by-check", "sed -i.bak s/a/z/ lib.rs"]);
-    assert!(!ok && out.contains("left made-by-check behind (removed)") && out.contains("changed lib.rs (put back)"), "{out}");
-    let wt = home.0.join("worktrees/repo/1");
-    assert!(!wt.join("lib.rs.bak").exists());
-    assert!(!wt.join("made-by-check").exists());
-    assert!(std::fs::read_to_string(wt.join("lib.rs")).unwrap().starts_with("fn a()"));
-
-    // Replacing that list does not carry a failed command into the new manual list.
-    let (ok, out) = home.arranger(&repo, &["checks", "1", "--run", "--wait", checks[0], checks[1]]);
-    assert!(ok, "{out}");
-    assert_eq!(commands(), checks);
-}
-
-#[test]
-fn failed_checks_auto_fix_is_bounded_and_persisted() {
-    let home = Home(std::env::temp_dir().join(format!("arranger-auto-fix-{}", std::process::id())));
-    let _ = std::fs::remove_dir_all(&home.0);
-    let repo = home.0.join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
-    std::fs::write(repo.join("lib.rs"), "fn a() {}\n").unwrap();
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "-q", "-m", "init"]);
-    let exe = |path: &Path, body: &str| {
-        std::fs::write(path, body).unwrap();
-        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    };
-    let bin = home.0.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let claude = bin.join("claude");
-    exe(&claude, HEADLESS_CLAUDE);
-    assert!(home.arranger(&repo, &["new", "--headless", claude.to_str().unwrap(), "hello"]).0);
-    home.wait_state(&repo, &["done"]);
-    assert_eq!(home.arranger(&repo, &["settings", "auto_fix"]).1.trim(), "0");
-    for value in ["-1", "11", "no"] {
-        assert!(!home.arranger(&repo, &["settings", "auto_fix", value]).0);
-    }
-    assert!(!home.arranger(&repo, &["settings", "unknown", "1"]).0);
-    // Missing-test retries are not a configurable setting.
-    for args in [&["settings", "coverage_fix", "2"][..], &["settings", "coverage_fix"]] {
-        let (ok, out) = home.arranger(&repo, args);
-        assert!(!ok && out.contains("unknown setting"), "{args:?}: {out}");
-    }
-    assert_eq!(home.arranger(&repo, &["settings", "auto_fix"]).1.trim(), "0");
-    let wt = home.0.join("worktrees/repo/1");
-    std::fs::write(wt.join("lib.rs"), "fn changed() {}\n").unwrap();
-    let wait_run = |run: u64, state: &str| {
-        let start = Instant::now();
-        loop {
-            let out = home.arranger(&repo, &["checks", "1"]).1;
-            if out.starts_with(&format!("run {run} · {state}")) { break; }
-            assert!(start.elapsed() < Duration::from_secs(15), "{out}");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    };
-    assert!(home.arranger(&repo, &["settings", "auto_fix", "2"]).0);
-    let (ok, out) = home.arranger(&repo, &["checks", "1", "--run", "true", "false"]);
-    assert!(ok, "{out}");
-    // The fake makes no edits: failed checks still rerun on the unchanged tree.
-    wait_run(3, "failed");
-    home.wait_state(&repo, &["needs-you"]);
-    let events = home.arranger(&repo, &["events", "1"]).1;
-    assert_eq!(events.matches("prompt: These checks failed").count(), 2, "{events}");
-    let db = rusqlite::Connection::open(home.0.join("arranger.db")).unwrap();
-    for run in 1..=3 {
-        let commands = db.prepare("SELECT command FROM checks WHERE run = ?1 ORDER BY pos").unwrap()
-            .query_map([run], |r| r.get::<_, String>(0)).unwrap().map(Result::unwrap).collect::<Vec<_>>();
-        assert_eq!(commands, ["true", "false"], "auto-fix run {run} changed the explicit list");
-    }
-    assert!(home.arranger(&repo, &["checks", "1", "--accept"]).0);
-    home.wait_state(&repo, &["done"]);
-    assert!(home.arranger(&repo, &["stop"]).0);
-    assert_eq!(home.arranger(&repo, &["settings", "auto_fix"]).1.trim(), "2");
-    let out = home.arranger(&repo, &["checks", "1"]).1;
-    assert!(out.starts_with("run 3 · failed") && out.contains("failed checks accepted"), "{out}");
-}
-
-#[test]
-fn summaries_match_checked_trees_and_supply_commit_messages() {
+fn summaries_match_worktree_snapshots_and_supply_commit_messages() {
     let home = Home(std::env::temp_dir().join(format!("arranger-summary-{}", std::process::id())));
     let _ = std::fs::remove_dir_all(&home.0);
     let repo = home.0.join("repo");
@@ -971,7 +729,6 @@ fi
 "#);
     let (ok, out) = home.arranger(&repo, &["new", home.0.join("agent").to_str().unwrap(), "look"]);
     assert!(ok, "{out}"); home.wait_state(&repo, &["exited"]);
-    assert!(home.arranger(&repo, &["checks", "1", "--run", "--wait", "test -f seen"]).0);
     let wait_summary = |state: &str| {
         let start = Instant::now();
         loop {
@@ -984,17 +741,17 @@ fi
     };
     let summary = wait_summary("ready");
     assert_eq!(summary, "Summary: ready\nCapture local setup output.\n");
-    // Verification remains in the structured record, outside the concise summary text.
+    // A generated summary cannot invent passing checks.
     let db = rusqlite::Connection::open(home.0.join("arranger.db")).unwrap();
     let json: String = db.query_row("SELECT json FROM summaries WHERE task = 1 AND state = 'ready'", [], |r| r.get(0)).unwrap();
     let recorded: arranger::proto::WorkSummary = serde_json::from_str(&json).unwrap();
     assert_eq!(recorded.title, "Record setup result");
-    assert_eq!(recorded.verified_by, ["test -f seen"]);
+    assert!(recorded.verified_by.is_empty());
     let wt = home.0.join("worktrees/repo/1");
     std::fs::write(wt.join("new.rs"), "fn new() {}\n").unwrap();
     assert!(home.arranger(&repo, &["summary", "1"]).1.starts_with("Summary: stale"));
-    assert!(home.arranger(&repo, &["diff", "1"]).1.contains("Checks: stale"));
-    assert!(!home.arranger(&repo, &["summary", "1", "--regenerate"]).0);
+    assert!(home.arranger(&repo, &["summary", "1", "--regenerate"]).0);
+    wait_summary("ready");
     std::fs::remove_file(wt.join("new.rs")).unwrap();
     // A summary that sees changing work is discarded, even if it returns valid JSON.
     std::fs::write(home.0.join("slow-summary"), "").unwrap();
@@ -1015,54 +772,6 @@ fi
     assert!(ok, "{out}");
     let message = git(&wt, &["log", "-1", "--format=%B"]);
     assert_eq!(message, "Capture local setup output.");
-}
-
-#[test]
-fn merge_gates_recheck_the_combined_tree_before_updating_base() {
-    for failing_base in [false, true] {
-        let home = Home(std::env::temp_dir().join(format!("arranger-merge-gate-{}-{failing_base}", std::process::id())));
-        let _ = std::fs::remove_dir_all(&home.0);
-        let repo = home.0.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-q", "-b", "main"]);
-        std::fs::write(repo.join("README"), "base\n").unwrap();
-        git(&repo, &["add", "."]); git(&repo, &["commit", "-q", "-m", "init"]);
-        let agent = home.0.join("agent");
-        std::fs::write(&agent, SETUP_AGENT).unwrap();
-        std::fs::set_permissions(&agent, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        assert!(home.arranger(&repo, &["new", agent.to_str().unwrap(), "look"]).0);
-        home.wait_state(&repo, &["exited"]);
-        let original = git(&repo, &["rev-parse", "HEAD"]);
-        let (ok, out) = home.arranger(&repo, &["commit", "1", "--merge"]);
-        assert!(!ok && out.contains("has not passed checks"), "{out}");
-        assert_eq!(git(&repo, &["rev-parse", "HEAD"]), original);
-        assert!(home.arranger(&repo, &["checks", "1", "--run", "--wait", "test ! -f forbidden"]).0);
-        let wt = home.0.join("worktrees/repo/1");
-        std::fs::write(wt.join("late"), "edit after checks\n").unwrap();
-        assert!(!home.arranger(&repo, &["commit", "1", "--merge"]).0);
-        std::fs::remove_file(wt.join("late")).unwrap();
-        std::fs::write(repo.join(if failing_base { "forbidden" } else { "base-addition" }), "new base\n").unwrap();
-        git(&repo, &["add", "."]); git(&repo, &["commit", "-q", "-m", "base moved"]);
-        let moved = git(&repo, &["rev-parse", "HEAD"]);
-        let (ok, out) = home.arranger(&repo, &["commit", "1", "--merge", "task result"]);
-        let db = rusqlite::Connection::open(home.0.join("arranger.db")).unwrap();
-        let (origin, state): (String, String) = db.query_row("SELECT origin, state FROM checks ORDER BY id DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-        assert_eq!(origin, "merge");
-        if failing_base {
-            assert!(!ok && out.contains("base branch was not updated"), "{out}");
-            assert_eq!(state, "failed");
-            assert_eq!(git(&repo, &["rev-parse", "HEAD"]), moved);
-            assert!(!repo.join("seen").exists());
-            // Explicit force is the only way around a failed, unaccepted gate.
-            let (ok, out) = home.arranger(&repo, &["commit", "1", "--merge", "--force", "accept failure"]);
-            assert!(ok, "{out}");
-        } else {
-            assert!(ok, "{out}"); assert_eq!(state, "passed");
-            assert!(repo.join("base-addition").exists());
-        }
-        assert!(repo.join("seen").exists());
-        assert_eq!(git(&repo, &["rev-parse", "HEAD^{tree}"]), git(&wt, &["rev-parse", "HEAD^{tree}"]));
-    }
 }
 
 #[test]
@@ -1103,7 +812,7 @@ for line in sys.stdin:
 }
 
 #[test]
-fn merge_refuses_a_commit_hook_that_changes_the_verified_tree() {
+fn merge_refuses_a_commit_hook_that_changes_the_reviewed_tree() {
     let home = Home(std::env::temp_dir().join(format!("arranger-merge-hook-{}", std::process::id())));
     let _ = std::fs::remove_dir_all(&home.0);
     let repo = home.0.join("repo");
@@ -1116,13 +825,12 @@ fn merge_refuses_a_commit_hook_that_changes_the_verified_tree() {
     std::fs::set_permissions(&agent, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     assert!(home.arranger(&repo, &["new", agent.to_str().unwrap(), "look"]).0);
     home.wait_state(&repo, &["exited"]);
-    assert!(home.arranger(&repo, &["checks", "1", "--run", "--wait", "test -f seen"]).0);
     let base = git(&repo, &["rev-parse", "HEAD"]);
     let hook = repo.join(".git/hooks/pre-commit");
     std::fs::write(&hook, "#!/bin/sh\necho unchecked > hook-change\ngit add hook-change\n").unwrap();
     std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let (ok, out) = home.arranger(&repo, &["commit", "1", "--merge"]);
-    assert!(!ok && out.contains("commit changed the checked tree"), "{out}");
+    assert!(!ok && out.contains("commit changed the reviewed tree"), "{out}");
     assert_eq!(git(&repo, &["rev-parse", "HEAD"]), base);
     assert!(!repo.join("hook-change").exists());
 }

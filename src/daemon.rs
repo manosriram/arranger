@@ -2,9 +2,8 @@
 
 use crate::adapter::{self, Osc};
 use crate::chat::Chat;
-use crate::checks;
+use crate::review::tree_hash;
 use std::os::unix::process::CommandExt;
-use crate::console::Console;
 use crate::headless::{self, Agent};
 use crate::proto::{self, Event, PlanLimit, Reply, Request, Ship, TaskInfo};
 use crate::pty::{self, Pty};
@@ -33,9 +32,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LISTENER: Token = Token(0);
 // Number the full task history before limiting the displayed runs.
-const CHECK_RUNS_QUERY: &str = "SELECT id, started, ended, tree, state, auto, note, accepted,
-    ROW_NUMBER() OVER (ORDER BY id) AS number
-    FROM check_runs WHERE task = ?1 ORDER BY id DESC LIMIT 30";
+
 const CHILD: Token = Token(1);
 const STOP: Token = Token(2);
 /// Task PTYs use `Token(TASK + id)`; client connections count up from 3.
@@ -123,7 +120,7 @@ struct Job {
     /// The worktree's HEAD when the job started.
     head: String,
     ship: Ship,
-    /// Merge preparation ends before checks and the final fast-forward.
+    /// Merge preparation ends before the final fast-forward.
     merge: Option<MergePending>,
 }
 
@@ -156,14 +153,8 @@ struct Daemon {
     /// Setup commands running, by task, and when they're out of time.
     setups: HashMap<u64, (std::process::Child, Instant)>,
     next_side: u64,
-    /// Check runs under way, by task.
-    passes: HashMap<u64, Pass>,
-    /// Check output parsed so far, by check, and how many bytes of its log that took.
-    consoles: HashMap<u64, (Console, u64)>,
-    /// Tasks whose turn just ended, and when to see whether it needs checks.
-    auto_due: HashMap<u64, Instant>,
+    summary_due: HashMap<u64, Instant>,
     summaries: HashMap<u64, SummaryRun>,
-    merges: HashMap<u64, MergePending>,
     /// What the agents last said about their plans' usage, one per (agent, window).
     limits: Vec<PlanLimit>,
     /// `limits` changed since watchers last heard.
@@ -172,7 +163,6 @@ struct Daemon {
 
 struct SummaryRun {
     tree: String,
-    verified_by: Vec<String>,
     side: side::Run,
     deadline: Instant,
 }
@@ -183,30 +173,7 @@ struct MergePending {
     tree: String,
     message: String,
     base: String,
-    force: bool,
-    checks: Vec<proto::CheckSpec>,
 }
-
-/// How long after a turn ends to rerun saved checks: claude may carry on with a queued prompt.
-const AUTO_AFTER: Duration = Duration::from_secs(2);
-
-/// A task's check run: the checks still to go, and the one running.
-struct Pass {
-    run: u64,
-    queue: std::collections::VecDeque<u64>,
-    current: Option<Running>,
-}
-
-struct Running {
-    check: u64,
-    child: std::process::Child,
-    deadline: Instant,
-    /// Why arranger stopped it (out of time, too much output), if it did.
-    cut: Option<&'static str>,
-}
-
-const CHECK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const CHECK_LOG_MAX: u64 = 32 << 20;
 
 struct PlanRun {
     repo: String,
@@ -228,7 +195,6 @@ pub fn run() -> io::Result<()> {
     security::private_dir(&data)?;
     security::private_dir(&data.join("logs"))?;
     security::private_dir(&data.join("adapters"))?;
-    security::private_dir(&data.join("logs/checks"))?;
     let sock = proto::socket_path();
     security::private_dir(sock.parent().ok_or_else(|| io::Error::other("socket has no directory"))?)?;
     // Retain the lock for the daemon's lifetime. Concurrent starts must never unlink a live socket.
@@ -295,34 +261,12 @@ pub fn run() -> io::Result<()> {
             created INTEGER NOT NULL, PRIMARY KEY (repo, key));
          UPDATE tasks SET setup = 'failed', setup_detail = 'Interrupted: the daemon stopped while it ran'
             WHERE state = 'setup' AND setup IN ('planning', 'running');
-         CREATE TABLE IF NOT EXISTS check_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, task INTEGER NOT NULL, started INTEGER NOT NULL,
-            ended INTEGER NOT NULL DEFAULT 0, tree TEXT NOT NULL, state TEXT NOT NULL);
-         CREATE INDEX IF NOT EXISTS check_runs_task ON check_runs (task);
-         CREATE TABLE IF NOT EXISTS checks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, run INTEGER NOT NULL, task INTEGER NOT NULL, pos INTEGER NOT NULL,
-            name TEXT NOT NULL, command TEXT NOT NULL, why TEXT NOT NULL, state TEXT NOT NULL, exit INTEGER,
-            started INTEGER NOT NULL DEFAULT 0, ended INTEGER NOT NULL DEFAULT 0);
-         CREATE INDEX IF NOT EXISTS checks_run ON checks (run);
          CREATE TABLE IF NOT EXISTS summaries (task INTEGER NOT NULL, tree TEXT NOT NULL, state TEXT NOT NULL,
             json TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', updated INTEGER NOT NULL, PRIMARY KEY(task, tree));
          UPDATE summaries SET state = 'error', error = 'Interrupted by daemon restart' WHERE state = 'running';
          CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )
     .map_err(io::Error::other)?;
-    for col in ["tasks ADD COLUMN fix_rounds INTEGER NOT NULL DEFAULT 0", "check_runs ADD COLUMN accepted INTEGER NOT NULL DEFAULT 0", "check_runs ADD COLUMN auto INTEGER NOT NULL DEFAULT 0", "check_runs ADD COLUMN note TEXT NOT NULL DEFAULT ''",
-        "checks ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'", "checks ADD COLUMN note TEXT NOT NULL DEFAULT ''"] {
-        let _ = db.execute(&format!("ALTER TABLE {col}"), []);
-    }
-    // Stop interrupted runs, including pending states left by older versions.
-    db.execute_batch(
-        "UPDATE checks SET state = 'stopped', ended = CAST(strftime('%s', 'now') AS INTEGER) WHERE state = 'running'
-            OR (state = 'pending' AND run IN (SELECT id FROM check_runs WHERE state IN ('running', 'planning', 'approval')));
-         UPDATE check_runs SET state = 'stopped', note = 'Interrupted by daemon restart', ended = CAST(strftime('%s', 'now') AS INTEGER)
-            WHERE state IN ('running', 'planning', 'approval');",
-    )
-    .map_err(io::Error::other)?;
-
     let poll = Poll::new()?;
     poll.registry().register(&mut listener, LISTENER, Interest::READABLE)?;
     let sigchld = signal_pipe(&[SIGCHLD])?;
@@ -353,11 +297,8 @@ pub fn run() -> io::Result<()> {
         plans: Vec::new(),
         setups: HashMap::new(),
         next_side: 0,
-        passes: HashMap::new(),
-        consoles: HashMap::new(),
-        auto_due: HashMap::new(),
+        summary_due: HashMap::new(),
         summaries: HashMap::new(),
-        merges: HashMap::new(),
         limits: Vec::new(),
         limits_dirty: false,
     };
@@ -403,8 +344,7 @@ pub fn run() -> io::Result<()> {
             return Ok(());
         }
         d.time_out_setups();
-        d.time_out_checks();
-        d.auto_checks();
+        d.auto_summaries();
         d.reap_summaries();
         for limits in usage.try_iter().filter(|limits| !limits.is_empty()) {
             // /usage is a complete account snapshot, including billing-mode changes.
@@ -721,7 +661,6 @@ impl Daemon {
                 }
             }
             Request::Prompt { id, text } => {
-                let _ = self.db.execute("UPDATE tasks SET fix_rounds = 0 WHERE id = ?1", [id]);
                 match self.tasks.get_mut(&id) {
                     Some(task) if task.headless.is_some() => {
                         let agent = task.headless.as_mut().unwrap();
@@ -794,23 +733,11 @@ impl Daemon {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Reply::Log(Vec::new()),
                 Err(e) => Reply::Error(format!("no setup log for task {id}: {e}")),
             },
-            Request::RunChecks { id, checks } => match self.run_checks(id, checks) {
-                Ok(_) => Reply::Ok,
-                Err(e) => Reply::Error(e),
-            },
-            Request::StopChecks { id } => match self.stop_checks(id) {
-                Ok(()) => Reply::Ok,
-                Err(e) => Reply::Error(e),
-            },
-            Request::Checks { id } => match self.check_runs(id) {
-                Ok(runs) => Reply::Checks(runs),
-                Err(e) => Reply::Error(e),
-            },
-            Request::Console { check, start, limit } => self.console(check, start, limit).unwrap_or_else(Reply::Error),
+            // Retain retired wire variants so older hooks keep their operation numbers.
+            Request::RunChecks { .. } | Request::StopChecks { .. } | Request::Checks { .. }
+            | Request::Console { .. } | Request::CheckReport { .. } | Request::AcceptChecks { .. }
+            | Request::Setting { .. } => Reply::Error("checks have been removed".into()),
             Request::GenerateSummary { id } => self.start_summary(id).map(|()| Reply::Ok).unwrap_or_else(Reply::Error),
-            Request::CheckReport { id } => self.check_report(id).map(Reply::Text).unwrap_or_else(Reply::Error),
-            Request::AcceptChecks { id } => self.accept_checks(id).map(|()| Reply::Ok).unwrap_or_else(Reply::Error),
-            Request::Setting { key, value } => self.setting(&key, value.as_deref()).map(Reply::Text).unwrap_or_else(Reply::Error),
             Request::Kill { id } => match self.kill(id) {
                 Ok(()) => Reply::Ok,
                 Err(e) => Reply::Error(e),
@@ -1153,11 +1080,10 @@ impl Daemon {
             }
             return;
         }
-        // Another turn: checks of the last one no longer judge the work, and mustn't run under it.
+        // New work invalidates any summary in progress.
         if matches!(event, Event::Prompt { .. }) && self.tasks.contains_key(&id) {
             self.cancel_summary(id);
-            self.auto_due.remove(&id);
-            self.end_checks(id, "stale");
+            self.summary_due.remove(&id);
         }
         let Some(task) = self.tasks.get_mut(&id) else { return };
         self.dirty = true;
@@ -1170,7 +1096,7 @@ impl Daemon {
             return;
         }
         if matches!(event, Event::TurnDone) {
-            self.auto_due.insert(id, Instant::now() + AUTO_AFTER);
+            self.summary_due.insert(id, Instant::now() + Duration::from_secs(2));
         }
         let (activity, action) = match &event {
             Event::Summary { text } => {
@@ -1437,7 +1363,6 @@ impl Daemon {
             self.finish(id, if failed { "failed" } else { "exited" });
         }
         self.reap_setups();
-        self.reap_checks();
         let exited: Vec<u64> = self.shells.iter_mut().filter_map(|(&id, s)| matches!(s.pty.child.try_wait(), Ok(Some(_))).then_some(id)).collect();
         for id in exited {
             self.read_shell(id);
@@ -1447,6 +1372,7 @@ impl Daemon {
     }
 
     fn finish(&mut self, id: u64, state: &str) {
+        if state == "exited" { self.summary_due.insert(id, Instant::now() + Duration::from_secs(2)); }
         let Some(mut task) = self.tasks.remove(&id) else { return };
         flush_log(&log_path(&self.data, id, task.headless.is_some()), &mut task.log, &mut self.zstd);
         let frame = proto::reply_frame(&Reply::Exited);
@@ -1914,38 +1840,8 @@ impl Daemon {
     }
 
     /// The last command list explicitly supplied by the user, never a generated list.
-    fn saved_checks(&self, id: u64) -> Result<Vec<proto::CheckSpec>, String> {
-        self.db.prepare("SELECT name, command, why FROM checks WHERE run = (
-            SELECT id FROM check_runs r WHERE task = ?1 AND auto = 0
-              AND EXISTS (SELECT 1 FROM checks c WHERE c.run = r.id)
-              AND NOT EXISTS (SELECT 1 FROM checks c WHERE c.run = r.id AND c.origin != 'manual')
-            ORDER BY id DESC LIMIT 1) ORDER BY pos")
-            .and_then(|mut s| s.query_map([id], |r| Ok(proto::CheckSpec { name: r.get(0)?, command: r.get(1)?, why: r.get(2)? }))?.collect())
-            .map_err(e2s)
-    }
-
-    /// Runs supplied commands, or repeats the last explicit list when none are supplied.
-    fn run_checks(&mut self, id: u64, specs: Vec<proto::CheckSpec>) -> Result<u64, String> {
-        if self.passes.contains_key(&id) || self.jobs.values().any(|j| j.task == id) || self.merges.contains_key(&id) {
-            return Err("checks are already running; stop them first".into());
-        }
-        let wt = self.checkable_worktree(id)?;
-        let specs = if specs.is_empty() { self.saved_checks(id)? } else { specs };
-        if specs.is_empty() {
-            return Err("add commands in Checks, or use checks <id> --run '<command>'".into());
-        }
-        let specs = checks::validate(specs)?;
-        let tree = checks::tree_hash(Path::new(&wt))?;
-        self.cancel_summary(id);
-        let run = self.new_run(id, &tree, "running", false)?;
-        let specs: Vec<(proto::CheckSpec, &str)> = specs.into_iter().map(|s| (s, "manual")).collect();
-        self.add_checks(run, id, &specs)?;
-        self.start_run(id, run);
-        Ok(run)
-    }
-
-    /// The task's worktree, if checks can run in it now.
-    fn checkable_worktree(&self, id: u64) -> Result<String, String> {
+    /// The task's worktree, once setup has finished.
+    fn task_worktree(&self, id: u64) -> Result<String, String> {
         let (state, wt): (String, String) = self
             .db
             .query_row("SELECT state, worktree FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -1961,278 +1857,25 @@ impl Daemon {
         Ok(wt)
     }
 
-    fn new_run(&mut self, task: u64, tree: &str, state: &str, auto: bool) -> Result<u64, String> {
-        self.db
-            .execute("INSERT INTO check_runs (task, started, tree, state, auto) VALUES (?1, ?2, ?3, ?4, ?5)", params![task, now_secs(), tree, state, auto])
-            .map_err(e2s)?;
-        self.dirty = true;
-        Ok(self.db.last_insert_rowid() as u64)
-    }
-
-    fn add_checks(&mut self, run: u64, task: u64, specs: &[(proto::CheckSpec, &str)]) -> Result<(), String> {
-        for (pos, (s, origin)) in specs.iter().enumerate() {
-            self.db
-                .execute(
-                    "INSERT INTO checks (run, task, pos, name, command, why, state, origin) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
-                    params![run, task, pos, s.name, s.command, s.why, origin],
-                )
-                .map_err(e2s)?;
-        }
-        Ok(())
-    }
-
-    /// Runs the run's pending checks, from the worktree as it is now.
-    fn start_run(&mut self, task: u64, run: u64) {
-        let queue = self
-            .db
-            .prepare("SELECT id FROM checks WHERE run = ?1 AND state = 'pending' ORDER BY pos")
-            .and_then(|mut s| s.query_map([run], |r| r.get(0))?.collect())
-            .unwrap_or_default();
-        // The tree it judges is the tree now, which checks mustn't change.
-        if let Ok(tree) = self.checkable_worktree(task).and_then(|wt| checks::tree_hash(Path::new(&wt))) {
-            let _ = self.db.execute("UPDATE check_runs SET state = 'running', tree = ?1 WHERE id = ?2", params![tree, run]);
-        }
-        self.passes.insert(task, Pass { run, queue, current: None });
-        self.next_check(task);
-    }
-
-    fn check_log(&self, check: u64) -> PathBuf {
-        self.data.join(format!("logs/checks/{check}.log"))
-    }
-
-    /// Starts the run's next check, or ends the run when none is left.
-    fn next_check(&mut self, task: u64) {
-        self.dirty = true;
-        loop {
-            let Some(check) = self.passes.get_mut(&task).and_then(|p| p.queue.pop_front()) else {
-                return self.end_run(task);
-            };
-            match self.spawn_check(task, check) {
-                Ok(child) => {
-                    let _ = self.db.execute("UPDATE checks SET state = 'running', started = ?1 WHERE id = ?2", params![now_secs(), check]);
-                    if let Some(p) = self.passes.get_mut(&task) {
-                        p.current = Some(Running { check, child, deadline: Instant::now() + CHECK_TIMEOUT, cut: None });
-                    }
-                    return;
-                }
-                Err(e) => {
-                    if let Ok(mut log) = security::private_file(&self.check_log(check), true) {
-                        let _ = writeln!(log, "\x1b[31mcouldn't start: {e}\x1b[0m");
-                    }
-                    let _ = self.db.execute("UPDATE checks SET state = 'failed', started = ?1, ended = ?1 WHERE id = ?2", params![now_secs(), check]);
-                }
-            }
-        }
-    }
-
-    fn spawn_check(&self, task: u64, check: u64) -> Result<std::process::Child, String> {
-        use std::os::unix::process::CommandExt;
-        let (command, wt, repo): (String, String, String) = self
-            .db
-            .query_row("SELECT c.command, t.worktree, t.repo FROM checks c JOIN tasks t ON t.id = c.task WHERE c.id = ?1", [check], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .map_err(e2s)?;
-        let log = security::private_file(&self.check_log(check), false).map_err(e2s)?;
-        log.set_len(0).map_err(e2s)?;
-        Command::new("sh")
-            .args(["-c", &command])
-            .current_dir(&wt)
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().map_err(e2s)?)
-            .stderr(log)
-            .env("ARRANGER_TASK", task.to_string())
-            .env("ARRANGER_ROOT", &repo)
-            .env("ARRANGER_WORKTREE", &wt)
-            .env("PORT", task_port(task).to_string())
-            // Colour, though it's not a terminal: the console keeps it.
-            .env("TERM", "xterm-256color")
-            .env("FORCE_COLOR", "1")
-            .env("CLICOLOR_FORCE", "1")
-            .env("CARGO_TERM_COLOR", "always")
-            .process_group(0)
-            .spawn()
-            .map_err(e2s)
-    }
-
-    /// The run is over: failed if a check failed, stopped if one was stopped, else passed.
-    fn end_run(&mut self, task: u64) {
-        let Some(pass) = self.passes.remove(&task) else { return };
-        let count = |state: &str| -> u32 {
-            self.db.query_row("SELECT COUNT(*) FROM checks WHERE run = ?1 AND state = ?2", params![pass.run, state], |r| r.get(0)).unwrap_or(0)
-        };
-        let state = if count("failed") > 0 { "failed" } else if count("stopped") > 0 { "stopped" } else { "passed" };
-        let _ = self.db.execute("UPDATE check_runs SET state = ?1, ended = ?2 WHERE id = ?3", params![state, now_secs(), pass.run]);
-        self.dirty = true;
-        if state == "failed" {
-            let _ = self.db.execute("UPDATE summaries SET state = 'stale' WHERE task = ?1 AND tree = (SELECT tree FROM check_runs WHERE id = ?2)", params![task, pass.run]);
-        }
-        if state == "passed" { self.schedule_summary(task); }
-        if let Some(pending) = self.merges.remove(&task) {
-            let result = if state == "passed" { self.finish_merge(task, pending.clone()) } else { Err("Checks after merging the base failed; base branch was not updated".into()) };
-            if let Err(output) = result { self.send(pending.conn, &proto::reply_frame(&Reply::JobDone { ok: false, output })); }
-            return;
-        }
-        if state == "failed" {
-            if let Err(e) = self.auto_fix(task) {
-                eprintln!("task {task}: auto-fix: {e}");
-            }
-        } else if state == "passed" {
-            let _ = self.db.execute("UPDATE tasks SET fix_rounds = 0 WHERE id = ?1", [task]);
-        }
-    }
-
-    fn reap_checks(&mut self) {
-        let exited: Vec<(u64, Option<i32>, bool, Option<&'static str>)> = self
-            .passes
-            .iter_mut()
-            .filter_map(|(&task, p)| {
-                let r = p.current.as_mut()?;
-                match r.child.try_wait() {
-                    Ok(Some(status)) => Some((task, status.code(), status.success(), r.cut)),
-                    Ok(None) => None,
-                    Err(_) => Some((task, None, false, r.cut)),
-                }
-            })
-            .collect();
-        for (task, code, ok, cut) in exited {
-            let Some(r) = self.passes.get_mut(&task).and_then(|p| p.current.take()) else { continue };
-            let run = self.passes[&task].run;
-            // Leaving new files behind (a lockfile, a snapshot) is untidy; changing the work is failing.
-            let changed = self.guard_tree(task, run, r.check);
-            let state = if ok && cut.is_none() && changed.altered.is_empty() { "passed" } else { "failed" };
-            let note = match (cut, changed.altered.is_empty(), changed.added.is_empty()) {
-                (Some(why), ..) => format!("stopped: {why}"),
-                (None, false, _) => format!("changed {} (put back)", changed.altered.join(", ")),
-                (None, true, false) => format!("left {} behind (removed)", changed.added.join(", ")),
-                _ => String::new(),
-            };
-            let _ = self.db.execute(
-                "UPDATE checks SET state = ?1, exit = ?2, ended = ?3, note = ?4 WHERE id = ?5",
-                params![state, if cut.is_some() { None } else { code }, now_secs(), note, r.check],
-            );
-            self.next_check(task);
-        }
-    }
-
-    /// Checks report; they mustn't change the work they judge. If this one changed the worktree
-    /// (while the agent wasn't working in it), its changes are undone; returns the files.
-    fn guard_tree(&mut self, task: u64, run: u64, check: u64) -> checks::Changes {
-        if self.tasks.get(&task).is_some_and(|t| t.activity == Activity::Running) {
-            return Default::default();
-        }
-        let Ok(wt) = self.checkable_worktree(task) else { return Default::default() };
-        let Ok(tree): Result<String, _> = self.db.query_row("SELECT tree FROM check_runs WHERE id = ?1", [run], |r| r.get(0)) else { return Default::default() };
-        if checks::tree_hash(Path::new(&wt)).is_ok_and(|now| now == tree) {
-            return Default::default();
-        }
-        match checks::restore_tree(Path::new(&wt), &tree) {
-            Ok(changed) => {
-                if let Ok(mut log) = security::private_file(&self.check_log(check), true) {
-                    if !changed.altered.is_empty() {
-                        let _ = writeln!(log, "\n\x1b[31mthis check changed files, which were put back: {}\x1b[0m", changed.altered.join(", "));
-                    }
-                    if !changed.added.is_empty() {
-                        let _ = writeln!(log, "\n\x1b[33mthis check left new files, which were removed: {}\x1b[0m", changed.added.join(", "));
-                    }
-                }
-                changed
-            }
-            Err(e) => checks::Changes { added: Vec::new(), altered: vec![format!("the worktree (couldn't put it back: {e})")] },
-        }
-    }
-
-    /// Stops checks that ran out of time or wrote too much; reaping records them as failed.
-    fn time_out_checks(&mut self) {
-        let now = Instant::now();
-        let mut cuts = Vec::new();
-        for p in self.passes.values_mut() {
-            let Some(r) = p.current.as_mut().filter(|r| r.cut.is_none()) else { continue };
-            let path = self.data.join(format!("logs/checks/{}.log", r.check));
-            let too_long = fs::metadata(&path).is_ok_and(|m| m.len() > CHECK_LOG_MAX);
-            if r.deadline <= now || too_long {
-                let why = if too_long { "its output passed 32 MiB" } else { "it ran for 10 minutes" };
-                r.cut = Some(why);
-                let _ = rustix::process::kill_process_group(Pid::from_child(&r.child), Signal::KILL);
-                cuts.push((path, why));
-            }
-        }
-        for (path, why) in cuts {
-            if let Ok(mut log) = security::private_file(&path, true) {
-                let _ = writeln!(log, "\n\x1b[31mstopped: {why}\x1b[0m");
-            }
-        }
-    }
-
-    fn stop_checks(&mut self, task: u64) -> Result<(), String> {
-        if self.end_checks(task, "stopped") {
-            Ok(())
-        } else {
-            Err(format!("task {task} has no checks running or waiting"))
-        }
-    }
-
-    /// Ends the task's running checks as
-    /// `state`: "stopped" by you, or "stale" when the agent starts another turn. False if none.
-    fn end_checks(&mut self, task: u64, state: &str) -> bool {
-        let now = now_secs();
-        if let Some(pending) = self.merges.remove(&task) {
-            self.send(pending.conn, &proto::reply_frame(&Reply::JobDone { ok: false, output: "Merge checks were interrupted; base branch was not updated".into() }));
-        }
-        let mut ended = false;
-        if let Some(mut pass) = self.passes.remove(&task) {
-            if let Some(mut r) = pass.current.take() {
-                let _ = rustix::process::kill_process_group(Pid::from_child(&r.child), Signal::KILL);
-                let _ = r.child.wait();
-                if let Ok(mut log) = security::private_file(&self.check_log(r.check), true) {
-                    let _ = writeln!(log, "\n\x1b[33m{}\x1b[0m", if state == "stale" { "stopped: the agent started another turn" } else { "stopped" });
-                }
-            }
-            let _ = self.db.execute("UPDATE checks SET state = 'stopped', ended = ?1 WHERE run = ?2 AND state IN ('pending', 'running')", params![now, pass.run]);
-            let _ = self.db.execute("UPDATE check_runs SET state = ?1, ended = ?2 WHERE id = ?3", params![state, now, pass.run]);
-            ended = true;
-        }
-        self.dirty |= ended;
-        ended
-    }
-
-    /// After the agent's turn, rerun only its saved manual commands if the work changed.
-    fn auto_checks(&mut self) {
-        let now = Instant::now();
-        let due: Vec<u64> = self.auto_due.iter().filter(|(_, at)| **at <= now).map(|(&id, _)| id).collect();
+    fn auto_summaries(&mut self) {
+        let due: Vec<u64> = self.summary_due.iter().filter(|(_, at)| **at <= Instant::now()).map(|(&id, _)| id).collect();
         for id in due {
-            self.auto_due.remove(&id);
-            let idle = self.tasks.get(&id).is_some_and(|t| t.activity == Activity::Done && t.need.is_none() && t.queued == 0 && !t.headless.as_ref().is_some_and(Agent::asking))
-                && !self.asks.iter().any(|a| a.0 == id);
-            if !idle || self.passes.contains_key(&id) {
-                continue;
-            }
-            let result = (|| -> Result<(), String> {
-                let specs = self.saved_checks(id)?;
-                if specs.is_empty() { return Ok(()); }
-                let wt = self.checkable_worktree(id)?;
-                let tree = checks::tree_hash(Path::new(&wt))?;
-                if self.check_runs(id)?.first().is_some_and(|r| r.tree == tree && (r.state != "failed" || r.accepted)) {
-                    return Ok(());
-                }
-                let run = self.run_checks(id, specs)?;
-                self.db.execute("UPDATE check_runs SET auto = 1 WHERE id = ?1", [run]).map_err(e2s)?;
-                Ok(())
-            })();
-            if let Err(e) = result {
-                eprintln!("task {id}: checks: {e}");
+            self.summary_due.remove(&id);
+            if self.tasks.get(&id).map_or_else(|| self.db.query_row("SELECT state FROM tasks WHERE id = ?1", [id], |r| r.get::<_, String>(0)).is_ok_and(|s| s == "exited"), |t| t.activity == Activity::Done && t.need.is_none() && t.queued == 0 && !t.headless.as_ref().is_some_and(Agent::asking))
+                && !self.asks.iter().any(|a| a.0 == id) {
+                self.schedule_summary(id);
             }
         }
-    }
-
-    fn verification(&self, id: u64, tree: &str) -> Result<String, String> {
-        let Some(run) = self.check_runs(id)?.into_iter().next() else { return Ok("unverified".into()) };
-        if run.tree != tree { return Ok("stale".into()); }
-        Ok(if run.accepted && run.state == "failed" { "accepted".into() } else { run.state })
     }
 
     fn schedule_summary(&mut self, id: u64) {
         if self.summaries.contains_key(&id) { return; }
+        if let Ok(tree) = self.task_worktree(id).and_then(|wt| tree_hash(Path::new(&wt)))
+            && self.db.query_row("SELECT state FROM summaries WHERE task = ?1 AND tree = ?2", params![id, tree], |r| r.get::<_, String>(0)).is_ok_and(|state| state == "ready") {
+            return;
+        }
         if let Err(error) = self.start_summary(id)
-            && let Ok(tree) = self.checkable_worktree(id).and_then(|wt| checks::tree_hash(Path::new(&wt)))
+            && let Ok(tree) = self.task_worktree(id).and_then(|wt| tree_hash(Path::new(&wt)))
         {
             let _ = self.db.execute("INSERT INTO summaries (task, tree, state, error, updated) VALUES (?1, ?2, 'error', ?3, ?4) ON CONFLICT(task, tree) DO UPDATE SET state = 'error', error = excluded.error, updated = excluded.updated", params![id, tree, error, now_secs()]);
             self.dirty = true;
@@ -2241,11 +1884,8 @@ impl Daemon {
 
     fn start_summary(&mut self, id: u64) -> Result<(), String> {
         if self.summaries.contains_key(&id) { return Err("summary is already running".into()); }
-        let wt = self.checkable_worktree(id)?;
-        let tree = checks::tree_hash(Path::new(&wt))?;
-        if !matches!(self.verification(id, &tree)?.as_str(), "passed" | "accepted" | "skipped") {
-            return Err("run checks or accept their failures before generating a summary".into());
-        }
+        let wt = self.task_worktree(id)?;
+        let tree = tree_hash(Path::new(&wt))?;
         let (agent, model, base, headless): (String, String, String, bool) = self.db.query_row(
             "SELECT agent, model, base_commit, headless FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(e2s)?;
         let backend = side::backend(&agent).ok_or("summary generation is disabled or no agent is installed")?;
@@ -2266,15 +1906,13 @@ impl Daemon {
             diff.truncate(cut);
             diff.push_str("\n(diff truncated; read the worktree for more)");
         }
-        let run = self.check_runs(id)?.into_iter().next().ok_or("no check run")?;
-        let verified_by = run.checks.iter().filter(|c| c.state == "passed").map(|c| c.command.clone()).collect::<Vec<_>>();
         let context = review::chat_summary(&self.events(id)?);
-        let prompt = format!("Summarize the completed work for human review and a commit message. Return JSON matching the schema. Read only; do not edit files, run checks, or send messages. Describe this exact tree {tree}, not intended future work. Keep the overview short: one concise paragraph describing only what the changes do to the existing codebase. Do not include headings, lists, per-file breakdowns, risks, or verification details in the overview. Include a short title and return empty arrays for files and risks. Do not claim verification beyond these recorded results: {}. Check state: {}.\nConversation context:\n{context}\nDiff:\n{diff}", verified_by.join(", "), run.state);
+        let prompt = format!("Summarize the completed work for human review and a commit message. Return JSON matching the schema. Read only; do not edit files, run checks, or send messages. Describe this exact tree {tree}, not intended future work. Keep the overview short: one concise paragraph describing only what the changes do to the existing codebase. Do not include headings, lists, per-file breakdowns, risks, or verification details in the overview. Include a short title and return empty arrays for files and risks. Do not claim verification.\nConversation context:\n{context}\nDiff:\n{diff}");
         let name = format!("summary-{}", self.next_side);
         self.next_side += 1;
         let side = side::start_summary(backend, Path::new(&wt), &prompt, if own { &model } else { "" }, &self.data.join("side"), &name, &agent, if own { session.trim() } else { "" }, &self.exe).map_err(e2s)?;
         self.db.execute("INSERT INTO summaries (task, tree, state, updated) VALUES (?1, ?2, 'running', ?3) ON CONFLICT(task, tree) DO UPDATE SET state = 'running', error = '', updated = excluded.updated", params![id, tree, now_secs()]).map_err(e2s)?;
-        self.summaries.insert(id, SummaryRun { tree, verified_by, side, deadline: Instant::now() + PLAN_TIMEOUT });
+        self.summaries.insert(id, SummaryRun { tree, side, deadline: Instant::now() + PLAN_TIMEOUT });
         self.dirty = true;
         Ok(())
     }
@@ -2290,8 +1928,8 @@ impl Daemon {
         for (id, ok) in done {
             let run = self.summaries.remove(&id).unwrap();
             let tree = run.tree.clone();
-            let result = run.side.finish(ok).and_then(|(v, _)| crate::summary::parse(v, tree.clone(), run.verified_by));
-            let current = self.checkable_worktree(id).and_then(|wt| checks::tree_hash(Path::new(&wt)));
+            let result = run.side.finish(ok).and_then(|(v, _)| crate::summary::parse(v, tree.clone(), Vec::new()));
+            let current = self.task_worktree(id).and_then(|wt| tree_hash(Path::new(&wt)));
             let result = result.and_then(|s| if current.as_deref() == Ok(tree.as_str()) { Ok(s) } else { Err("Work changed while the summary was generated; regenerate it".into()) });
             let (state, json, error) = match result {
                 Ok(summary) => ("ready", serde_json::to_string(&summary).unwrap(), String::new()),
@@ -2309,156 +1947,6 @@ impl Daemon {
             let _ = run.side.finish(false);
             let _ = self.db.execute("UPDATE summaries SET state = 'error', error = 'Interrupted by new work' WHERE task = ?1 AND state = 'running'", [id]);
         }
-    }
-
-    fn setting(&self, key: &str, value: Option<&str>) -> Result<String, String> {
-        if key != "auto_fix" {
-            return Err(format!("unknown setting: {key}"));
-        }
-        if let Some(value) = value {
-            let rounds: u32 = value.parse().map_err(|_| "auto_fix must be an integer from 0 to 10")?;
-            if rounds > 10 { return Err("auto_fix must be an integer from 0 to 10".into()); }
-            self.db.execute("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![key, rounds.to_string()]).map_err(e2s)?;
-        }
-        Ok(self.db.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0)).optional().map_err(e2s)?.unwrap_or_else(|| "0".into()))
-    }
-
-    fn failed_run(&self, id: u64) -> Result<proto::CheckRun, String> {
-        let run = self.check_runs(id)?.into_iter().next().ok_or("no check run")?;
-        if run.state != "failed" { return Err("the latest checks have not failed".into()); }
-        Ok(run)
-    }
-
-    fn accept_checks(&mut self, id: u64) -> Result<(), String> {
-        let run = self.failed_run(id)?;
-        if self.tasks.get(&id).is_some_and(|t| t.activity != Activity::Done || t.queued > 0) {
-            return Err("wait for the agent to finish before accepting checks".into());
-        }
-        let wt = self.checkable_worktree(id)?;
-        if checks::tree_hash(Path::new(&wt))? != run.tree {
-            return Err("the worktree changed; run checks again before accepting".into());
-        }
-        self.db.execute("UPDATE check_runs SET accepted = 1 WHERE id = ?1", [run.id]).map_err(e2s)?;
-        self.auto_due.remove(&id);
-        self.dirty = true;
-        self.schedule_summary(id);
-        Ok(())
-    }
-
-    fn check_report(&self, id: u64) -> Result<String, String> {
-        let run = self.failed_run(id)?;
-        let mut failures = Vec::new();
-        for check in run.checks.into_iter().filter(|c| c.state == "failed") {
-            let mut console = Console::default();
-            let bytes = match read_tail(&self.check_log(check.id), 32 << 20) {
-                Ok(bytes) => bytes,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => b"Check output is unavailable.\n".to_vec(),
-                Err(e) => return Err(e2s(e)),
-            };
-            console.feed(&bytes);
-            let lines = console.lines(0, console.len()).into_iter().map(|line| {
-                (line.spans.into_iter().map(|span| span.0).collect(), line.error)
-            }).collect();
-            failures.push(checks::Failure { name: check.name, command: check.command, exit: check.exit, note: check.note, lines });
-        }
-        Ok(checks::failure_report(&failures))
-    }
-
-    fn auto_fix(&mut self, id: u64) -> Result<(), String> {
-        let limit: u32 = self.setting("auto_fix", None)?.parse().map_err(e2s)?;
-        let used: u32 = self.db.query_row("SELECT fix_rounds FROM tasks WHERE id = ?1", [id], |r| r.get(0)).map_err(e2s)?;
-        if used >= limit { return Ok(()); }
-        let Some(task) = self.tasks.get(&id) else { return Ok(()) };
-        if task.activity != Activity::Done || task.need.is_some() || task.queued > 0 || task.interrupted || task.headless.as_ref().is_some_and(Agent::asking) {
-            return Ok(());
-        }
-        let run = self.failed_run(id)?;
-        let wt = self.checkable_worktree(id)?;
-        if run.accepted || checks::tree_hash(Path::new(&wt))? != run.tree { return Ok(()); }
-        let text = self.check_report(id)?;
-        self.db.execute("UPDATE tasks SET fix_rounds = fix_rounds + 1 WHERE id = ?1", [id]).map_err(e2s)?;
-        let task = self.tasks.get_mut(&id).unwrap();
-        if let Some(agent) = task.headless.as_mut() {
-            let events = agent.prompt(text);
-            self.agent_events(id, events);
-        } else {
-            let mut bytes = security::paste_text(&text, task.screen.mode().contains(TermMode::BRACKETED_PASTE)).into_bytes();
-            bytes.push(b'\r');
-            write_pty(&task.pty.master, &bytes);
-            task.activity = Activity::Running;
-            task.action = "fixing failed checks".into();
-            task.since = now();
-            self.dirty = true;
-        }
-        Ok(())
-    }
-
-    /// Task `id`'s check runs, newest first.
-    fn check_runs(&self, id: u64) -> Result<Vec<proto::CheckRun>, String> {
-        let mut stmt = self.db.prepare(CHECK_RUNS_QUERY).map_err(e2s)?;
-        let mut runs: Vec<proto::CheckRun> = stmt
-            .query_map([id], |r| {
-                Ok(proto::CheckRun { id: r.get(0)?, number: r.get(8)?, started: r.get(1)?, ended: r.get(2)?, tree: r.get(3)?, state: r.get(4)?, auto: r.get(5)?, note: r.get(6)?, accepted: r.get(7)?, checks: Vec::new() })
-            })
-            .and_then(Iterator::collect)
-            .map_err(e2s)?;
-        let mut stmt = self.db.prepare("SELECT id, name, command, why, state, exit, started, ended, origin, note FROM checks WHERE run = ?1 ORDER BY pos").map_err(e2s)?;
-        for run in &mut runs {
-            run.checks = stmt
-                .query_map([run.id], |r| {
-                    Ok(proto::CheckInfo {
-                        id: r.get(0)?,
-                        name: r.get(1)?,
-                        command: r.get(2)?,
-                        why: r.get(3)?,
-                        state: r.get(4)?,
-                        exit: r.get(5)?,
-                        started: r.get(6)?,
-                        ended: r.get(7)?,
-                        origin: r.get(8)?,
-                        note: r.get(9)?,
-                    })
-                })
-                .and_then(Iterator::collect)
-                .map_err(e2s)?;
-        }
-        Ok(runs)
-    }
-
-    /// Lines of a check's output: what its log has gained since last asked is parsed on.
-    fn console(&mut self, check: u64, start: usize, limit: usize) -> Result<Reply, String> {
-        use std::io::Seek;
-        let state: String = self
-            .db
-            .query_row("SELECT state FROM checks WHERE id = ?1", [check], |r| r.get(0))
-            .optional()
-            .map_err(e2s)?
-            .ok_or(format!("no check {check}"))?;
-        let path = self.check_log(check);
-        let entry = self.consoles.entry(check).or_default();
-        let len = match fs::File::open(&path) {
-            Ok(mut f) => {
-                let len = f.metadata().map_err(e2s)?.len();
-                if len > entry.1 {
-                    f.seek(io::SeekFrom::Start(entry.1)).map_err(e2s)?;
-                    let mut buf = Vec::new();
-                    (&mut f).take(8 << 20).read_to_end(&mut buf).map_err(e2s)?;
-                    entry.0.feed(&buf);
-                    entry.1 += buf.len() as u64;
-                }
-                len
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
-            Err(e) => return Err(e2s(e)),
-        };
-        let done = !matches!(state.as_str(), "pending" | "running") && entry.1 >= len;
-        let reply = Reply::Console { check, start, total: entry.0.len(), done, lines: entry.0.lines(start, limit.min(5000)) };
-        // Keep the running ones and this one; the rest parse again if asked for.
-        if self.consoles.len() > 16 {
-            let running: Vec<u64> = self.passes.values().filter_map(|p| p.current.as_ref().map(|r| r.check)).collect();
-            self.consoles.retain(|c, _| *c == check || running.contains(c));
-        }
-        Ok(reply)
     }
 
     fn kill(&mut self, id: u64) -> Result<(), String> {
@@ -2484,17 +1972,8 @@ impl Daemon {
         }
         self.close_shell(id);
         self.stop_setup(id);
-        let _ = self.stop_checks(id);
-        let checks: Vec<u64> = self.db.prepare("SELECT id FROM checks WHERE task = ?1").and_then(|mut s| s.query_map([id], |r| r.get(0))?.collect()).unwrap_or_default();
-        for c in checks {
-            let _ = fs::remove_file(self.check_log(c));
-            self.consoles.remove(&c);
-        }
-        let _ = self.db.execute("DELETE FROM checks WHERE task = ?1", [id]);
-        let _ = self.db.execute("DELETE FROM check_runs WHERE task = ?1", [id]);
+        self.summary_due.remove(&id);
         let _ = self.db.execute("DELETE FROM summaries WHERE task = ?1", [id]);
-        let _ = self.db.execute("DELETE FROM dropped_checks WHERE task = ?1", [id]);
-        self.auto_due.remove(&id);
         if !wt.is_empty() && Path::new(&wt).exists() {
             git(git_in(Path::new(&repo)).args(["worktree", "remove", "--force"]).arg(&wt))?;
         }
@@ -2550,24 +2029,10 @@ impl Daemon {
         });
         let mut tasks: Vec<TaskInfo> = rows.and_then(Iterator::collect).map_err(e2s)?;
         drop(stmt);
-        // Each task's latest check run.
-        let mut stmt = self
-            .db
-            .prepare(
-                "SELECT r.task, r.state, COALESCE(SUM(c.state = 'passed'), 0), COALESCE(SUM(c.state = 'failed'), 0), COUNT(c.id), r.id, r.started, r.accepted
-                 FROM check_runs r LEFT JOIN checks c ON c.run = r.id
-                 WHERE r.id IN (SELECT MAX(id) FROM check_runs GROUP BY task) GROUP BY r.id",
-            )
-            .map_err(e2s)?;
-        let summaries: HashMap<u64, proto::ChecksSummary> = stmt
-            .query_map([], |r| Ok((r.get(0)?, proto::ChecksSummary { state: r.get(1)?, passed: r.get(2)?, failed: r.get(3)?, total: r.get(4)?, run: r.get(5)?, started: r.get(6)?, accepted: r.get(7)? })))
-            .and_then(Iterator::collect)
-            .map_err(e2s)?;
         for info in &mut tasks {
-            let state: Option<String> = self.db.query_row("SELECT CASE WHEN s.tree = r.tree THEN s.state ELSE 'stale' END FROM summaries s LEFT JOIN check_runs r ON r.id = (SELECT MAX(id) FROM check_runs WHERE task = ?1) WHERE s.task = ?1 ORDER BY (s.tree = r.tree) DESC, s.updated DESC LIMIT 1", [info.id], |r| r.get(0)).optional().map_err(e2s)?;
-            info.summary_state = if self.tasks.get(&info.id).is_some_and(|t| t.activity == Activity::Running) && state.is_some() { "stale".into() } else { state.unwrap_or_default() };
-            if let Some(s) = summaries.get(&info.id) {
-                info.checks = s.clone();
+            info.summary_state = self.db.query_row("SELECT state FROM summaries WHERE task = ?1 ORDER BY updated DESC LIMIT 1", [info.id], |r| r.get(0)).optional().map_err(e2s)?.unwrap_or_default();
+            if self.tasks.get(&info.id).is_some_and(|t| t.activity != Activity::Done) && !info.summary_state.is_empty() {
+                info.summary_state = "stale".into();
             }
         }
         for info in &mut tasks {
@@ -2594,15 +2059,6 @@ impl Daemon {
             }
             if with_files {
                 info.files = self.files(info.id).map_err(e2s)?;
-            }
-        }
-        for info in &mut tasks {
-            if info.checks.state == "failed" && !info.checks.accepted && info.state == "done" {
-                info.state = "needs-you".into();
-                info.action = format!("Checks failed ({}/{})", info.checks.failed, info.checks.total);
-                info.need = Some(Event::Attention { text: info.action.clone() });
-            } else if info.checks.state == "running" && info.state == "done" {
-                info.action = "running checks".into();
             }
         }
         Ok(tasks)
@@ -2650,8 +2106,8 @@ impl Daemon {
             .query_row("SELECT branch, base FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(e2s)?;
         let events = self.events(id)?;
-        let tree = checks::tree_hash(Path::new(&wt))?;
-        let verification = self.verification(id, &tree)?;
+        let tree = tree_hash(Path::new(&wt))?;
+        let verification = String::new();
         let stored: Option<(String, String, String, String)> = self.db.query_row(
             "SELECT tree, state, json, error FROM summaries WHERE task = ?1 ORDER BY (tree = ?2) DESC, updated DESC LIMIT 1", params![id, tree], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional().map_err(e2s)?;
         let (work_summary, summary_state) = match stored {
@@ -2667,18 +2123,17 @@ impl Daemon {
             branch,
             base: if base.is_empty() { "HEAD".into() } else { base },
             summary,
-            checks: self.check_runs(id)?.first().filter(|r| r.tree == tree).map(|r| r.checks.iter().map(|c| (c.command.clone(), match c.state.as_str() { "passed" => Some(true), "failed" | "stopped" => Some(false), _ => None })).collect()).unwrap_or_default(),
+            checks: Vec::new(),
             files: review::diff(Path::new(&wt), &base_commit, None)?,
         })
     }
 
-    fn commit(&mut self, conn: Token, id: u64, message: &str, ship: Ship, force: bool) -> Result<(), String> {
-        if self.jobs.values().any(|j| j.task == id) || self.merges.contains_key(&id) {
+    fn commit(&mut self, conn: Token, id: u64, message: &str, ship: Ship, _force: bool) -> Result<(), String> {
+        if self.jobs.values().any(|j| j.task == id) {
             return Err("a commit or merge is already running".into());
         }
-        if ship == Ship::Merge && (self.tasks.get(&id).is_some_and(|t| t.activity != Activity::Done || t.queued > 0)
-            || self.passes.contains_key(&id)) {
-            return Err("wait for the agent and checks to finish before merging".into());
+        if ship == Ship::Merge && (self.tasks.get(&id).is_some_and(|t| t.activity != Activity::Done || t.queued > 0)) {
+            return Err("wait for the agent to finish before merging".into());
         }
         let data = self.review(id)?;
         let (title, base): (String, String) = self.db.query_row("SELECT title, base FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(e2s)?;
@@ -2693,12 +2148,8 @@ impl Daemon {
             git(git_in(Path::new(&wt)).args(["show-ref", "--verify", &format!("refs/heads/{base}")]))?;
         }
         if ship == Ship::Merge {
-            if !force && !matches!(data.verification.as_str(), "passed" | "accepted" | "skipped") {
-                return Err("this tree has not passed checks; review/run checks and retry, or use --force to merge anyway".into());
-            }
-            let checks = self.check_runs(id)?.first().map(|r| r.checks.iter().map(|c| proto::CheckSpec { name: c.name.clone(), command: c.command.clone(), why: c.why.clone() }).collect()).unwrap_or_default();
             self.cancel_summary(id);
-            let pending = MergePending { conn, tree: data.tree.clone(), message: message.clone(), base: base.clone(), force, checks };
+            let pending = MergePending { conn, tree: data.tree.clone(), message: message.clone(), base: base.clone() };
             return self.spawn_commit(conn, id, &message, ship, "prepare", &data.summary, &base, &data.tree, Some(pending));
         }
         self.spawn_commit(conn, id, &message, ship, if ship == Ship::Pr { "pr" } else { "" }, &data.summary, &base, &data.tree, None)
@@ -2721,38 +2172,15 @@ impl Daemon {
     }
 
     fn prepared_merge(&mut self, id: u64, mut pending: MergePending) -> Result<(), String> {
-        let wt = self.checkable_worktree(id)?;
-        let tree = checks::tree_hash(Path::new(&wt))?;
-        if tree == pending.tree || pending.force {
-            pending.tree = tree;
-            return self.finish_merge(id, pending);
-        }
-        // The base changed the tree: rerun exactly the checks already supplied.
-        if pending.checks.is_empty() && !checks::code_changed(&checks::changed_files(Path::new(&wt), &pending.tree, &tree)?) {
-            let run = self.new_run(id, &tree, "skipped", false)?;
-            self.db.execute("UPDATE check_runs SET ended = ?1, note = 'Base changed only non-code files; no checks needed' WHERE id = ?2", params![now_secs(), run]).map_err(e2s)?;
-            pending.tree = tree;
-            self.schedule_summary(id);
-            return self.finish_merge(id, pending);
-        }
-        if pending.checks.is_empty() {
-            return Err("merging the base changed the tree and there are no previous checks; run checks before retrying".into());
-        }
-        let run = self.new_run(id, &tree, "running", false)?;
-        let specs = pending.checks.iter().cloned().map(|c| (c, "merge")).collect::<Vec<_>>();
-        self.add_checks(run, id, &specs)?;
+        let wt = self.task_worktree(id)?;
+        let tree = tree_hash(Path::new(&wt))?;
         pending.tree = tree;
-        self.merges.insert(id, pending);
-        self.start_run(id, run);
-        Ok(())
+        self.finish_merge(id, pending)
     }
 
     fn finish_merge(&mut self, id: u64, pending: MergePending) -> Result<(), String> {
-        let wt = self.checkable_worktree(id)?;
-        if checks::tree_hash(Path::new(&wt))? != pending.tree { return Err("worktree changed before merge; run checks again".into()); }
-        if !pending.force && !matches!(self.verification(id, &pending.tree)?.as_str(), "passed" | "accepted" | "skipped") {
-            return Err("the merged tree has not passed checks".into());
-        }
+        let wt = self.task_worktree(id)?;
+        if tree_hash(Path::new(&wt))? != pending.tree { return Err("worktree changed before merge; review and retry".into()); }
         self.spawn_commit(pending.conn, id, &pending.message, Ship::Merge, "merge", "", &pending.base, &pending.tree, None)
     }
 
@@ -2831,8 +2259,6 @@ impl Daemon {
     /// Drop agent owners explicitly: kill their process groups and reap them before returning.
     fn shutdown(&mut self, sock: &Path) {
         for id in self.summaries.keys().copied().collect::<Vec<_>>() { self.cancel_summary(id); }
-        let checking: Vec<u64> = self.passes.keys().copied().collect();
-        for id in checking { self.end_checks(id, "stopped"); }
         for id in self.setups.keys().copied().collect::<Vec<_>>() { self.stop_setup(id); }
         self.plans.clear();
         for job in self.jobs.values_mut() {
@@ -2875,34 +2301,6 @@ fn queued_label(n: usize) -> String {
 mod tests {
     use super::*;
     use proto::ToolKind;
-
-    #[test]
-    fn check_run_numbers_start_fresh_for_each_task() {
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE check_runs (
-            id INTEGER PRIMARY KEY, task INTEGER, started INTEGER DEFAULT 0,
-            ended INTEGER DEFAULT 0, tree TEXT DEFAULT '', state TEXT DEFAULT 'passed',
-            auto INTEGER DEFAULT 0, note TEXT DEFAULT '', accepted INTEGER DEFAULT 0)").unwrap();
-        for task in [1, 2, 1, 3, 2] {
-            db.execute("INSERT INTO check_runs (task) VALUES (?1)", [task]).unwrap();
-        }
-        let numbers = |task| {
-            db.prepare(CHECK_RUNS_QUERY).unwrap()
-                .query_map([task], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, u64>(8)?)))
-                .unwrap().collect::<Result<Vec<_>, _>>().unwrap()
-        };
-        assert_eq!(numbers(1), [(3, 2), (1, 1)]);
-        assert_eq!(numbers(2), [(5, 2), (2, 1)]);
-        assert_eq!(numbers(3), [(4, 1)]);
-        assert!(numbers(4).is_empty());
-        for _ in 0..31 {
-            db.execute("INSERT INTO check_runs (task) VALUES (1)", []).unwrap();
-        }
-        let runs = numbers(1);
-        assert_eq!(runs.len(), 30);
-        assert_eq!(runs.first().unwrap().1, 33);
-        assert_eq!(runs.last().unwrap().1, 4);
-    }
 
     #[test]
     fn interrupted_turn_ignores_late_hooks_until_next_prompt() {

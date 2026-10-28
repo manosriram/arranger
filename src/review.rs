@@ -297,9 +297,9 @@ pub fn conflicts(worktree: &Path) -> Result<(Vec<String>, bool), String> {
 pub const COMMIT_SCRIPT: &str = r#"set -e
 if [ -n "$(git diff --name-only --diff-filter=U)" ]; then echo "resolve the conflicts first"; exit 1; fi
 git add -A
-if [ -n "$5" ] && [ "$(git write-tree)" != "$5" ]; then echo "worktree changed since verification; run checks again"; exit 1; fi
+if [ -n "$5" ] && [ "$(git write-tree)" != "$5" ]; then echo "worktree changed since review; review and retry"; exit 1; fi
 if ! git diff --cached --quiet || [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then git commit -q -m "$1"; fi
-if [ -n "$5" ] && [ "$(git rev-parse HEAD^{tree})" != "$5" ]; then echo "commit changed the checked tree; run checks again"; exit 1; fi
+if [ -n "$5" ] && [ "$(git rev-parse HEAD^{tree})" != "$5" ]; then echo "commit changed the reviewed tree; review and retry"; exit 1; fi
 if [ "$2" = pr ]; then
   git push -q -u origin HEAD
   gh pr create --title "$(printf '%s\n' "$1" | head -n 1)" --body "$3" --base "$4"
@@ -466,4 +466,31 @@ mod tests {
         assert_eq!(diff(&dir, &main, None).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// The worktree's contents as a git tree, uncommitted and untracked (not ignored) files
+/// included, without touching its index: a copy of the index takes the changes.
+pub fn tree_hash(worktree: &Path) -> Result<String, String> {
+    let git = |index: Option<&Path>, args: &[&str]| {
+        let mut c = Command::new("git");
+        c.arg("-C").arg(worktree).args(args);
+        if let Some(i) = index {
+            c.env("GIT_INDEX_FILE", i);
+        }
+        let out = c.output().map_err(|e| format!("git: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let real = git(None, &["rev-parse", "--path-format=absolute", "--git-path", "index"])?;
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let copy = std::env::temp_dir().join(format!("arranger-index-{}-{nanos}", std::process::id()));
+    // Its stat cache spares hashing every file again; a fresh one starts from HEAD.
+    if std::fs::copy(&real, &copy).is_err() {
+        git(Some(&copy), &["read-tree", "HEAD"])?;
+    }
+    let tree = git(Some(&copy), &["add", "-A"]).and_then(|_| git(Some(&copy), &["write-tree"]));
+    let _ = std::fs::remove_file(&copy);
+    tree
 }

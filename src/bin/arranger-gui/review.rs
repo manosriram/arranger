@@ -12,28 +12,7 @@ const HUNK_H: f32 = 36.0;
 const CARD_HEAD: f32 = 40.0;
 const NOTE_X: f32 = 110.0;
 
-pub struct CheckOutput {
-    command: String,
-    output: String,
-    wrapped_lines: Vec<String>,
-    wrapped_width: Option<f32>,
-    ok: Option<bool>,
-    pub scroll: f32,
-    next: Instant,
-    pending: bool,
-}
-
-impl CheckOutput {
-    fn set_output(&mut self, output: String) {
-        if self.output != output {
-            self.output = output;
-            self.wrapped_width = None;
-        }
-    }
-}
-
 pub struct ReviewView {
-    pub check_output: Option<CheckOutput>,
     pub task: u64,
     /// The machine the task runs on.
     pub host: usize,
@@ -41,7 +20,7 @@ pub struct ReviewView {
     pub file: usize,
     pub split: bool,
     pub scroll: f32,
-    /// The left rail (files, checks, summary) scrolls on its own.
+    /// The left rail (files and summary) scrolls on its own.
     pub rail_scroll: f32,
     /// "path\0header" of hunks marked reviewed; they collapse.
     accepted: HashSet<String>,
@@ -69,7 +48,7 @@ pub const FLASH: Duration = Duration::from_millis(2000);
 impl ReviewView {
     /// Something on screen moves: the button's dots while busy, or its confirmation fading.
     pub fn animating(&self) -> bool {
-        self.data.as_ref().is_some_and(|d| d.summary_state == "running") || self.check_output.is_some() || self.busy || self.flash.as_ref().is_some_and(|f| f.1.elapsed() < FLASH)
+        self.data.as_ref().is_some_and(|d| d.summary_state == "running") || self.busy || self.flash.as_ref().is_some_and(|f| f.1.elapsed() < FLASH)
     }
 }
 
@@ -87,7 +66,6 @@ pub enum ReviewAction {
     Run,
     Refresh,
     GenerateSummary,
-    Check,
     File(usize),
     Split(bool),
     Revert(String, String),
@@ -111,7 +89,6 @@ pub enum ReviewAction {
 pub enum Tag {
     Review(u64),
     Summary,
-    CheckOutput(u64, String),
     /// A background diff for the Review tab's enabled state.
     Changes(crate::TaskKey),
     Revert,
@@ -124,9 +101,7 @@ pub enum Tag {
     Delete,
     /// A task's events, for the last prompt it was sent: the clone dialog shows it.
     LastPrompt(crate::TaskKey),
-    /// The Checks tab's runs, and a check's output.
-    CheckRuns(crate::TaskKey),
-    Console(crate::TaskKey, u64),
+
 }
 
 fn key(path: &str, header: &str) -> String {
@@ -244,7 +219,6 @@ impl App {
         }
         let message = title(task);
         self.review = Some(ReviewView {
-            check_output: None,
             task: task.id,
             host: task.machine,
             data: None,
@@ -267,7 +241,6 @@ impl App {
             shipping: None,
             flash: None,
         });
-        self.checks = None;
         self.focus = self.rest();
         self.review_action(ReviewAction::Refresh);
     }
@@ -281,9 +254,6 @@ impl App {
     }
 
     pub fn on_reply(&mut self, tag: Tag, reply: Result<Reply, String>) {
-        if matches!(tag, Tag::CheckRuns(_) | Tag::Console(..)) {
-            return self.on_checks_reply(tag, reply);
-        }
         if let Tag::Changes(key) = tag {
             // An error (no worktree, say) means there's nothing to look at either.
             let has = matches!(&reply, Ok(Reply::Review(d)) if !d.files.is_empty() || d.merging || !d.conflicts.is_empty());
@@ -321,30 +291,6 @@ impl App {
         };
         let mut refresh = false;
         match (tag, reply) {
-            (Tag::CheckOutput(id, command), reply) if id == rv.task => {
-                if let Some(check) = rv.check_output.as_mut().filter(|c| c.command == command) {
-                    check.pending = false;
-                    check.next = Instant::now() + Duration::from_millis(300);
-                    match reply {
-                        Ok(Reply::Chat { items, .. }) => {
-                            if let Some((output, ok)) = items.into_iter().rev().find_map(|item| match item {
-                                proto::ChatItem::Tool { target, output, ok, .. } if target == command => Some((output, ok)),
-                                _ => None,
-                            }) {
-                                check.set_output(output);
-                                check.ok = ok;
-                            } else {
-                                check.set_output("No output captured for this check.".into());
-                            }
-                        }
-                        Ok(Reply::Error(e)) | Err(e) => {
-                            check.set_output(format!("Output unavailable: {e}"));
-                            check.next = Instant::now() + Duration::from_secs(60);
-                        }
-                        _ => {}
-                    }
-                }
-            }
             (Tag::Review(id), Ok(Reply::Review(data))) if id == rv.task => {
                 rv.refreshed = Instant::now();
                 if let Some(s) = data.work_summary.as_ref().filter(|s| s.tree == data.tree && data.summary_state == "ready") {
@@ -432,7 +378,6 @@ impl App {
                 self.review = None;
                 self.focus = rest;
             }
-            ReviewAction::Check => self.open_checks(),
             ReviewAction::GenerateSummary => self.spawn_request(host, Tag::Summary, Request::GenerateSummary { id }),
             ReviewAction::Refresh => self.spawn_request(host, Tag::Review(id), Request::Review { id }),
             ReviewAction::File(i) => {
@@ -504,7 +449,7 @@ impl App {
                 .into();
                 let message = rv.message.clone();
                 self.focus = rest;
-                let force = ship == Ship::Merge && rv.data.as_ref().is_some_and(|d| !matches!(d.verification.as_str(), "passed" | "accepted" | "skipped"));
+                let force = false;
                 self.spawn_request(host, Tag::Commit, Request::Commit { id, message, ship, force });
             }
             ReviewAction::ShipMenu(open) => rv.ship_menu = open.then(Rect::default),
@@ -639,24 +584,6 @@ impl App {
         let section = |r: &mut Renderer, y: f32, label: &str| {
             r.text(rail.x + 16.0, y, label, UI, 11.0, 500, t.text3, 200.0);
         };
-        if let Some(d) = &rv.data {
-            let (label, color) = match d.verification.as_str() {
-                "passed" => ("Passed on this exact diff", t.add),
-                "accepted" => ("Failed checks accepted", t.needs),
-                "skipped" => ("Checks skipped for this diff", t.needs),
-                "stale" => ("Checks are out of date", t.needs),
-                "failed" => ("Checks failed", t.del),
-                "running" => ("Checks running", t.work),
-                _ => ("This diff is unverified", t.needs),
-            };
-            r.text(rail.x + 16.0, y, label, UI, 12.0, 500, color, rail.w - 32.0);
-            y += 25.0;
-            let b = Rect::new(rail.x + 16.0, y, 100.0, 26.0);
-            r.frame(b, 0.0, t.bg, t.border2);
-            r.text(b.x + 9.0, r.center(b, UI, 12.0), "Run checks", UI, 12.0, 500, t.text, b.w);
-            if self.hit(r, b) { acts.push(ReviewAction::Check); }
-            y += 40.0;
-        }
         section(r, y, "FILES");
         y += 22.0;
         if files.is_empty() && rv.data.is_some() {
@@ -693,25 +620,6 @@ impl App {
             y += 34.0;
             if let Some(change) = rv.data.as_ref().and_then(|d| d.work_summary.as_ref().filter(|s| s.tree == d.tree)).and_then(|s| s.files.iter().find(|(path, _)| path == &f.path)).map(|(_, change)| change) {
                 y = draw_markdown(r, t, change, rail.x + 24.0, y, self.rail_w - 40.0) + 8.0;
-            }
-        }
-        if let Some(d) = rv.data.as_ref().filter(|d| !d.checks.is_empty()) {
-            y += 18.0;
-            section(r, y, "CHECKS");
-            y += 24.0;
-            for (cmd, ok) in &d.checks {
-                let row = Rect::new(rail.x + 16.0, y, self.rail_w - 32.0, 20.0);
-                let (icon, ic, label) = match ok {
-                    Some(true) => ("✓", t.add, "passed"),
-                    Some(false) => ("✗", t.del, "failed"),
-                    None => ("■", t.needs, "running"),
-                };
-                r.text(row.x, r.center(row, MONO, 12.0), icon, MONO, 12.0, 600, ic, 16.0);
-                let lw = r.measure(MONO, 12.0, 400, label);
-                r.text(row.x + 21.0, r.center(row, MONO, 12.0), cmd, MONO, 12.0, 400, t.tc, row.w - 30.0 - lw);
-                r.text(row.x + row.w - lw, r.center(row, MONO, 12.0), label, MONO, 12.0, 400, if ok.is_none() { t.needs } else { t.text3 }, lw + 2.0);
-                if self.hit(r, row) { acts.push(ReviewAction::Check); }
-                y += 28.0;
             }
         }
         if let Some(d) = &rv.data {
@@ -817,65 +725,6 @@ impl App {
             rv.ship_menu = menu;
         }
         self.actions.extend(acts.into_iter().map(Action::Review));
-    }
-
-    pub fn draw_check_output(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
-        let Some(rv) = self.review.as_mut() else { return };
-        let Some(check) = rv.check_output.as_mut() else { return };
-        let request = if !check.pending && Instant::now() >= check.next {
-            check.pending = true;
-            Some((rv.host, rv.task, check.command.clone()))
-        } else { None };
-        r.set_clip(None);
-        let bounds = Rect::new(0.0, TITLE_H, w, (h - TITLE_H).max(0.0));
-        r.rect(bounds, 0.0, t.scrim);
-        r.target(bounds, Cursor::Arrow);
-        let pw = (w - 32.0).clamp(1.0, 960.0);
-        let ph = (bounds.h - 32.0).clamp(1.0, 640.0);
-        let panel = Rect::new((w - pw) / 2.0, bounds.y + (bounds.h - ph) / 2.0, pw, ph);
-        r.frame(panel, 8.0, t.dialog, t.border2);
-        r.target(panel, Cursor::Arrow);
-        r.text(panel.x + 16.0, panel.y + 16.0, &check.command, MONO, 13.0, 600, t.text, panel.w - 120.0);
-        let close = Rect::new(panel.x + panel.w - 80.0, panel.y + 8.0, 68.0, 32.0);
-        r.frame(close, 4.0, t.raised, t.border2);
-        r.text(close.x + 8.0, close.y + 8.0, "Close ✕", UI, 12.0, 500, t.text, close.w - 16.0);
-        let label = match check.ok { None => "Running • live output", Some(true) => "Passed", Some(false) => "Failed" };
-        r.text(panel.x + 16.0, panel.y + 40.0, label, UI, 12.0, 400, t.text3, panel.w - 32.0);
-        let logs = Rect::new(panel.x + 12.0, panel.y + 64.0, (panel.w - 24.0).max(1.0), (panel.h - 76.0).max(1.0));
-        r.frame(logs, 4.0, t.term, t.border2);
-        let body = Rect::new(logs.x + 10.0, logs.y + 10.0, (logs.w - 28.0).max(1.0), (logs.h - 20.0).max(1.0));
-        // Wrapping measures every character; only redo it when content or width changes.
-        if check.wrapped_width != Some(body.w) {
-            let output = if check.output.is_empty() { "Waiting for output…" } else { &check.output };
-            check.wrapped_lines = output.lines().flat_map(|line| wrap(r, line, MONO, 12.0, body.w)).collect();
-            check.wrapped_width = Some(body.w);
-        }
-        let lines = &check.wrapped_lines;
-        let max = (lines.len() as f32 * 18.0 - body.h).max(0.0);
-        check.scroll = check.scroll.min(max);
-        r.set_clip(Some(body));
-        let offset = max - check.scroll;
-        let first = (offset / 18.0).floor() as usize;
-        let end = (((offset + body.h) / 18.0).ceil() as usize).min(lines.len());
-        for (i, line) in lines.iter().enumerate().take(end).skip(first) {
-            let y = body.y + i as f32 * 18.0 - offset;
-            if y + 18.0 >= body.y && y < body.y + body.h {
-                r.text(body.x, y, line, MONO, 12.0, 400, readable(t.text, t.term), body.w);
-            }
-        }
-        r.set_clip(None);
-        if max > 0.0 {
-            let track = Rect::new(logs.x + logs.w - 10.0, body.y, 4.0, body.h);
-            let thumb_h = (body.h * body.h / (max + body.h)).max(20.0).min(body.h);
-            r.rect(track, 0.0, t.border);
-            r.rect(Rect::new(track.x, track.y + (body.h - thumb_h) * (1.0 - check.scroll / max), track.w, thumb_h), 0.0, t.text3);
-        }
-        r.target(close, Cursor::Pointer);
-        let dismiss = self.click.take().is_some_and(|p| close.contains(p) || !panel.contains(p));
-        if dismiss { self.review.as_mut().unwrap().check_output = None; }
-        if let Some((host, id, command)) = request {
-            self.spawn_request(host, Tag::CheckOutput(id, command), Request::ChatPage { id, end: usize::MAX, limit: usize::MAX });
-        }
     }
 
     /// Draws one file's card; returns how far it can scroll.
@@ -1117,11 +966,9 @@ impl App {
         let branch = rv.data.as_ref().map_or("", |d| d.branch.as_str());
         // Conflicts turn the main button into asking the agent; ▾ then settles them by side instead.
         let conflicted = rv.data.as_ref().is_some_and(|d| !d.conflicts.is_empty());
-        let force_merge = rv.data.as_ref().is_some_and(|d| !matches!(d.verification.as_str(), "passed" | "accepted" | "skipped"));
         let merge_label = match (conflicted, ended) {
             (true, false) => format!("Ask {agent} to resolve"),
             (true, true) => format!("Revive {agent} to resolve"),
-            _ if force_merge => "Force merge".to_string(),
             _ if base.is_empty() => "Merge".to_string(),
             _ => format!("Merge into {base}"),
         };
@@ -1158,7 +1005,6 @@ impl App {
         let fill = match flash {
             Some((_, k)) => blend(t.done, t.primary_bg, ((k - 0.8) / 0.2).clamp(0.0, 1.0)),
             None if idle => t.raised,
-            None if force_merge && !conflicted => dim(t.del),
             None => dim(t.primary_bg),
         };
         r.rect(ship, 4.0, fill);

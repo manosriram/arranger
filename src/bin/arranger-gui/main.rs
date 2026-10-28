@@ -4,7 +4,6 @@
 
 mod overlays;
 mod chat;
-mod checks;
 mod completion;
 mod sound;
 mod render;
@@ -42,7 +41,6 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use checks::{ChecksAction, ChecksView};
 use review::{ReviewAction, ReviewView, Tag};
 use theme::{AGENTS, Rgba, THEMES, Theme, accent, alpha, blend, efforts, models, readable};
 #[cfg(test)]
@@ -170,8 +168,6 @@ enum Focus {
     HostRepo,
     /// A headless task's message box, under its chat.
     Message,
-    /// The Checks tab's field for a command to add.
-    CheckCmd,
 }
 
 #[derive(Default)]
@@ -321,9 +317,6 @@ enum Action {
     SendChat,
     /// Approve, skip, retry or replan a task's setup.
     Setup(TaskKey, SetupAction),
-    /// Open the Checks tab on the selected task.
-    OpenChecks,
-    Checks(ChecksAction),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -410,8 +403,6 @@ struct App {
     /// A machine whose Remove was clicked once; the next click removes it.
     remove_armed: Option<usize>,
     review: Option<ReviewView>,
-    /// The Checks tab, open on a task.
-    checks: Option<ChecksView>,
     /// The Terminal tab is on (under Review, when that's open too).
     shell: bool,
     /// Whether each probed task has anything to review, keyed by the state it was probed in.
@@ -533,7 +524,6 @@ fn run() -> io::Result<()> {
         prompts: Vec::new(),
         revive_error: None,
         setup_log: None,
-        checks: None,
         setup_log_pending: false,
         welcome: false,
         recent: Vec::new(),
@@ -772,13 +762,6 @@ impl ApplicationHandler<Msg> for App {
                     }
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_REVIEW").is_some() {
                         self.open_review();
-                    }
-                    // `ARRANGER_CHECKS=<check id>` (or anything) opens the Checks tab on it.
-                    if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_CHECKS").is_some() {
-                        self.open_checks();
-                        if let Some(check) = std::env::var("ARRANGER_CHECKS").ok().and_then(|v| v.parse().ok()) {
-                            self.checks_action(ChecksAction::Select(check));
-                        }
                     }
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_TERMINAL").is_some() {
                         self.shell = true;
@@ -1315,8 +1298,8 @@ struct Stage {
     progress: Option<f32>,
 }
 
-/// The task's pipeline: Setup → Working → Checks → Summary → Review → Merge.
-fn stages(task: &TaskInfo) -> [Stage; 6] {
+/// The task's pipeline: Setup → Working → Summary → Review → Merge.
+fn stages(task: &TaskInfo) -> [Stage; 5] {
     use Phase::*;
     let stage = |name, phase, note: &str| Stage { name, phase, note: note.to_string(), progress: None };
     let setting_up = is_setup(&task.state);
@@ -1337,24 +1320,6 @@ fn stages(task: &TaskInfo) -> [Stage; 6] {
         3 => stage("Working", Done, "turn done"),
         _ => stage("Working", Done, "ended"),
     };
-    let c = &task.checks;
-    let counted = if c.total == 0 { String::new() } else { format!("{}/{}", c.passed, c.total) };
-    let mut checks = match c.state.as_str() {
-        "" => stage("Checks", Todo, ""),
-        "running" => stage("Checks", Active, &if counted.is_empty() { "running".into() } else { format!("{counted} passed") }),
-        "passed" => stage("Checks", Done, &if counted.is_empty() { "passed".into() } else { format!("{counted} passed") }),
-        "failed" if c.accepted => stage("Checks", Done, &format!("{} failed · accepted", c.failed)),
-        "failed" => stage("Checks", Failed, &format!("{} failed", c.failed)),
-        "unverified" => stage("Checks", Waiting, "unverified"),
-        "error" => stage("Checks", Failed, "failed to run"),
-        "stale" => stage("Checks", Todo, "outdated"),
-        "skipped" => stage("Checks", Skipped, "skipped"),
-        "stopped" => stage("Checks", Skipped, "stopped"),
-        s => stage("Checks", Todo, s),
-    };
-    if c.state == "running" && c.total > 0 {
-        checks.progress = Some((c.passed + c.failed) as f32 / c.total as f32);
-    }
     let summary = match task.summary_state.as_str() {
         "ready" => stage("Summary", Done, "written"),
         "running" => stage("Summary", Active, "writing"),
@@ -1362,9 +1327,8 @@ fn stages(task: &TaskInfo) -> [Stage; 6] {
         "stale" => stage("Summary", Todo, "outdated"),
         _ => stage("Summary", Todo, ""),
     };
-    let checked = matches!(checks.phase, Done | Skipped);
     let review = match task.shipped.as_str() {
-        "" if group(&task.state) == 3 && checked => stage("Review", Waiting, "ready for you"),
+        "" if group(&task.state) == 3 => stage("Review", Waiting, "ready for you"),
         "" => stage("Review", Todo, ""),
         _ => stage("Review", Done, "approved"),
     };
@@ -1374,7 +1338,7 @@ fn stages(task: &TaskInfo) -> [Stage; 6] {
         "committed" => stage("Merge", Skipped, "committed only"),
         _ => stage("Merge", Todo, ""),
     };
-    [setup, working, checks, summary, review, merge]
+    [setup, working, summary, review, merge]
 }
 
 /// The stage to call out: the first that isn't finished, or none once all are.
@@ -1845,12 +1809,8 @@ impl App {
     fn move_view(&mut self, forward: bool) {
         if self.review.is_some() {
             if !forward {
-                self.actions.push(if self.checkable() { Action::OpenChecks } else { Action::Shell(false) });
+                self.actions.push(Action::Shell(false));
             }
-        } else if self.checks.is_some() {
-            self.actions.push(if !forward { Action::Shell(false) } else if self.reviewable() { Action::OpenReview } else { return });
-        } else if forward && self.checkable() {
-            self.actions.push(Action::OpenChecks);
         } else if forward && self.reviewable() {
             self.actions.push(Action::OpenReview);
         } else if !forward && self.shell {
@@ -1930,9 +1890,6 @@ impl App {
         let files = self.review.as_ref().and_then(|rv| rv.data.as_ref()).map_or(0, |d| d.files.len());
         let file = self.review.as_ref().map(|rv| rv.file);
         match key.as_str() {
-            "j" if self.checks.is_some() => self.actions.push(Action::Checks(ChecksAction::Step(1))),
-            "k" if self.checks.is_some() => self.actions.push(Action::Checks(ChecksAction::Step(-1))),
-            "e" if self.checks.is_some() => self.actions.push(Action::Checks(ChecksAction::NextError)),
             "j" if file.is_some() => self.actions.push(Action::Review(ReviewAction::File((file.unwrap() + 1).min(files.saturating_sub(1))))),
             "k" if file.is_some() => self.actions.push(Action::Review(ReviewAction::File(file.unwrap().saturating_sub(1)))),
             "j" => self.move_selection(1),
@@ -1948,7 +1905,6 @@ impl App {
             "i" if self.current().is_some() => {
                 self.machine_tasks = None;
                 self.review = None;
-                self.checks = None;
                 self.actions.push(Action::Focus(Focus::Term));
             }
             "h" | "l" if self.machine_tasks.is_none() => self.move_view(key == "l"),
@@ -1963,14 +1919,13 @@ impl App {
             "esc" if self.help => self.help = false,
             "esc" if self.machine_tasks.is_some() => self.actions.push(Action::MachineTasks(None)),
             "esc" if self.review.is_some() => self.actions.push(Action::Review(ReviewAction::Close)),
-            "esc" if self.checks.is_some() => self.actions.push(Action::Shell(false)),
             _ => {}
         }
     }
 
     /// The sidebar's or review rail's divider under `p`, which a press starts dragging.
     fn divider_at(&self, p: (f32, f32)) -> Option<Divider> {
-        if self.review.as_ref().is_some_and(|r| r.check_output.is_some()) || self.checks.is_some() || self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || p.1 < TITLE_H {
+        if self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || p.1 < TITLE_H {
             return None;
         }
         match &self.review {
@@ -1981,15 +1936,7 @@ impl App {
 
     /// Scrolls whatever is under the mouse by `dy` pixels (positive = towards the top).
     fn scroll_by(&mut self, dy: f32) {
-        if let Some(check) = self.review.as_mut().and_then(|r| r.check_output.as_mut()) {
-            check.scroll = (check.scroll + dy).max(0.0);
-            return;
-        }
         if self.confirm_delete.is_some() { return; }
-        if self.dialog.is_none() && self.checks.is_some() && self.scroll_checks(dy) {
-            self.redraw();
-            return;
-        }
         if let Some(d) = self.dialog.as_mut() {
             if d.prompt_bounds.is_some_and(|b| b.contains(self.mouse)) {
                 d.prompt_scroll = (d.prompt_scroll - dy).max(0.0);
@@ -2284,10 +2231,6 @@ impl App {
 
     fn key(&mut self, ev: &KeyEvent) {
         let m = self.mods;
-        if let Some(rv) = self.review.as_mut().filter(|r| r.check_output.is_some()) {
-            if ev.logical_key == Key::Named(NamedKey::Escape) { rv.check_output = None; }
-            return;
-        }
         // Consume confirmation keys before shortcuts or terminal input can handle them.
         if let Some(task) = self.confirm_delete.take() {
             if !ev.repeat && !app_mod(m) && !m.control_key()
@@ -2559,7 +2502,6 @@ impl App {
             Key::Named(NamedKey::Enter) => match focus {
                 Focus::Note => self.actions.push(Action::Review(ReviewAction::SaveNote)),
                 Focus::CommitMsg => self.actions.push(Action::Review(ReviewAction::Commit(Ship::Commit))),
-                Focus::CheckCmd => self.actions.push(Action::Checks(ChecksAction::Add)),
                 Focus::Prompt | Focus::Base | Focus::Repo => self.actions.push(Action::Start),
                 Focus::Message => self.actions.push(Action::SendChat),
                 Focus::HostSsh | Focus::HostName | Focus::HostRepo => self.actions.push(Action::AddHost),
@@ -2595,9 +2537,6 @@ impl App {
         }
         if let (Focus::CommitMsg, Some(rv)) = (focus, &mut self.review) {
             return &mut rv.message;
-        }
-        if let (Focus::CheckCmd, Some(cv)) = (focus, &mut self.checks) {
-            return &mut cv.input;
         }
         if let Some(a) = &mut self.add_host {
             match focus {
@@ -2794,12 +2733,6 @@ impl App {
                     self.stats.remove(&key);
                     self.changes.remove(&key);
                 }
-                Action::OpenChecks => {
-                    if self.dialog.is_none() && self.checkable() {
-                        self.open_checks();
-                    }
-                }
-                Action::Checks(a) => self.checks_action(a),
                 Action::Setup((m, id), action) => {
                     if let Ok(Reply::Error(e)) | Err(e) = request_at(self.sock(m).as_deref(), &Request::Setup { id, action }).map_err(|e| e.to_string()) {
                         eprintln!("arranger: {e}");
@@ -2850,7 +2783,7 @@ impl App {
                 Action::Review(a) => self.review_action(a),
                 Action::Shell(on) => {
                     if self.dialog.is_none() && (!on || self.shellable()) {
-                        (self.shell, self.review, self.machine_tasks, self.checks) = (on, None, None, None);
+                        (self.shell, self.review, self.machine_tasks) = (on, None, None);
                         self.focus = self.rest();
                         self.sync_session();
                     }
@@ -2974,7 +2907,7 @@ impl App {
         self.stale.set(false);
         self.icons.borrow_mut().clear();
         self.task_regions.borrow_mut().clear();
-        self.layered = !(self.review.as_ref().is_some_and(|r| r.check_output.is_some()) || self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || (self.help && self.vim) || self.popup != Popup::None || self.task_menu.is_some());
+        self.layered = !(self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || (self.help && self.vim) || self.popup != Popup::None || self.task_menu.is_some());
         let dpi = gfx.window.scale_factor() as f32 * self.zoom;
         let (w, h) = (size.width as f32 / dpi, size.height as f32 / dpi);
         let r = &mut gfx.r;
@@ -2982,20 +2915,19 @@ impl App {
 
         self.probe_changes();
         // Under an open dialog or popup nothing reacts: the views below draw without the click.
-        let modal_click = (self.review.as_ref().is_some_and(|r| r.check_output.is_some()) || self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || self.task_menu.is_some()).then(|| self.click.take());
+        let modal_click = (self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || self.task_menu.is_some()).then(|| self.click.take());
         let floating = self.popover(w, h).filter(|f| self.click.is_some_and(|p| f.contains(p))).and_then(|_| self.click.take());
         self.draw_title(r, t, w);
         if self.welcome {
             self.draw_welcome(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H));
         } else if self.review.is_some() {
             self.draw_review(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H - STATUS_H));
-        } else if self.checks.is_some() {
-            self.draw_checks(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H - STATUS_H));
+
         } else {
             self.draw_sidebar(r, t, h);
             self.draw_main(r, t, Rect::new(self.sidebar_w, TITLE_H, w - self.sidebar_w, h - TITLE_H - STATUS_H));
         }
-        if !self.welcome && self.checks.is_none() {
+        if !self.welcome {
             let (x, top) = if self.review.is_some() { (self.rail_w, TITLE_H + review::STRIP_H) } else { (self.sidebar_w, TITLE_H) };
             r.target(Rect::new(x - 4.0, top, 8.0, h - top - STATUS_H), Cursor::Resize);
         }
@@ -3033,7 +2965,6 @@ impl App {
         if self.confirm_delete.is_some() {
             self.draw_delete_confirmation(r, t, w, h);
         }
-        self.draw_check_output(r, t, w, h);
         let cursor = r.finish(self.mouse);
         self.draw_icons(r, t);
         self.hot = r.hot(self.mouse);
@@ -3094,11 +3025,10 @@ impl App {
             self.actions.push(Action::Welcome);
         }
 
-        // Views: Workspace | Checks | Review.
+        // Views: Workspace | Review.
         let mut nx = x + 26.0 + rw;
         let review = self.review.is_some();
-        let checks = self.checks.is_some();
-        let tabs = [("Workspace", !review && !checks && !self.shell), ("Checks", checks), ("Review", review)];
+        let tabs = [("Workspace", !review && !self.shell), ("Review", review)];
         for (label, on) in tabs.into_iter().filter(|_| !self.welcome) {
             let tw = r.measure(UI, 13.0, 500, label) + 24.0;
             let tab = Rect::new(nx, (TITLE_H - 30.0) / 2.0, tw, 30.0);
@@ -3107,19 +3037,12 @@ impl App {
             }
             let off = !on && match label {
                 "Review" => !self.reviewable(),
-                "Checks" => !self.checkable(),
                 _ => false,
             };
-            // The summary describes only the latest run; an older pass must not keep this green.
-            let passed = label == "Checks" && self.current().is_some_and(|task| task.checks.state == "passed");
-            if passed {
-                r.rect(Rect::new(tab.x, tab.y + tab.h - 2.0, tab.w, 2.0), 0.0, t.done);
-            }
-            r.text(tab.x + 12.0, r.center(tab, UI, 13.0), label, UI, 13.0, 500, if passed { t.done } else if on { t.text } else if off { alpha(t.text3, 90) } else { t.text3 }, tw);
+            r.text(tab.x + 12.0, r.center(tab, UI, 13.0), label, UI, 13.0, 500, if on { t.text } else if off { alpha(t.text3, 90) } else { t.text3 }, tw);
             if self.hit(r, tab) && !on && !off {
                 self.actions.push(match label {
                     "Review" => Action::OpenReview,
-                    "Checks" => Action::OpenChecks,
                     _ if review => Action::Review(ReviewAction::Close),
                     _ => Action::Shell(false),
                 });
@@ -3326,8 +3249,7 @@ impl App {
         let ask = Rect::new(text_x, top.y + top.h, card.w - 38.0, 20.0);
         r.text(ask.x, r.center(ask, UI, 12.5), &status_line(task, 0).replace('\n', " "), UI, 12.5, 400, t.needs, ask.w);
 
-        let buttons: Vec<(&str, bool, Vec<Action>)> = if self.multi_select.is_some() { vec![] } else if task.checks.state == "failed" && !task.checks.accepted && task.state == "needs-you" {
-            vec![("Review checks", true, vec![Action::Select(key), Action::OpenChecks])]
+        let buttons: Vec<(&str, bool, Vec<Action>)> = if self.multi_select.is_some() { vec![]
         } else if task.state == "setup-needs-you" {
             let first = if task.setup == "failed" { ("Retry", SetupAction::Retry) } else { ("Approve", SetupAction::Approve) };
             vec![(first.0, true, vec![Action::Setup(key, first.1)]), ("Skip setup", false, vec![Action::Setup(key, SetupAction::Skip)])]
@@ -3597,7 +3519,7 @@ impl App {
 
 
     /// The header's pipeline: a segment per stage, its bar filled by where it is, with the stage's
-    /// name and a few words under it. The stage to look at next is lit; Checks and the stages
+    /// name and a few words under it. The stage to look at next is lit; the stages
     /// Review covers open their tabs.
     fn draw_pipeline(&mut self, r: &mut Renderer, t: &Theme, row: Rect, task: &TaskInfo) {
         let stages = stages(task);
@@ -3640,7 +3562,6 @@ impl App {
             let tx = nx + nw + 7.0;
             r.text(tx, r.center(line, UI, 11.0), &s.note, UI, 11.0, 400, note, (line.x + line.w - tx).max(0.0));
             let open = match s.name {
-                "Checks" if self.checkable() => Some(Action::OpenChecks),
                 "Summary" | "Review" | "Merge" if self.reviewable() && !self.shell => Some(Action::OpenReview),
                 _ => None,
             };
@@ -4461,48 +4382,15 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_follows_a_task_from_setup_to_merge() {
+    fn pipeline_moves_from_work_to_review_without_checks() {
         use Phase::*;
-        let mut task = task_in("setup-needs-you", "approval");
-        assert_eq!(phases(&task), [Waiting, Todo, Todo, Todo, Todo, Todo]);
-        assert_eq!(current_stage(&stages(&task)), Some(0));
-
-        task = task_in("running", "ok");
-        assert_eq!(phases(&task), [Done, Active, Todo, Todo, Todo, Todo]);
-        assert_eq!(current_stage(&stages(&task)), Some(1));
-
-        task.state = "done".into();
-        task.checks = proto::ChecksSummary { state: "running".into(), passed: 2, failed: 1, total: 4, ..Default::default() };
-        let s = stages(&task);
-        assert_eq!((s[2].phase, s[2].note.as_str(), s[2].progress), (Active, "2/4 passed", Some(0.75)));
-        assert_eq!(current_stage(&s), Some(2));
-
-        task.checks.state = "passed".into();
+        let mut task = task_in("done", "ok");
         task.summary_state = "ready".into();
-        assert_eq!(phases(&task), [Done, Done, Done, Done, Waiting, Todo]);
-        assert_eq!(stages(&task)[4].note, "ready for you");
-
+        assert_eq!(phases(&task), [Done, Done, Done, Waiting, Todo]);
+        assert_eq!(current_stage(&stages(&task)), Some(3));
         task.shipped = "merged".into();
-        assert_eq!(phases(&task), [Done, Done, Done, Done, Done, Done]);
+        assert_eq!(phases(&task), [Done, Done, Done, Done, Done]);
         assert_eq!(current_stage(&stages(&task)), None);
-    }
-
-    #[test]
-    fn pipeline_marks_waits_failures_and_skips() {
-        use Phase::*;
-        let mut task = task_in("needs-you", "skipped");
-        assert_eq!(phases(&task)[..3], [Skipped, Waiting, Todo]);
-        assert_eq!(current_stage(&stages(&task)), Some(1));
-
-        task.state = "done".into();
-        task.checks = proto::ChecksSummary { state: "failed".into(), failed: 2, total: 3, ..Default::default() };
-        assert_eq!(stages(&task)[2].phase, Failed);
-        assert_eq!(stages(&task)[4].phase, Todo, "nothing to review while checks fail");
-        task.checks.accepted = true;
-        assert_eq!((stages(&task)[2].phase, stages(&task)[4].phase), (Done, Waiting));
-
-        task.shipped = "committed".into();
-        assert_eq!(phases(&task)[4..], [Done, Skipped]);
     }
 
     #[test]
