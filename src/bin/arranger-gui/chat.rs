@@ -614,6 +614,7 @@ impl App {
 
     /// The conversation, what's waiting on you and the message box, in `sec` under the header.
     pub(super) fn draw_chat(&mut self, r: &mut Renderer, t: &Theme, sec: Rect, task: &TaskInfo, ended: bool) {
+        self.ask_bounds = None;
         let key = (task.machine, task.id);
         let focused = self.focus == Focus::Message && self.dialog.is_none();
 
@@ -627,7 +628,7 @@ impl App {
         let w = (sec.w - 2.0 * PAD).min(MAX_W);
         let x = sec.x + PAD;
         if task.asking {
-            bottom = self.draw_ask(r, t, x, w, bottom, task);
+            bottom = self.draw_ask(r, t, x, w, bottom, sec.y, task);
         }
         if task.state == "running" {
             let cy = bottom - 16.0;
@@ -821,7 +822,7 @@ impl App {
 
     /// What the agent waits on, pinned above the message box: Allow/Deny, or a question's options
     /// (or type an answer). Returns the y above it.
-    fn draw_ask(&mut self, r: &mut Renderer, t: &Theme, x: f32, w: f32, bottom: f32, task: &TaskInfo) -> f32 {
+    fn draw_ask(&mut self, r: &mut Renderer, t: &Theme, x: f32, w: f32, bottom: f32, top: f32, task: &TaskInfo) -> f32 {
         let key = (task.machine, task.id);
         let (label, text, options): (&str, String, Vec<String>) = match &task.need {
             // Its detail is the action line ("running cargo test"); asked, it reads "run cargo test".
@@ -835,7 +836,7 @@ impl App {
         };
         let question = matches!(task.need, Some(Event::Question { .. }));
         // The text runs from 90 to the card's right edge, or to the Deny button (at w - 180).
-        let text_w = if question { w - 104.0 } else { w - 280.0 }.max(80.0);
+        let text_w = if question { w - 104.0 } else { w - 36.0 }.max(80.0);
         let lines = wrap(r, &text, UI, 12.5, text_w);
         // A question's options as buttons, as many rows as they take, the hint after the last.
         let hint = "or type an answer below";
@@ -853,12 +854,42 @@ impl App {
         }
         let hint_at = if bx + hint_w > right && bx > left { (left, row + 1) } else { (bx, row) };
         let rows = hint_at.1 + 1;
-        let h = (20.0 + lines.len() as f32 * 19.0).max(42.0) + if question { rows as f32 * 34.0 + 6.0 } else { 0.0 };
+        let h = if question {
+            (20.0 + lines.len() as f32 * 19.0).max(42.0) + rows as f32 * 34.0 + 6.0
+        } else {
+            (54.0 + lines.len() as f32 * 19.0).min(220.0).min((bottom - top - 16.0).max(73.0))
+        };
         let card = Rect::new(x, bottom - h - 12.0, w, h);
         r.frame(card, 0.0, t.needs_bg, t.needs_line);
         r.text(card.x + 14.0, card.y + 10.0, label, UI, 12.0, 600, t.needs, 80.0);
-        for (i, line) in lines.iter().enumerate() {
-            r.text(card.x + 90.0, card.y + 10.0 + i as f32 * 19.0, line, UI, 12.5, 400, t.text, text_w);
+        if question {
+            for (i, line) in lines.iter().enumerate() {
+                r.text(card.x + 90.0, card.y + 10.0 + i as f32 * 19.0, line, UI, 12.5, 400, t.text, text_w);
+            }
+        } else {
+            let identity = (key, task.since, text);
+            if self.ask_identity.as_ref() != Some(&identity) {
+                self.ask_scroll = 0.0;
+                self.ask_identity = Some(identity);
+            }
+            let viewport = Rect::new(card.x + 14.0, card.y + 44.0, w - 28.0, h - 54.0);
+            self.ask_bounds = Some(viewport);
+            let content_h = lines.len() as f32 * 19.0;
+            self.ask_scroll = self.ask_scroll.min((content_h - viewport.h).max(0.0));
+            let old_clip = r.clip();
+            r.set_clip(Some(viewport));
+            for (i, line) in lines.iter().enumerate() {
+                let y = viewport.y + i as f32 * 19.0 - self.ask_scroll;
+                if y + 19.0 > viewport.y && y < viewport.y + viewport.h {
+                    r.text(viewport.x, y, line, UI, 12.5, 400, t.text, text_w);
+                }
+            }
+            r.set_clip(old_clip);
+            if content_h > viewport.h {
+                let thumb_h = (viewport.h * viewport.h / content_h).max(12.0).min(viewport.h);
+                let thumb_y = viewport.y + (viewport.h - thumb_h) * self.ask_scroll / (content_h - viewport.h);
+                r.rect(Rect::new(card.x + w - 7.0, thumb_y, 3.0, thumb_h), 1.5, t.text3);
+            }
         }
         if question {
             // Anything not among the options is typed in the message box.
