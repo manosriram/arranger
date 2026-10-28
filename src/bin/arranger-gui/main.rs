@@ -59,7 +59,7 @@ use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 const TITLE_H: f32 = 44.0;
 const STATUS_H: f32 = 26.0;
 const SIDEBAR_W: f32 = 340.0;
-const HEADER_H: f32 = 80.0;
+const HEADER_H: f32 = 118.0;
 const ROW_H: f32 = 28.0;
 /// A row with its second line (what the agent is doing / did).
 const ROW2_H: f32 = 48.0;
@@ -1145,40 +1145,98 @@ fn status_line(task: &TaskInfo, queue_pos: usize) -> String {
     }
 }
 
-/// The header's stage strip: Setup → Working → Checks → Summary → Review → Merge, each with a
-/// mark for where it is. Summary isn't built yet.
-fn pipeline(t: &Theme, task: &TaskInfo) -> Vec<(String, Rgba)> {
-    let (todo, done) = (("○", t.text3), ("✓", t.done));
+/// Where one pipeline stage is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Phase {
+    Todo,
+    Active,
+    /// Waiting on you.
+    Waiting,
+    Done,
+    Failed,
+    Skipped,
+}
+
+/// One stage of the pipeline: its name, where it is, a few words on it, and how far along it is
+/// (0..1) when that's known.
+#[derive(Debug, PartialEq)]
+struct Stage {
+    name: &'static str,
+    phase: Phase,
+    note: String,
+    progress: Option<f32>,
+}
+
+/// The task's pipeline: Setup → Working → Checks → Summary → Review → Merge.
+fn stages(task: &TaskInfo) -> [Stage; 6] {
+    use Phase::*;
+    let stage = |name, phase, note: &str| Stage { name, phase, note: note.to_string(), progress: None };
+    let setting_up = is_setup(&task.state);
     let setup = match task.setup.as_str() {
-        "ok" => done,
-        "planning" | "running" => ("●", t.work),
-        "approval" => ("■", t.needs),
-        "failed" => ("✗", t.del),
-        _ => ("–", t.text3), // skipped, or from before setup
+        "ok" => stage("Setup", Done, "ready"),
+        "planning" => stage("Setup", Active, "planning"),
+        "running" => stage("Setup", Active, "installing"),
+        "approval" => stage("Setup", Waiting, "approve plan"),
+        "failed" => stage("Setup", Failed, "failed"),
+        _ => stage("Setup", Skipped, "skipped"), // skipped, or from before setup
     };
     let checks_wait = task.checks.state == "approval" && task.state == "needs-you";
-    let working = match (is_setup(&task.state), group(&task.state)) {
-        (true, _) | (_, 2) => todo,
+    let since = if task.since == 0 { String::new() } else { format!(" · {}", ago(task.since)) };
+    let working = match group(&task.state) {
+        _ if setting_up => stage("Working", Todo, ""),
+        2 => stage("Working", Todo, "queued"),
         // It's its checks that wait on you, not the agent.
-        _ if checks_wait => done,
-        (_, 0) => ("■", t.needs),
-        (_, 1) => ("●", t.work),
-        _ => done,
+        _ if checks_wait => stage("Working", Done, "turn done"),
+        0 => stage("Working", Waiting, &format!("needs you{since}")),
+        1 => stage("Working", Active, &format!("working{since}")),
+        3 => stage("Working", Done, "turn done"),
+        _ => stage("Working", Done, "ended"),
     };
-    let checks = match task.checks.state.as_str() {
-        "" => todo,
-        s => checks::state_mark(t, s),
+    let c = &task.checks;
+    let counted = if c.total == 0 { String::new() } else { format!("{}/{}", c.passed, c.total) };
+    let mut checks = match c.state.as_str() {
+        "" => stage("Checks", Todo, ""),
+        "planning" => stage("Checks", Active, "planning"),
+        "approval" => stage("Checks", Waiting, "approve"),
+        "running" => stage("Checks", Active, &if counted.is_empty() { "running".into() } else { format!("{counted} passed") }),
+        "passed" => stage("Checks", Done, &if counted.is_empty() { "passed".into() } else { format!("{counted} passed") }),
+        "failed" if c.accepted => stage("Checks", Done, &format!("{} failed · accepted", c.failed)),
+        "failed" => stage("Checks", Failed, &format!("{} failed", c.failed)),
+        "unverified" => stage("Checks", Waiting, "unverified"),
+        "error" => stage("Checks", Failed, "couldn't plan"),
+        "stale" => stage("Checks", Todo, "outdated"),
+        "skipped" => stage("Checks", Skipped, "nothing to check"),
+        "stopped" => stage("Checks", Skipped, "stopped"),
+        s => stage("Checks", Todo, s),
     };
-    let review = if task.shipped.is_empty() { todo } else { done };
-    let merge = if task.shipped == "merged" { done } else { todo };
-    let stages = [("Setup", setup), ("Working", working), ("Checks", checks), ("Summary", match task.summary_state.as_str() { "ready" => done, "running" => ("●", t.work), "error" => ("✗", t.del), _ => todo }), ("Review", review), ("Merge", merge)];
-    let mut parts = Vec::new();
-    for (i, (name, (mark, color))) in stages.into_iter().enumerate() {
-        let sep = if i == 0 { "" } else { "  " };
-        parts.push((format!("{sep}{name} "), if color == t.text3 { t.text3 } else { t.text }));
-        parts.push((mark.to_string(), color));
+    if c.state == "running" && c.total > 0 {
+        checks.progress = Some((c.passed + c.failed) as f32 / c.total as f32);
     }
-    parts
+    let summary = match task.summary_state.as_str() {
+        "ready" => stage("Summary", Done, "written"),
+        "running" => stage("Summary", Active, "writing"),
+        "error" => stage("Summary", Failed, "failed"),
+        "stale" => stage("Summary", Todo, "outdated"),
+        _ => stage("Summary", Todo, ""),
+    };
+    let checked = matches!(checks.phase, Done | Skipped);
+    let review = match task.shipped.as_str() {
+        "" if group(&task.state) == 3 && checked => stage("Review", Waiting, "ready for you"),
+        "" => stage("Review", Todo, ""),
+        _ => stage("Review", Done, "approved"),
+    };
+    let merge = match task.shipped.as_str() {
+        "merged" => stage("Merge", Done, "merged"),
+        "PR" => stage("Merge", Done, "PR opened"),
+        "committed" => stage("Merge", Skipped, "committed only"),
+        _ => stage("Merge", Todo, ""),
+    };
+    [setup, working, checks, summary, review, merge]
+}
+
+/// The stage to call out: the first that isn't finished, or none once all are.
+fn current_stage(stages: &[Stage]) -> Option<usize> {
+    stages.iter().position(|s| matches!(s.phase, Phase::Waiting | Phase::Failed | Phase::Active)).or_else(|| stages.iter().position(|s| s.phase == Phase::Todo))
 }
 
 /// The header pill: why the task is where it is.
@@ -3345,7 +3403,6 @@ impl App {
             ]
         } else {
             let mut details = vec![
-                ("Pipeline", pipeline(t, &task)),
                 ("Agent", vec![(if task.headless { format!("{kind} · headless") } else { kind.to_string() }, accent(kind))]),
                 ("Branch", vec![(branch, t.text)]),
                 ("Machine", vec![(host.name().to_string(), t.text)]),
@@ -3371,6 +3428,8 @@ impl App {
             }
             dx += w + 32.0;
         }
+
+        self.draw_pipeline(r, t, Rect::new(area.x + 20.0, area.y + 84.0, area.w - 36.0, HEADER_H - 92.0), &task);
 
         // The agent's own terminal, sized to the pane; once the agent has ended, a bar to bring it back below.
         let ended = group(&task.state) == 4 && !self.shell;
@@ -3476,6 +3535,62 @@ impl App {
         }
     }
 
+
+    /// The header's pipeline: a segment per stage, its bar filled by where it is, with the stage's
+    /// name and a few words under it. The stage to look at next is lit; Checks and the stages
+    /// Review covers open their tabs.
+    fn draw_pipeline(&mut self, r: &mut Renderer, t: &Theme, row: Rect, task: &TaskInfo) {
+        let stages = stages(task);
+        let current = current_stage(&stages);
+        let gap = 6.0;
+        let w = (row.w - gap * (stages.len() - 1) as f32) / stages.len() as f32;
+        for (i, s) in stages.iter().enumerate() {
+            let seg = Rect::new(row.x + i as f32 * (w + gap), row.y, w, row.h);
+            let (mark, color) = match s.phase {
+                Phase::Done => ("✓", t.done),
+                Phase::Active => ("●", t.work),
+                Phase::Waiting => ("■", t.needs),
+                Phase::Failed => ("✗", t.del),
+                Phase::Skipped => ("–", t.text3),
+                Phase::Todo => ("○", t.text3),
+            };
+            let lit = current == Some(i);
+            if lit {
+                r.rect(Rect::new(seg.x, seg.y + 3.0, seg.w, seg.h - 3.0), 0.0, alpha(color, if t.dark { 0x14 } else { 0x10 }));
+            }
+            let bar = Rect::new(seg.x, seg.y, seg.w, 3.0);
+            match s.phase {
+                Phase::Todo => r.rect(bar, 0.0, t.border2),
+                Phase::Skipped => r.rect(bar, 0.0, alpha(t.text3, 0x40)),
+                _ => {
+                    let fill = s.progress.unwrap_or(1.0).clamp(0.0, 1.0);
+                    if fill < 1.0 {
+                        r.rect(bar, 0.0, alpha(color, 0x40));
+                    }
+                    r.rect(Rect::new(bar.x, bar.y, bar.w * fill, bar.h), 0.0, color);
+                }
+            }
+            let reached = !matches!(s.phase, Phase::Todo | Phase::Skipped);
+            let line = Rect::new(seg.x + 8.0, seg.y + 3.0, seg.w - 12.0, seg.h - 3.0);
+            let y = r.center(line, UI, 12.0);
+            let mw = r.text(line.x, r.center(line, UI, 11.0), mark, UI, 11.0, 600, color, 16.0);
+            let nx = line.x + mw + 6.0;
+            let nw = r.text(nx, y, s.name, UI, 12.0, if lit { 600 } else { 500 }, if reached || lit { t.text } else { t.text3 }, line.x + line.w - nx);
+            let note = if lit && matches!(s.phase, Phase::Waiting | Phase::Failed) { color } else { t.text3 };
+            let tx = nx + nw + 7.0;
+            r.text(tx, r.center(line, UI, 11.0), &s.note, UI, 11.0, 400, note, (line.x + line.w - tx).max(0.0));
+            let open = match s.name {
+                "Checks" if self.checkable() => Some(Action::OpenChecks),
+                "Summary" | "Review" | "Merge" if self.reviewable() && !self.shell => Some(Action::OpenReview),
+                _ => None,
+            };
+            if let Some(action) = open
+                && self.hit(r, seg)
+            {
+                self.actions.push(action);
+            }
+        }
+    }
 
     fn draw_status(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
         let bar = Rect::new(0.0, h - STATUS_H, w, STATUS_H);
@@ -4232,6 +4347,66 @@ mod tests {
         assert_ne!(loaded.bookmarks[0], loaded.bookmarks[1]);
         assert_eq!(loaded.theme, "Paper");
         assert!(loaded.vim);
+    }
+
+    fn task_in(state: &str, setup: &str) -> TaskInfo {
+        serde_json::from_value(serde_json::json!({
+            "id": 1, "agent": "claude", "branch": "b", "worktree": "/w", "state": state, "action": "",
+            "files": [], "title": "", "created": 0, "need": null, "asking": false, "since": 0,
+            "summary": "", "shipped": "", "updated": 0, "setup": setup, "summary_state": "",
+        }))
+        .unwrap()
+    }
+
+    fn phases(task: &TaskInfo) -> Vec<Phase> {
+        stages(task).iter().map(|s| s.phase).collect()
+    }
+
+    #[test]
+    fn pipeline_follows_a_task_from_setup_to_merge() {
+        use Phase::*;
+        let mut task = task_in("setup-needs-you", "approval");
+        assert_eq!(phases(&task), [Waiting, Todo, Todo, Todo, Todo, Todo]);
+        assert_eq!(current_stage(&stages(&task)), Some(0));
+
+        task = task_in("running", "ok");
+        assert_eq!(phases(&task), [Done, Active, Todo, Todo, Todo, Todo]);
+        assert_eq!(current_stage(&stages(&task)), Some(1));
+
+        task.state = "done".into();
+        task.checks = proto::ChecksSummary { state: "running".into(), passed: 2, failed: 1, total: 4, ..Default::default() };
+        let s = stages(&task);
+        assert_eq!((s[2].phase, s[2].note.as_str(), s[2].progress), (Active, "2/4 passed", Some(0.75)));
+        assert_eq!(current_stage(&s), Some(2));
+
+        task.checks.state = "passed".into();
+        task.summary_state = "ready".into();
+        assert_eq!(phases(&task), [Done, Done, Done, Done, Waiting, Todo]);
+        assert_eq!(stages(&task)[4].note, "ready for you");
+
+        task.shipped = "merged".into();
+        assert_eq!(phases(&task), [Done, Done, Done, Done, Done, Done]);
+        assert_eq!(current_stage(&stages(&task)), None);
+    }
+
+    #[test]
+    fn pipeline_marks_waits_failures_and_skips() {
+        use Phase::*;
+        let mut task = task_in("needs-you", "skipped");
+        task.checks.state = "approval".into();
+        // Its checks wait on you, not the agent.
+        assert_eq!(phases(&task)[..3], [Skipped, Done, Waiting]);
+        assert_eq!(current_stage(&stages(&task)), Some(2));
+
+        task.state = "done".into();
+        task.checks = proto::ChecksSummary { state: "failed".into(), failed: 2, total: 3, ..Default::default() };
+        assert_eq!(stages(&task)[2].phase, Failed);
+        assert_eq!(stages(&task)[4].phase, Todo, "nothing to review while checks fail");
+        task.checks.accepted = true;
+        assert_eq!((stages(&task)[2].phase, stages(&task)[4].phase), (Done, Waiting));
+
+        task.shipped = "committed".into();
+        assert_eq!(phases(&task)[4..], [Done, Skipped]);
     }
 
     #[test]
