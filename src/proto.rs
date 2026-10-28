@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub const MAX_FRAME: usize = 16 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 26;
+pub const VERSION: u32 = 27;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -241,6 +241,8 @@ pub enum Reply {
     /// Lines `start..start + lines.len()` of `total` so far; `done`: the check has ended and
     /// all its output is in.
     Console { check: u64, start: usize, total: usize, done: bool, lines: Vec<ConsoleLine> },
+    /// Pushed to watchers after `Tasks` when an agent reports its plan usage, and on Watch.
+    Limits(Vec<PlanLimit>),
 }
 
 /// One entry in a headless task's conversation.
@@ -310,6 +312,11 @@ pub struct TaskInfo {
     #[serde(default)]
     pub checks: ChecksSummary,
     pub summary_state: String,
+    /// Tokens its agent has used so far, and what that cost, if the agent says.
+    #[serde(default)]
+    pub tokens: u64,
+    #[serde(default)]
+    pub cost: Option<f64>,
     /// Which machine the GUI got this task from (an index into its machine list); not sent.
     #[serde(skip)]
     pub machine: usize,
@@ -406,6 +413,25 @@ pub enum Event {
     Error { message: String },
     /// Session totals so far.
     Usage { tokens: u64, cost: Option<f64> },
+    /// How much of a plan's usage window is spent, as the agent reported it.
+    Limit(PlanLimit),
+}
+
+/// One usage window of an agent's subscription (claude's 5-hour session, codex's week...).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct PlanLimit {
+    /// The agent kind: "claude" or "codex".
+    pub agent: String,
+    /// "5h", "week", "week (opus)"...; with `agent`, what a newer report replaces.
+    pub window: String,
+    /// Percent spent, if the agent says.
+    pub used: Option<f64>,
+    /// Unix seconds when it resets; 0 if unknown.
+    pub resets: u64,
+    /// "allowed", "allowed_warning" or "rejected" (claude), else "".
+    pub status: String,
+    /// Unix seconds when the daemon heard it.
+    pub seen: u64,
 }
 
 impl Event {
@@ -433,6 +459,7 @@ impl Event {
             Event::Error { message } => format!("error: {message}"),
             Event::Usage { tokens, cost: Some(cost) } => format!("{tokens} tokens, ${cost:.4}"),
             Event::Usage { tokens, cost: None } => format!("{tokens} tokens"),
+            Event::Limit(l) => format!("{} {}: {}", l.agent, l.window, l.used.map_or(l.status.clone(), |u| format!("{u:.0}% used"))),
         }
     }
 }

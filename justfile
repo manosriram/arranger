@@ -16,6 +16,11 @@ app:
 screenshot:
     scripts/demo.sh
 
+# The plan usage chip and popover, rendered offscreen and checked by pixel (needs a display)
+check-usage-ui:
+    cargo build
+    python3 -I scripts/check-usage-ui.py
+
 # Before a release: do headless claude and codex still send what the interactive ones do?
 # Needs both logged in; costs one short request per variant.
 parity:

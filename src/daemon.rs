@@ -6,7 +6,7 @@ use crate::checks;
 use std::os::unix::process::CommandExt;
 use crate::console::Console;
 use crate::headless::{self, Agent};
-use crate::proto::{self, Event, Reply, Request, Ship, TaskInfo};
+use crate::proto::{self, Event, PlanLimit, Reply, Request, Ship, TaskInfo};
 use crate::pty::{self, Pty};
 use crate::review;
 use crate::security;
@@ -166,6 +166,10 @@ struct Daemon {
     auto_due: HashMap<u64, Instant>,
     summaries: HashMap<u64, SummaryRun>,
     merges: HashMap<u64, MergePending>,
+    /// What the agents last said about their plans' usage, one per (agent, window).
+    limits: Vec<PlanLimit>,
+    /// `limits` changed since watchers last heard.
+    limits_dirty: bool,
 }
 
 struct SummaryRun {
@@ -290,6 +294,8 @@ pub fn run() -> io::Result<()> {
         "setup_detail TEXT NOT NULL DEFAULT ''",
         "start_ask TEXT NOT NULL DEFAULT ''",
         "setup_key TEXT NOT NULL DEFAULT ''",
+        "tokens INTEGER NOT NULL DEFAULT 0",
+        "cost REAL",
     ] {
         let _ = db.execute(&format!("ALTER TABLE tasks ADD COLUMN {col}"), []);
     }
@@ -369,7 +375,11 @@ pub fn run() -> io::Result<()> {
         auto_due: HashMap::new(),
         summaries: HashMap::new(),
         merges: HashMap::new(),
+        limits: Vec::new(),
+        limits_dirty: false,
     };
+    d.limits = d.db.query_row("SELECT value FROM settings WHERE key = 'plan_limits'", [], |r| r.get::<_, String>(0)).ok()
+        .and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
     d.prune_check_artifacts();
     d.start_queued();
 
@@ -858,7 +868,10 @@ impl Daemon {
                     c.watching = true;
                 }
                 match self.list(false) {
-                    Ok(tasks) => Reply::Tasks(tasks),
+                    Ok(tasks) => {
+                        self.send(t, &proto::reply_frame(&Reply::Tasks(tasks)));
+                        Reply::Limits(self.limits.clone())
+                    }
                     Err(e) => Reply::Error(e),
                 }
             }
@@ -1161,6 +1174,13 @@ impl Daemon {
 
     /// Stores an event and updates the task's derived state and action line.
     fn record(&mut self, id: u64, event: Event) {
+        // Not this task's doing: the whole plan's.
+        if let Event::Limit(limit) = event {
+            if self.tasks.contains_key(&id) {
+                self.set_limit(limit);
+            }
+            return;
+        }
         // Another turn: checks of the last one no longer judge the work, and mustn't run under it.
         if matches!(event, Event::Prompt { .. }) && self.tasks.contains_key(&id) {
             self.cancel_summary(id);
@@ -1187,7 +1207,11 @@ impl Daemon {
                 let _ = self.db.execute("UPDATE tasks SET summary = ?1 WHERE id = ?2", params![line, id]);
                 return;
             }
-            Event::Usage { .. } => return,
+            Event::Usage { tokens, cost } => {
+                let _ = self.db.execute("UPDATE tasks SET tokens = ?1, cost = ?2 WHERE id = ?3", params![tokens, cost, id]);
+                return;
+            }
+            Event::Limit(_) => return,
             // Agents with hooks also ping the terminal when idle; that's not a new ask.
             Event::Attention { .. } if task.activity == Activity::Done => return,
             Event::PermissionRequest { .. } | Event::Question { .. } | Event::Attention { .. } | Event::Error { .. } => {
@@ -1341,9 +1365,26 @@ impl Daemon {
         }
         let Ok(tasks) = self.list(false) else { return };
         let frame = proto::reply_frame(&Reply::Tasks(tasks));
+        let limits = std::mem::take(&mut self.limits_dirty).then(|| proto::reply_frame(&Reply::Limits(self.limits.clone())));
         for t in watchers {
             self.send(t, &frame);
+            if let Some(limits) = &limits {
+                self.send(t, limits);
+            }
         }
+    }
+
+    /// Keeps an agent's newest word on one of its plan's windows, for every watcher and restart.
+    fn set_limit(&mut self, mut limit: PlanLimit) {
+        limit.seen = now();
+        match self.limits.iter_mut().find(|l| l.agent == limit.agent && l.window == limit.window) {
+            Some(l) => *l = limit,
+            None => self.limits.push(limit),
+        }
+        let json = serde_json::to_string(&self.limits).unwrap_or_default();
+        let _ = self.db.execute("INSERT INTO settings (key, value) VALUES ('plan_limits', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [json]);
+        self.limits_dirty = true;
+        self.dirty = true;
     }
 
     /// A human answered (approve/deny or typing): back to running unless more asks wait.
@@ -2789,7 +2830,7 @@ impl Daemon {
         let mut stmt =
             self.db.prepare(
                 "SELECT id, agent, branch, worktree, state, title, created, summary, shipped,
-                 MAX(created, updated, COALESCE((SELECT MAX(ts) FROM events WHERE task = tasks.id) / 1000, 0)), model, cloned_from, headless, effort, mode, setup, setup_detail
+                 MAX(created, updated, COALESCE((SELECT MAX(ts) FROM events WHERE task = tasks.id) / 1000, 0)), model, cloned_from, headless, effort, mode, setup, setup_detail, tokens, cost
                  FROM tasks ORDER BY id",
             ).map_err(e2s)?;
         let rows = stmt.query_map([], |r| {
@@ -2818,6 +2859,8 @@ impl Daemon {
                 setup_detail: r.get(16)?,
                 checks: proto::ChecksSummary::default(),
                 summary_state: String::new(),
+                tokens: r.get(17)?,
+                cost: r.get(18)?,
                 machine: 0,
             })
         });

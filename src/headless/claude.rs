@@ -209,6 +209,7 @@ impl Transport for Claude {
                 }
             }
             "control_cancel_request" => self.c.asks.retain(|a| a.id != v["request_id"]),
+            "rate_limit_event" => events.extend(adapter::claude_limit(&v["rate_limit_info"])),
             "assistant" if subagent => {}
             "assistant" if v["isApiErrorMessage"] == true || v.get("error").is_some_and(|e| !e.is_null()) => {
                 let text = texts(&v["message"]["content"]);
@@ -319,6 +320,24 @@ mod tests {
         assert!(matches!(events[2], Event::Usage { tokens: 5, cost: Some(_) }));
         assert_eq!(events[3], Event::Prompt { text: "second".into() });
         assert_eq!(sent(&mut c)[0]["message"]["content"], "second");
+    }
+
+    #[test]
+    fn rate_limit_events_report_plan_usage() {
+        use crate::proto::PlanLimit;
+        let mut c = started();
+        c.prompt("go".into());
+        sent(&mut c);
+        let info = json!({"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.83,"resetsAt":1800000000u64});
+        let events = receive(&mut c, json!({"type":"rate_limit_event","rate_limit_info":info,"session_id":"s-1"}));
+        let want = PlanLimit { agent: "claude".into(), window: "week".into(), used: Some(83.0), resets: 1800000000, status: "allowed_warning".into(), seen: 0 };
+        assert!(matches!(&events[..], [Event::Limit(l)] if l.window == want.window && l.status == want.status && l.resets == want.resets
+            && (l.used.unwrap() - 83.0).abs() < 1e-9), "{events:?}");
+        // Refused with no number: spent; and a turn still finishes as usual afterwards.
+        let events = receive(&mut c, json!({"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":5}}));
+        assert!(matches!(&events[..], [Event::Limit(l)] if l.window == "5h" && l.used == Some(100.0) && l.status == "rejected"), "{events:?}");
+        assert!(receive(&mut c, json!({"type":"rate_limit_event","rate_limit_info":{}})).is_empty(), "nothing said, nothing reported");
+        assert!(receive(&mut c, result()).contains(&Event::TurnDone));
     }
 
     #[test]

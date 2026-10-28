@@ -17,7 +17,7 @@ use arranger::adapter;
 use arranger::headless;
 use arranger::client::{connect, connect_at, request_at};
 use arranger::machine::{self, Machine};
-use arranger::proto::{self, Event, Reply, Request, SetupAction, Ship, TaskInfo};
+use arranger::proto::{self, Event, PlanLimit, Reply, Request, SetupAction, Ship, TaskInfo};
 use arranger::screen::Screen;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
@@ -65,8 +65,7 @@ const ROW_H: f32 = 28.0;
 const ROW2_H: f32 = 48.0;
 /// A one-line row, when the sidebar is dense.
 const DENSE_ROW_H: f32 = 32.0;
-const NEEDS_CARD_H: f32 = 100.0;
-const GROUP_H: f32 = 24.0;
+const NEEDS_CARD_H: f32 = 92.0;
 const TERM_SIZE: f32 = 12.0;
 const LINE_H: f32 = 18.0;
 
@@ -75,6 +74,8 @@ pub type TaskKey = (usize, u64);
 
 pub enum Msg {
     Tasks(usize, Vec<TaskInfo>),
+    /// A machine's daemon's latest word on the agents' plan usage.
+    Limits(usize, Vec<PlanLimit>),
     Output(u64, Vec<u8>),
     Exited(u64),
     /// A finished task's recorded PTY output.
@@ -106,6 +107,8 @@ struct Host {
     cfg: Option<Machine>,
     link: Link,
     tasks: Vec<TaskInfo>,
+    /// Plan usage as this machine's agents last reported it.
+    limits: Vec<PlanLimit>,
     /// Removed this session; kept so other hosts' indices stay valid.
     removed: bool,
     /// Wakes the link thread to retry now; dropping it ends the thread.
@@ -283,8 +286,6 @@ enum Action {
     Review(ReviewAction),
     /// Show (true) or leave the Terminal tab: a shell in the selected task's worktree.
     Shell(bool),
-    /// Folds or unfolds a sidebar section ("needs" or "host:<i>").
-    Toggle(String),
     PickHost(usize),
     OpenAddHost,
     TestHost,
@@ -293,6 +294,8 @@ enum Action {
     RemoveHost(usize),
     PickTheme(usize),
     ToggleMenu,
+    ToggleBookmarks,
+    ToggleUsage,
     ToggleVim,
     ToggleDing,
     /// Opens the popup of every task on this machine, or closes it (None).
@@ -352,9 +355,12 @@ struct App {
     /// Vim keys: a normal mode for moving and acting without the mouse.
     vim: bool,
     ding_muted: bool,
-    /// The scheme menu is open; `scheme_btn` is the title-bar button that opens it.
-    menu: bool,
+    /// The title- or status-bar popup that's open, and the buttons that open them: Settings
+    /// (`scheme_btn`), Bookmarks, and the usage chip.
+    popup: Popup,
     scheme_btn: Rect,
+    bookmarks_btn: Rect,
+    usage_btn: Rect,
     /// The vim keybinding sheet.
     help: bool,
     /// `g` was pressed and waits for a second `g`.
@@ -430,8 +436,6 @@ struct App {
     click: Option<(f32, f32)>,
     actions: Vec<Action>,
     scroll: f32,
-    /// Sidebar sections folded to their header.
-    collapsed: std::collections::HashSet<String>,
     /// The selection's fixed end in the focused field (the caret is the moving end), from ⇧-moves,
     /// a mouse drag or ⌘A. The next edit replaces the text between them.
     anchor: Option<(Focus, usize)>,
@@ -486,8 +490,13 @@ fn run() -> io::Result<()> {
     watch.write_all(&proto::frame(&Request::Watch))?;
     let p = proxy.clone();
     thread::spawn(move || {
-        while let Ok(Reply::Tasks(tasks)) = proto::read_msg(&mut watch) {
-            if p.send_event(Msg::Tasks(0, tasks)).is_err() {
+        loop {
+            let msg = match proto::read_msg(&mut watch) {
+                Ok(Reply::Tasks(tasks)) => Msg::Tasks(0, tasks),
+                Ok(Reply::Limits(limits)) => Msg::Limits(0, limits),
+                _ => break,
+            };
+            if p.send_event(msg).is_err() {
                 return;
             }
         }
@@ -509,8 +518,10 @@ fn run() -> io::Result<()> {
         theme: 0,
         vim: false,
         ding_muted: false,
-        menu: false,
+        popup: Popup::None,
         scheme_btn: Rect::new(0.0, 0.0, 0.0, 0.0),
+        bookmarks_btn: Rect::default(),
+        usage_btn: Rect::default(),
         help: false,
         confirm_delete: None,
         multi_select: None,
@@ -556,7 +567,6 @@ fn run() -> io::Result<()> {
         click: None,
         actions: Vec::new(),
         scroll: 0.0,
-        collapsed: Default::default(),
         anchor: None,
         text_drag: None,
         chat_selection: None,
@@ -737,6 +747,7 @@ impl ApplicationHandler<Msg> for App {
                     d.completion.files = paths;
                 }
             }
+            Msg::Limits(m, limits) => set_limits(&mut self.hosts, m, limits),
             Msg::Tasks(m, tasks) => {
                 self.user_event_tasks(m, tasks);
                 if self.selected.is_none_or(|k| self.task(k).is_none()) {
@@ -771,6 +782,15 @@ impl ApplicationHandler<Msg> for App {
                     }
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_TERMINAL").is_some() {
                         self.shell = true;
+                    }
+                    // `ARRANGER_MENU=settings|bookmarks|usage` snapshots that title- or status-bar popup open.
+                    if std::env::var_os("ARRANGER_SNAPSHOT").is_some() {
+                        match std::env::var("ARRANGER_MENU").as_deref() {
+                            Ok("settings") => self.popup = Popup::Settings,
+                            Ok("bookmarks") => self.popup = Popup::Bookmarks,
+                            Ok("usage") => self.popup = Popup::Usage,
+                            _ => {}
+                        }
                     }
                     // `ARRANGER_POPUP` snapshots this machine's "See all" popup instead,
                     // `ARRANGER_NEWTASK` the new-task box, and `ARRANGER_CLONE` it cloning the task.
@@ -957,21 +977,49 @@ impl ApplicationHandler<Msg> for App {
 
 // ---------- state ----------
 
-/// A sidebar section and its rows. `host` None is "Needs you", which spans machines.
+/// A sidebar section and its rows: "needs" (cards, every machine), "tasks" (the rest, every
+/// machine), and one per unreachable machine (`host`), with no rows.
 struct Section<'a> {
     key: String,
     host: Option<usize>,
     tasks: Vec<&'a TaskInfo>,
-    /// Tasks whose agent has ended; left out of `tasks` (the machine popup lists them) unless filtering or selected.
-    ended: usize,
-    /// Rows past `DENSE_CAP` left out while the sidebar is dense; "+N more" opens the machine popup.
-    more: usize,
 }
 
-/// Past this many running or queued agents the sidebar goes dense: one line per row, and each
-/// machine lists `DENSE_CAP` of them (plus the selected one) with the rest behind "+N more".
+/// The sidebar's sections (see `App::sections`) for machines `hosts`, through `filter`, keeping the
+/// `selected` task even when it has ended.
+fn sidebar_sections<'a>(hosts: &'a [Host], filter: &str, selected: Option<TaskKey>) -> Vec<Section<'a>> {
+    let f = filter.to_lowercase();
+    let shown = |t: &&TaskInfo| {
+        t.shipped != "merged"
+            && (f.is_empty() || format!("{} {} {} {}", title(t), t.agent, t.branch, hosts[t.machine].name()).to_lowercase().contains(&f))
+            && (!f.is_empty() || group(&t.state) != 4 || selected == Some((t.machine, t.id)))
+    };
+    let sort = |v: &mut Vec<&TaskInfo>| v.sort_by_key(|t| (group(&t.state), std::cmp::Reverse(last_event(t)), std::cmp::Reverse(t.id)));
+    let all = hosts.iter().filter(|h| !h.removed).flat_map(|h| &h.tasks);
+    let (mut needs, mut rest): (Vec<&TaskInfo>, Vec<&TaskInfo>) = all.filter(shown).partition(|t| group(&t.state) == 0);
+    sort(&mut needs);
+    sort(&mut rest);
+    let mut out = vec![Section { key: "needs".into(), host: None, tasks: needs }, Section { key: "tasks".into(), host: None, tasks: rest }];
+    for (i, _) in hosts.iter().enumerate().filter(|(_, h)| !h.removed && matches!(h.link, Link::Down(_))) {
+        out.push(Section { key: format!("host:{i}"), host: Some(i), tasks: Vec::new() });
+    }
+    out
+}
+
+/// How many of a machine's tasks the sidebar leaves out: ended or merged.
+fn hidden_tasks(tasks: &[TaskInfo]) -> usize {
+    tasks.iter().filter(|t| t.shipped == "merged" || group(&t.state) == 4).count()
+}
+
+/// The Bookmarks list's rows: the saved tasks, most recently active first.
+fn bookmark_rows<'a>(tasks: impl Iterator<Item = &'a TaskInfo>, saved: impl Fn(&TaskInfo) -> bool) -> Vec<&'a TaskInfo> {
+    let mut v: Vec<&TaskInfo> = tasks.filter(|t| saved(t)).collect();
+    v.sort_by_key(|t| (std::cmp::Reverse(last_event(t)), std::cmp::Reverse(t.id)));
+    v
+}
+
+/// Past this many running or queued agents the sidebar goes dense: one line per row.
 const DENSE_AT: usize = 6;
-const DENSE_CAP: usize = 4;
 
 /// Automatic reconnect attempts after a machine's link fails; then it waits for Reconnect.
 const AUTO_RETRIES: u32 = 3;
@@ -1005,6 +1053,11 @@ fn keep_linked(m: usize, cfg: Machine, p: EventLoopProxy<Msg>, retry: mpsc::Rece
                                     // before that still spends a retry.
                                     (tries, wait) = (0, 2);
                                     if p.send_event(Msg::Tasks(m, tasks)).is_err() {
+                                        return;
+                                    }
+                                }
+                                Ok(Reply::Limits(limits)) => {
+                                    if p.send_event(Msg::Limits(m, limits)).is_err() {
                                         return;
                                     }
                                 }
@@ -1069,17 +1122,6 @@ fn group(state: &str) -> usize {
     }
 }
 
-/// A machine's header line: "1 needs you · 2 running · 1 done", or "no tasks".
-fn host_summary(tasks: &[TaskInfo]) -> String {
-    let mut counts = [0; 5];
-    for t in tasks {
-        counts[group(&t.state)] += 1;
-    }
-    let names = ["needs you", "running", "queued", "done"];
-    let parts: Vec<String> = counts.iter().zip(names).filter(|(n, _)| **n > 0).map(|(n, s)| format!("{n} {s}")).collect();
-    if parts.is_empty() { "no tasks".into() } else { parts.join(" · ") }
-}
-
 fn state_color(t: &Theme, state: &str) -> Rgba {
     [t.needs, t.work, t.faint, t.done, t.faint][group(state)]
 }
@@ -1094,6 +1136,113 @@ fn age(task: &TaskInfo) -> String {
         return "—".into();
     }
     ago(task.created)
+}
+
+/// The title- or status-bar popup that's open; opening one closes the others.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Popup {
+    None,
+    Settings,
+    Bookmarks,
+    Usage,
+}
+
+impl Popup {
+    /// What a key does to it: Esc closes an open popup and is used up (Some); otherwise the key
+    /// goes on to the rest of the window (None).
+    fn key(self, key: &Key) -> Option<Popup> {
+        (self != Popup::None && *key == Key::Named(NamedKey::Escape)).then_some(Popup::None)
+    }
+
+    /// Its button was clicked: open it, or close it if it's the one open.
+    fn toggle(self, which: Popup) -> Popup {
+        if self == which { Popup::None } else { which }
+    }
+}
+
+/// A click closes a popup when it lands neither on the popup nor on the button that opened it
+/// (the button toggles it itself).
+fn clicked_outside(click: Option<(f32, f32)>, popup: Rect, button: Rect) -> bool {
+    click.is_some_and(|p| !popup.contains(p) && !button.contains(p))
+}
+
+/// Machine `m`'s daemon reported its agents' plan usage.
+fn set_limits(hosts: &mut [Host], m: usize, limits: Vec<PlanLimit>) {
+    if let Some(h) = hosts.get_mut(m) {
+        h.limits = limits;
+    }
+}
+
+/// Every machine's plan usage merged: the newest report per agent and window, the hour windows
+/// first, then the weeks.
+fn merged_limits(hosts: &[Host]) -> Vec<PlanLimit> {
+    let mut out: Vec<PlanLimit> = Vec::new();
+    for l in hosts.iter().filter(|h| !h.removed).flat_map(|h| &h.limits) {
+        match out.iter_mut().find(|o| o.agent == l.agent && o.window == l.window) {
+            Some(o) if o.seen >= l.seen => {}
+            Some(o) => *o = l.clone(),
+            None => out.push(l.clone()),
+        }
+    }
+    out.sort_by_key(|l| (!l.window.ends_with('h'), !l.window.starts_with("week"), l.window.clone()));
+    out
+}
+
+/// Rows the usage popover lists: per agent, its name and each window it reported (or one line
+/// saying there's nothing yet).
+fn usage_rows(limits: &[PlanLimit]) -> usize {
+    USAGE_AGENTS.iter().map(|a| 1 + limits.iter().filter(|l| l.agent == *a).count().max(1)).sum()
+}
+
+/// Agents whose plan usage the status bar shows.
+const USAGE_AGENTS: [&str; 2] = ["claude", "codex"];
+
+/// Red once the window is spent, amber near it, else the working colour.
+fn limit_color(t: &Theme, l: &PlanLimit) -> Rgba {
+    let used = l.used.unwrap_or(0.0);
+    if l.status == "rejected" || used >= 100.0 {
+        t.del
+    } else if l.status == "allowed_warning" || used >= 80.0 {
+        t.needs
+    } else {
+        t.work
+    }
+}
+
+/// "42%", or, when the agent gives no number, how it stands.
+fn limit_label(l: &PlanLimit) -> String {
+    match (l.used, l.status.as_str()) {
+        (Some(u), _) => format!("{u:.0}%"),
+        (None, "rejected") => "limited".into(),
+        (None, "allowed_warning") => "near".into(),
+        _ => "ok".into(),
+    }
+}
+
+/// The window an agent is closest to spending, for the status-bar chip.
+fn tightest<'a>(limits: &'a [PlanLimit], agent: &str) -> Option<&'a PlanLimit> {
+    let rank = |l: &PlanLimit| (l.status == "rejected", l.used.unwrap_or(0.0), l.status == "allowed_warning");
+    limits.iter().filter(|l| l.agent == agent).max_by(|a, b| rank(a).partial_cmp(&rank(b)).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+/// "950", "182k", "1.2M".
+fn short_count(n: u64) -> String {
+    match n {
+        0..1000 => n.to_string(),
+        1000..999_500 => format!("{}k", (n + 500) / 1000),
+        _ => format!("{:.1}M", n as f64 / 1e6),
+    }
+}
+
+/// "38m", "2h 14m", "3d 4h" until unix second `t`.
+fn until(t: u64) -> String {
+    let s = t.saturating_sub(unix_secs() as u64);
+    match s {
+        0..60 => "now".into(),
+        60..3600 => format!("{}m", s / 60),
+        3600..86400 => format!("{}h {}m", s / 3600, s % 3600 / 60),
+        _ => format!("{}d {}h", s / 86400, s % 86400 / 3600),
+    }
 }
 
 /// "40s", "6m", "2h", "3d" since unix second `t`.
@@ -1490,49 +1639,36 @@ impl App {
         self.hosts.iter().filter(|h| !h.removed).flat_map(|h| &h.tasks)
     }
 
+    /// Every machine's plan usage merged: the newest report per agent and window, the 5-hour
+    /// windows first.
+    fn plan_limits(&self) -> Vec<PlanLimit> {
+        merged_limits(&self.hosts)
+    }
+
+    /// The popup over the workspace that's open, if any; clicks inside it don't reach below.
+    fn popover(&self, w: f32, h: f32) -> Option<Rect> {
+        match self.popup {
+            Popup::Settings => Some(self.menu_rect()),
+            Popup::Bookmarks => Some(self.bookmarks_rect()),
+            Popup::Usage if !self.welcome => Some(self.usage_rect(w, h)),
+            _ => None,
+        }
+    }
+
     fn sock(&self, m: usize) -> Option<PathBuf> {
         self.hosts.get(m).and_then(Host::sock)
     }
 
-    /// Sidebar sections: "Needs you" across every machine, then each machine's other tasks,
-    /// most recently active first within each state.
+    /// Sidebar sections: what needs you, then everything else, across every machine, most
+    /// recently active first within each state; ended tasks only while filtering or selected
+    /// (Settings' machine rows and the list's foot open the rest). Unreachable machines last.
     fn sections(&self) -> Vec<Section<'_>> {
-        let f = self.filter.to_lowercase();
-        let shown = |t: &&TaskInfo| {
-            t.shipped != "merged"
-                && (f.is_empty() || format!("{} {} {} {}", title(t), t.agent, t.branch, self.hosts[t.machine].name()).to_lowercase().contains(&f))
-        };
-        let sort = |v: &mut Vec<&TaskInfo>| v.sort_by_key(|t| (group(&t.state), std::cmp::Reverse(last_event(t)), std::cmp::Reverse(t.id)));
-        let mut needs: Vec<&TaskInfo> = self.all_tasks().filter(shown).filter(|t| group(&t.state) == 0).collect();
-        sort(&mut needs);
-        let mut out = vec![Section { key: "needs".into(), host: None, tasks: needs, ended: 0, more: 0 }];
-        let mut saved: Vec<_> = self.all_tasks().filter(|t| self.is_bookmarked((t.machine, t.id)))
-            .filter(|t| f.is_empty() || format!("{} {} {} {}", title(t), t.agent, t.branch, self.hosts[t.machine].name()).to_lowercase().contains(&f)).collect();
-        sort(&mut saved);
-        out.insert(0, Section { key: "bookmarks".into(), host: None, tasks: saved, ended: 0, more: 0 });
-        let dense = self.dense();
-        for (i, h) in self.hosts.iter().enumerate().filter(|(_, h)| !h.removed) {
-            let mut tasks: Vec<&TaskInfo> = h.tasks.iter().filter(shown).filter(|t| group(&t.state) != 0).collect();
-            sort(&mut tasks);
-            let ended = tasks.iter().filter(|t| group(&t.state) == 4).count();
-            let mut more = 0;
-            if f.is_empty() {
-                tasks.retain(|t| group(&t.state) != 4 || self.selected == Some((t.machine, t.id)));
-                if dense {
-                    let all = tasks.len();
-                    let mut k = 0;
-                    tasks.retain(|t| {
-                        k += 1;
-                        k <= DENSE_CAP || self.selected == Some((t.machine, t.id))
-                    });
-                    more = all - tasks.len();
-                }
-            }
-            out.push(Section { key: format!("host:{i}"), host: Some(i), tasks, ended, more });
-        }
-        // Unreachable machines sink to the bottom; the sort is stable, so order is otherwise kept.
-        out.sort_by_key(|s| s.host.is_some_and(|m| matches!(self.hosts[m].link, Link::Down(_))));
-        out
+        sidebar_sections(&self.hosts, &self.filter, self.selected)
+    }
+
+    /// Tasks the sidebar leaves out on machine `m` (ended or merged), for the list's foot.
+    fn hidden(&self, m: usize) -> usize {
+        hidden_tasks(&self.hosts[m].tasks)
     }
 
     /// More than `DENSE_AT` agents are running or queued: the sidebar packs its rows.
@@ -1561,9 +1697,8 @@ impl App {
             return self.mt_tasks().iter().map(|t| (t.machine, t.id)).collect();
         }
         let sections = self.sections();
-        let open = sections.iter().filter(|s| !self.collapsed.contains(&s.key));
         let mut seen = std::collections::HashSet::new();
-        open.flat_map(|s| s.tasks.iter().map(|t| (t.machine, t.id))).filter(|key| seen.insert(*key)).collect()
+        sections.iter().flat_map(|s| s.tasks.iter().map(|t| (t.machine, t.id))).filter(|key| seen.insert(*key)).collect()
     }
 
     /// Adds a machine to the window; a remote one gets a thread that keeps its ssh link up.
@@ -1574,6 +1709,7 @@ impl App {
             cfg: cfg.clone(),
             link: if cfg.is_some() { Link::Connecting } else { Link::Up(0) },
             tasks: Vec::new(),
+            limits: Vec::new(),
             removed: false,
             retry: cfg.is_some().then_some(tx),
             stop: Arc::default(),
@@ -2229,8 +2365,8 @@ impl App {
             }
             return;
         }
-        if self.menu && ev.logical_key == Key::Named(NamedKey::Escape) {
-            self.menu = false;
+        if let Some(popup) = self.popup.key(&ev.logical_key) {
+            self.popup = popup;
             return;
         }
         if !app_mod(m) && !m.control_key() && !m.shift_key() && (self.slash_key(&ev.logical_key) || self.completion_key(&ev.logical_key)) {
@@ -2439,6 +2575,9 @@ impl App {
                     self.actions.push(Action::Review(ReviewAction::SaveNote));
                 } else if focus == Focus::Message {
                     self.interrupt_chat();
+                } else if focus == Focus::Filter {
+                    self.filter.clear();
+                    self.focus = self.rest();
                 } else {
                     self.focus = self.rest();
                 }
@@ -2618,9 +2757,11 @@ impl App {
                 Action::ToggleTheme => self.set_theme((self.theme + THEMES.len() / 2) % THEMES.len()),
                 Action::PickTheme(i) => {
                     self.set_theme(i);
-                    self.menu = false;
+                    self.popup = Popup::None;
                 }
-                Action::ToggleMenu => self.menu = !self.menu,
+                Action::ToggleMenu => self.popup = self.popup.toggle(Popup::Settings),
+                Action::ToggleBookmarks => self.popup = self.popup.toggle(Popup::Bookmarks),
+                Action::ToggleUsage => self.popup = self.popup.toggle(Popup::Usage),
                 Action::ToggleDing => {
                     self.ding_muted = !self.ding_muted;
                     self.save_settings();
@@ -2737,11 +2878,6 @@ impl App {
                         (self.shell, self.review, self.machine_tasks, self.checks) = (on, None, None, None);
                         self.focus = self.rest();
                         self.sync_session();
-                    }
-                }
-                Action::Toggle(key) => {
-                    if !self.collapsed.remove(&key) {
-                        self.collapsed.insert(key);
                     }
                 }
                 Action::PickHost(m) => self.pick_host(m),
@@ -2863,7 +2999,7 @@ impl App {
         self.stale.set(false);
         self.icons.borrow_mut().clear();
         self.task_regions.borrow_mut().clear();
-        self.layered = !(self.review.as_ref().is_some_and(|r| r.check_output.is_some()) || self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || (self.help && self.vim) || self.menu || self.task_menu.is_some());
+        self.layered = !(self.review.as_ref().is_some_and(|r| r.check_output.is_some()) || self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || (self.help && self.vim) || self.popup != Popup::None || self.task_menu.is_some());
         let dpi = gfx.window.scale_factor() as f32 * self.zoom;
         let (w, h) = (size.width as f32 / dpi, size.height as f32 / dpi);
         let r = &mut gfx.r;
@@ -2872,6 +3008,7 @@ impl App {
         self.probe_changes();
         // Under an open dialog or popup nothing reacts: the views below draw without the click.
         let modal_click = (self.review.as_ref().is_some_and(|r| r.check_output.is_some()) || self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || self.task_menu.is_some()).then(|| self.click.take());
+        let floating = self.popover(w, h).filter(|f| self.click.is_some_and(|p| f.contains(p))).and_then(|_| self.click.take());
         self.draw_title(r, t, w);
         if self.welcome {
             self.draw_welcome(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H));
@@ -2893,6 +3030,9 @@ impl App {
         if let Some(click) = modal_click {
             self.click = click;
         }
+        if floating.is_some() {
+            self.click = floating;
+        }
         let context_click = self.task_menu.is_some().then(|| self.click.take());
         if self.machine_tasks.is_some() {
             self.task_regions.borrow_mut().clear();
@@ -2908,8 +3048,11 @@ impl App {
         if self.help && self.vim {
             self.draw_help(r, t, w, h);
         }
-        if self.menu {
-            self.draw_menu(r, t);
+        match self.popup {
+            Popup::Settings => self.draw_menu(r, t),
+            Popup::Bookmarks => self.draw_bookmarks(r, t),
+            Popup::Usage if !self.welcome => self.draw_usage(r, t, w, h),
+            _ => {}
         }
         self.draw_task_selection(r, t, w, h);
         if self.confirm_delete.is_some() {
@@ -3009,18 +3152,28 @@ impl App {
             nx += tw + 4.0;
         }
 
-        // Scheme menu button: [swatch] Graphite ˅
-        let label_w = r.measure(UI, 12.0, 400, t.name);
-        let b = Rect::new(w - 10.0 - (label_w + 51.0), (TITLE_H - 28.0) / 2.0, label_w + 51.0, 28.0);
+        // Settings ˅, and Bookmarks left of it.
+        let label = "Settings";
+        let label_w = r.measure(UI, 12.0, 400, label);
+        let b = Rect::new(w - 10.0 - (label_w + 38.0), (TITLE_H - 28.0) / 2.0, label_w + 38.0, 28.0);
         self.scheme_btn = b;
-        r.frame(b, 3.0, t.bg, t.border);
-        r.rect(Rect::new(b.x + 7.0, b.y + 6.0, 14.0, 14.0), 3.0, t.border2);
-        r.rect(Rect::new(b.x + 8.0, b.y + 7.0, 6.0, 12.0), 2.0, t.bg);
-        r.rect(Rect::new(b.x + 14.0, b.y + 7.0, 6.0, 12.0), 2.0, t.needs);
-        r.text(b.x + 28.0, r.center(b, UI, 12.0), t.name, UI, 12.0, 400, t.text2, label_w + 4.0);
-        r.path(5, "M16 24L48 24L32 42Z", None, b.x + b.w - 17.0, b.y + 8.0, 10.0, t.text3);
+        r.frame(b, 0.0, if self.popup == Popup::Settings { t.raised } else { t.bg }, t.border);
+        r.text(b.x + 10.0, r.center(b, UI, 12.0), label, UI, 12.0, 400, t.text2, label_w + 4.0);
+        r.path(5, "M16 24L48 24L32 42Z", None, b.x + b.w - 19.0, b.y + 8.0, 10.0, t.text3);
         if self.hit(r, b) {
             self.actions.push(Action::ToggleMenu);
+        }
+        if !self.welcome {
+            let n = self.all_tasks().filter(|t| self.is_bookmarked((t.machine, t.id))).count();
+            let label = if n == 0 { "Bookmarks".to_string() } else { format!("Bookmarks {n}") };
+            let lw = r.measure(UI, 12.0, 400, &label);
+            let bb = Rect::new(b.x - 8.0 - (lw + 20.0), b.y, lw + 20.0, b.h);
+            self.bookmarks_btn = bb;
+            r.frame(bb, 0.0, if self.popup == Popup::Bookmarks { t.raised } else { t.bg }, t.border);
+            r.text(bb.x + 10.0, r.center(bb, UI, 12.0), &label, UI, 12.0, 400, t.text2, lw + 4.0);
+            if self.hit(r, bb) {
+                self.actions.push(Action::ToggleBookmarks);
+            }
         }
     }
 
@@ -3029,193 +3182,117 @@ impl App {
         r.rect(side, 0.0, t.panel);
         r.rect(Rect::new(self.sidebar_w - 1.0, TITLE_H, 1.0, side.h), 0.0, t.border);
 
-        // Filter + new task.
-        let f = Rect::new(8.0, TITLE_H + 8.0, self.sidebar_w - 16.0 - 32.0, 26.0);
-        let focused = self.focus == Focus::Filter;
-        r.frame(f, 3.0, t.bg, if focused { t.work } else { t.border });
-        for (i, lw) in [16.0, 10.0, 4.0].iter().enumerate() {
-            r.rect(Rect::new(f.x + 8.0 + (16.0 - lw) / 2.0 * 0.7, f.y + 8.0 + i as f32 * 4.0, lw * 0.7, 1.4), 0.5, t.text3);
-        }
-        let n = self.all_tasks().count();
-        let hosts = self.hosts.iter().filter(|h| !h.removed).count();
-        let placeholder = if hosts > 1 { format!("Filter {n} agents on {hosts} machines") } else { format!("Filter {n} agents") };
-        if self.filter.is_empty() && !focused {
-            r.text(f.x + 25.0, r.center(f, UI, 12.0), &placeholder, UI, 12.0, 400, t.text3, f.w - 50.0);
-        } else {
+        // The filter shows only while it's in use: ⌘F or / opens it, Esc clears it.
+        let filtering = self.focus == Focus::Filter || !self.filter.is_empty();
+        let mut top = TITLE_H + 8.0;
+        if filtering {
+            let f = Rect::new(8.0, top, self.sidebar_w - 16.0, 26.0);
+            let focused = self.focus == Focus::Filter;
+            r.frame(f, 0.0, t.bg, if focused { t.work } else { t.border2 });
+            for (i, lw) in [16.0, 10.0, 4.0].iter().enumerate() {
+                r.rect(Rect::new(f.x + 8.0 + (16.0 - lw) / 2.0 * 0.7, f.y + 8.0 + i as f32 * 4.0, lw * 0.7, 1.4), 0.0, t.text3);
+            }
             let filter = self.filter.clone();
-            self.field_text(r, t, f.x + 25.0, r.center(f, UI, 12.0), &filter, UI, 12.0, f.w - 50.0, (Focus::Filter, 0), focused, self.caret_for(Focus::Filter, &filter), t.work);
-        }
-        r.text(f.x + f.w - 8.0 - r.measure(MONO, 10.0, 400, &mod_label("F")), r.center(f, MONO, 10.0), &mod_label("F"), MONO, 10.0, 400, t.text3, 60.0);
-        if self.hit_as(r, f, Cursor::Text) {
-            self.actions.push(Action::Focus(Focus::Filter));
-        }
-        let plus = Rect::new(self.sidebar_w - 8.0 - 26.0, f.y, 26.0, 26.0);
-        r.rect(plus, 3.0, t.primary_bg);
-        r.rect(Rect::new(plus.x + 7.5, plus.y + 12.0, 11.0, 2.0), 1.0, t.primary_fg);
-        r.rect(Rect::new(plus.x + 12.0, plus.y + 7.5, 2.0, 11.0), 1.0, t.primary_fg);
-        if self.hit(r, plus) {
-            self.actions.push(Action::NewTask);
+            if filter.is_empty() && !focused {
+                r.text(f.x + 25.0, r.center(f, UI, 12.0), "Filter", UI, 12.0, 400, t.text3, f.w - 50.0);
+            } else {
+                self.field_text(r, t, f.x + 25.0, r.center(f, UI, 12.0), &filter, UI, 12.0, f.w - 50.0, (Focus::Filter, 0), focused, self.caret_for(Focus::Filter, &filter), t.work);
+            }
+            r.text(f.x + f.w - 8.0 - r.measure(MONO, 10.0, 400, "esc"), r.center(f, MONO, 10.0), "esc", MONO, 10.0, 400, t.text3, 40.0);
+            if self.hit_as(r, f, Cursor::Text) {
+                self.actions.push(Action::Focus(Focus::Filter));
+            }
+            top = f.y + f.h + 6.0;
         }
 
-        // Sections: Needs you (every machine), then one per machine.
-        let add = Rect::new(8.0, side.y + side.h - 8.0 - 28.0, self.sidebar_w - 16.0, 28.0);
-        let list = Rect::new(0.0, f.y + f.h + 8.0, self.sidebar_w - 1.0, add.y - 6.0 - (f.y + f.h + 8.0));
+        // One list: needs-you cards, then every other task, across machines.
+        let list = Rect::new(0.0, top, self.sidebar_w - 1.0, side.y + side.h - top);
         r.set_clip(Some(list));
         let multi = self.hosts.iter().filter(|h| !h.removed).count() > 1;
         let clicked = |p: Option<(f32, f32)>| p.is_some_and(|p| list.contains(p));
-        let mut y = list.y - self.scroll;
+        let mut y = list.y + 4.0 - self.scroll;
         let mut picks = Vec::new();
         let dense = self.dense();
         let sections = self.sections();
-        for (i, sec) in sections.iter().enumerate() {
-            let folded = self.collapsed.contains(&sec.key);
-            let chevron = |r: &mut Renderer, cy: f32| {
-                let (id, path) = if folded { (6, "M24 16L42 32L24 48Z") } else { (5, "M16 24L48 24L32 42Z") };
-                r.path(id, path, None, self.sidebar_w - 26.0, cy - 5.0, 10.0, t.text3);
-            };
-            let mut host_down = None;
-            match sec.host {
-                None if sec.key == "bookmarks" => {
-                    let head = Rect::new(6.0, y + 6.0, self.sidebar_w - 13.0, GROUP_H);
-                    let label = format!("BOOKMARKS  {}", sec.tasks.len());
-                    r.text(16.0, r.center(head, UI, 11.5), &label, UI, 11.5, 600, t.text2, head.w - 32.0);
-                    chevron(r, head.y + head.h / 2.0);
-                    if self.hit(r, head) && clicked(self.click) { picks.push(Action::Toggle(sec.key.clone())); }
-                    y += GROUP_H + 12.0;
-                    if sec.tasks.is_empty() && !folded {
-                        r.text(16.0, y + 2.0, "Bookmark a thread to keep it here", UI, 11.5, 400, t.text3, self.sidebar_w - 32.0);
-                        y += 28.0;
-                    }
-                }
-                None if sec.tasks.is_empty() => continue,
-                None => {
-                    let head = Rect::new(6.0, y + 6.0, self.sidebar_w - 13.0, GROUP_H);
-                    let lw = r.text(16.0, r.center(head, UI, 11.5), "NEEDS YOU", UI, 11.5, 600, t.needs, 150.0);
-                    r.text(24.0 + lw, r.center(head, MONO, 11.5), &sec.tasks.len().to_string(), MONO, 11.5, 600, t.needs, 40.0);
-                    if multi {
-                        let note = "all machines";
-                        let nw = r.measure(UI, 11.5, 400, note);
-                        r.text(self.sidebar_w - 34.0 - nw, r.center(head, UI, 11.5), note, UI, 11.5, 400, t.text3, nw + 2.0);
-                    }
-                    chevron(r, head.y + head.h / 2.0);
-                    if self.hit(r, head) && clicked(self.click) {
-                        picks.push(Action::Toggle(sec.key.clone()));
-                    }
-                    y += GROUP_H + 12.0;
-                }
-                Some(m) => {
-                    let h = &self.hosts[m];
-                    if i > 0 {
-                        r.rect(Rect::new(6.0, y + 4.0, self.sidebar_w - 13.0, 1.0), 0.0, t.border);
-                    }
-                    let head = Rect::new(6.0, y + 8.0, self.sidebar_w - 13.0, 38.0);
-                    let (dot, status, sc) = match &h.link {
-                        Link::Up(ms) => {
-                            let mut s = host_summary(&h.tasks);
-                            if h.cfg.is_some() {
-                                s += &format!(" · {ms} ms");
-                            }
-                            (t.done, s, t.text3)
-                        }
-                        Link::Connecting => (t.needs, "connecting…".to_string(), t.text3),
-                        Link::Down(e) => {
-                            host_down = Some(m);
-                            (t.del, format!("unreachable · {e}"), t.del)
-                        }
-                    };
-                    r.rect(Rect::new(head.x + 8.0, head.y + 9.0, 8.0, 8.0), 0.0, dot);
-                    let top = Rect::new(head.x, head.y + 2.0, head.w, 22.0);
-                    // "See All →": every task on the machine, ended ones too, in a popup.
-                    let mut see = Rect::default();
-                    if matches!(h.link, Link::Up(_)) && !h.tasks.is_empty() {
-                        let label = "See All →";
-                        let lw = r.measure(UI, 12.0, 500, label);
-                        see = Rect::new(self.sidebar_w - 36.0 - lw - 12.0, top.y, lw + 12.0, top.h);
-                        r.text(see.x + 6.0, r.center(see, UI, 12.0), label, UI, 12.0, 500, t.text2, lw + 2.0);
-                        if self.hit(r, see) && clicked(self.click) {
-                            picks.push(Action::MachineTasks(Some(m)));
-                        }
-                    }
-                    let room = (if see.w > 0.0 { see.x } else { self.sidebar_w - 36.0 }) - head.x - 30.0;
-                    let nw = r.text(head.x + 24.0, r.center(top, UI, 13.5), h.name(), UI, 13.5, 600, t.text, room.min(160.0));
-                    let addr = h.cfg.as_ref().map_or("local", |c| c.ssh.as_str());
-                    r.text(head.x + 32.0 + nw, r.center(top, MONO, 11.5), addr, MONO, 11.5, 400, t.text3, room - nw - 8.0);
-                    let sub = Rect::new(head.x + 24.0, head.y + 24.0, head.w - 44.0, 16.0);
-                    r.text(sub.x, r.center(sub, UI, 12.0), &status, UI, 12.0, 400, sc, sub.w);
-                    chevron(r, top.y + top.h / 2.0);
-                    if self.hit(r, head) && clicked(self.click) && !self.click.is_some_and(|p| see.contains(p)) {
-                        picks.push(Action::Toggle(sec.key.clone()));
-                    }
-                    y += 54.0;
-                }
-            }
-            if let Some(m) = host_down {
-                // Reconnect / Remove under an unreachable machine.
-                let mut bx = 26.0;
+        let line = |r: &mut Renderer, y: f32| r.rect(Rect::new(10.0, y, self.sidebar_w - 21.0, 1.0), 0.0, t.border);
+        for sec in &sections {
+            if let Some(m) = sec.host {
+                // An unreachable machine: why, and Reconnect / Remove.
+                let host = &self.hosts[m];
+                let Link::Down(e) = &host.link else { continue };
+                let row = Rect::new(6.0, y, self.sidebar_w - 13.0, 26.0);
+                r.rect(Rect::new(row.x + 8.0, row.y + 9.0, 8.0, 8.0), 0.0, t.del);
+                r.text(row.x + 24.0, r.center(row, UI, 12.5), &format!("{} unreachable · {e}", host.name()), UI, 12.5, 500, t.del, row.w - 30.0);
+                y += 28.0;
+                let mut bx = 30.0;
                 let armed = self.remove_armed == Some(m);
                 for (label, action) in [("Reconnect", Action::Reconnect(m)), (if armed { "Click again to remove" } else { "Remove" }, Action::RemoveHost(m))] {
                     let bw = r.measure(UI, 11.5, 400, label) + 16.0;
                     let b = Rect::new(bx, y, bw, 22.0);
-                    r.frame(b, 3.0, t.panel, if armed && bx > 26.0 { t.del } else { t.border2 });
-                    r.text(b.x + 8.0, r.center(b, UI, 11.5), label, UI, 11.5, 400, if bx > 26.0 { t.del } else { t.text }, bw);
+                    r.frame(b, 0.0, t.panel, if armed && bx > 30.0 { t.del } else { t.border2 });
+                    r.text(b.x + 8.0, r.center(b, UI, 11.5), label, UI, 11.5, 400, if bx > 30.0 { t.del } else { t.text }, bw);
                     if self.hit(r, b) && clicked(self.click) {
                         picks.push(action);
                     }
                     bx += bw + 6.0;
                 }
                 y += 30.0;
+                line(r, y);
+                y += 1.0;
                 continue;
-            }
-            if folded {
-                continue;
-            }
-            if sec.host.is_some_and(|m| matches!(self.hosts[m].link, Link::Up(_))) && sec.tasks.is_empty() && sec.ended == 0 {
-                let note = if self.filter.is_empty() { format!("No tasks · {} to start one", mod_label("N")) } else { "No matches".into() };
-                r.text(26.0, y + 2.0, &note, UI, 11.5, 400, t.text3, self.sidebar_w - 40.0);
-                y += 24.0;
             }
             for task in &sec.tasks {
+                let chip = (multi && task.machine != 0).then(|| self.hosts[task.machine].name());
                 if sec.key == "needs" {
-                    let card = Rect::new(10.0, y + 2.0, self.sidebar_w - 21.0, NEEDS_CARD_H);
-                    let chip = multi.then(|| self.hosts[task.machine].name());
+                    let card = Rect::new(6.0, y, self.sidebar_w - 13.0, NEEDS_CARD_H);
                     picks.extend(self.draw_needs_card(r, t, task, card, chip, clicked(self.click)));
-                    y += NEEDS_CARD_H + 10.0;
+                    y += NEEDS_CARD_H;
+                } else {
+                    let row_h = if dense { DENSE_ROW_H } else { ROW2_H };
+                    let row = Rect::new(6.0, y, self.sidebar_w - 13.0, row_h);
+                    if self.draw_row(r, t, task, row, dense, chip) && clicked(self.click) {
+                        picks.push(Action::Select((task.machine, task.id)));
+                    }
+                    y += row_h;
+                }
+                line(r, y);
+                y += 1.0;
+            }
+        }
+        let empty = sections.iter().all(|s| s.tasks.is_empty());
+        drop(sections);
+        if empty {
+            let note = if self.filter.is_empty() { format!("No tasks · {} to start one", mod_label("N")) } else { "No matches".into() };
+            r.text(16.0, y + 10.0, &note, UI, 12.0, 400, t.text3, self.sidebar_w - 32.0);
+            y += 34.0;
+        }
+        // The foot: what's left out (ended and merged), behind each machine's every-task popup.
+        if self.filter.is_empty() {
+            for (m, host) in self.hosts.iter().enumerate().filter(|(_, h)| !h.removed && matches!(h.link, Link::Up(_))) {
+                let n = self.hidden(m);
+                if n == 0 {
                     continue;
                 }
-                let row_h = if dense { DENSE_ROW_H } else { ROW2_H };
-                let row = Rect::new(6.0, y, self.sidebar_w - 13.0, row_h);
-                if self.draw_row(r, t, task, row, dense) && clicked(self.click) {
-                    picks.push(Action::Select((task.machine, task.id)));
-                }
-                y += row_h;
-            }
-            if let (Some(m), true) = (sec.host, sec.more > 0) {
-                let row = Rect::new(6.0, y, self.sidebar_w - 13.0, DENSE_ROW_H);
-                r.text(row.x + 30.0, r.center(row, UI, 12.5), &format!("+{} more", sec.more), UI, 12.5, 400, t.text3, row.w - 40.0);
+                let label = if multi { format!("{n} ended on {} · see all →", host.name()) } else { format!("{n} ended · see all →") };
+                let row = Rect::new(6.0, y + 4.0, self.sidebar_w - 13.0, 28.0);
+                let hot = row.contains(self.mouse);
+                r.text(row.x + 10.0, r.center(row, UI, 12.0), &label, UI, 12.0, 400, if hot { t.text2 } else { t.faint }, row.w - 20.0);
                 if self.hit(r, row) && clicked(self.click) {
                     picks.push(Action::MachineTasks(Some(m)));
                 }
-                y += DENSE_ROW_H;
+                y += 28.0;
             }
         }
-        drop(sections);
         let content_h = y + self.scroll - list.y;
         self.scroll = self.scroll.min((content_h - list.h + 8.0).max(0.0));
         r.set_clip(None);
-
-        r.frame(add, 4.0, t.panel, t.border2);
-        let label = "+ Add machine";
-        let lw = r.measure(UI, 12.0, 400, label);
-        r.text(add.x + (add.w - lw) / 2.0, r.center(add, UI, 12.0), label, UI, 12.0, 400, t.text2, add.w);
-        if self.hit(r, add) {
-            picks.push(Action::OpenAddHost);
-        }
         self.actions.extend(picks);
     }
 
-    /// One task row: state icon, title and agent, and under them what it's doing. Dense, it's one
-    /// line, with what it's doing on the right in place of the agent. Returns whether it was clicked.
-    fn draw_row(&self, r: &mut Renderer, t: &Theme, task: &TaskInfo, row: Rect, dense: bool) -> bool {
+    /// One task row: state icon, title and agent (and `machine`, if it's another one), and under
+    /// them what it's doing. Dense, it's one line, with what it's doing on the right in place of
+    /// the agent. Returns whether it was clicked.
+    fn draw_row(&self, r: &mut Renderer, t: &Theme, task: &TaskInfo, row: Rect, dense: bool, machine: Option<&str>) -> bool {
         let hit_row = row;
         self.register_task_region((task.machine, task.id), row);
         let g = group(&task.state);
@@ -3233,7 +3310,8 @@ impl App {
             4 => t.faint,
             _ => t.text3,
         };
-        let (right, rc, most) = if dense { (line.clone(), sc, row.w * 0.34) } else { (adapter::kind(&task.agent).to_string(), t.text3, 90.0) };
+        let agent = machine.map_or_else(|| adapter::kind(&task.agent).to_string(), |m| format!("{} · {m}", adapter::kind(&task.agent)));
+        let (right, rc, most) = if dense { (line.clone(), sc, row.w * 0.34) } else { (agent, t.text3, 150.0) };
         let rw = r.measure(MONO, 12.0, 400, &right).min(most);
         r.text(row.x + row.w - 8.0 - rw, r.center(top, MONO, 12.0), &right, MONO, 12.0, 400, rc, rw);
         let tc = if g == 4 { t.text3 } else if on { t.tc_on } else { t.tc };
@@ -3257,18 +3335,20 @@ impl App {
         self.register_task_region(key, card);
         let mut acts = Vec::new();
         let on = self.task_is_selected(key);
-        r.frame(card, 0.0, if on { t.sel } else { t.needs_bg }, if on { t.needs } else { t.needs_line });
+        if on {
+            r.rect(card, 0.0, t.sel);
+        }
         if self.hit(r, hit_card) && live {
             acts.push(Action::Select(key));
         }
-        let top = Rect::new(card.x, card.y + 10.0, card.w, 22.0);
-        self.icon(r, t, task, card.x + 12.0, top.y + top.h / 2.0);
-        let text_x = card.x + 36.0;
-        let right = machine.map_or_else(|| adapter::kind(&task.agent).to_string(), str::to_string);
-        let rw = r.measure(MONO, 12.0, 400, &right).min(110.0);
-        r.text(card.x + card.w - 12.0 - rw, r.center(top, MONO, 12.0), &right, MONO, 12.0, 400, t.text3, rw);
-        r.text(text_x, r.center(top, UI, 13.0), &title(task), UI, 13.0, 500, t.text, card.w - 36.0 - rw - 24.0);
-        let ask = Rect::new(text_x, top.y + top.h, card.w - 48.0, 20.0);
+        let top = Rect::new(card.x, card.y + 8.0, card.w, 22.0);
+        self.icon(r, t, task, card.x + 8.0, top.y + top.h / 2.0);
+        let text_x = card.x + 30.0;
+        let right = machine.map_or_else(|| adapter::kind(&task.agent).to_string(), |m| format!("{} · {m}", adapter::kind(&task.agent)));
+        let rw = r.measure(MONO, 12.0, 400, &right).min(150.0);
+        r.text(card.x + card.w - 8.0 - rw, r.center(top, MONO, 12.0), &right, MONO, 12.0, 400, t.text3, rw);
+        r.text(text_x, r.center(top, UI, 13.0), &title(task), UI, 13.0, 500, t.text, card.w - 30.0 - rw - 18.0);
+        let ask = Rect::new(text_x, top.y + top.h, card.w - 38.0, 20.0);
         r.text(ask.x, r.center(ask, UI, 12.5), &status_line(task, 0).replace('\n', " "), UI, 12.5, 400, t.needs, ask.w);
 
         let checks_wait = task.checks.state == "approval" && task.state == "needs-you";
@@ -3287,7 +3367,7 @@ impl App {
         let mut bx = text_x;
         for (label, filled, then) in buttons {
             let bw = r.measure(UI, 12.5, 500, label) + 24.0;
-            let b = Rect::new(bx, card.y + card.h - 12.0 - 30.0, bw, 30.0);
+            let b = Rect::new(bx, card.y + card.h - 10.0 - 26.0, bw, 26.0);
             if filled {
                 r.rect(b, 0.0, t.needs);
             } else {
@@ -3409,6 +3489,11 @@ impl App {
                 ("Changes", changes),
                 ("Elapsed", vec![(age(&task), t.text)]),
             ];
+            if task.tokens > 0 {
+                let mut usage = vec![(format!("{} tokens", short_count(task.tokens)), t.text)];
+                usage.extend(task.cost.map(|c| (format!(" · ${c:.2}"), t.text3)));
+                details.push(("Usage", usage));
+            }
             if let Some(source) = task.cloned_from {
                 details.push(("Cloned from", vec![(format!("#{source}"), t.text)]));
             }
@@ -3505,7 +3590,7 @@ impl App {
                 }
                 let visible_bottom = (grid.y + grid.h).min(origin + rows * LINE_H);
                 let selectable = Rect::new(sec.x, sec.y, sec.w, (visible_bottom - sec.y).max(0.0));
-                let pressed = self.click.is_some_and(|p| selectable.contains(p)) && self.dialog.is_none() && self.add_host.is_none() && !self.menu;
+                let pressed = self.click.is_some_and(|p| selectable.contains(p)) && self.dialog.is_none() && self.add_host.is_none() && self.popup == Popup::None;
                 if pressed || self.chat_drag {
                     let row = (((self.mouse.1.clamp(sec.y, visible_bottom.max(sec.y)) - origin) / LINE_H).floor() as i32 - off)
                         .clamp(-(g.history_size() as i32), g.screen_lines() as i32 - 1);
@@ -3651,6 +3736,44 @@ impl App {
         }
         let rw = r.measure(MONO, 11.5, 400, &right);
         r.text(right_x - rw, y, &right, MONO, 10.5, 400, if lost { t.del } else { t.text3 }, rw + 2.0);
+        right_x -= rw + 14.0;
+
+        // Plan usage, both agents in one chip: each one's tightest window. Click for the rest.
+        let limits = self.plan_limits();
+        let parts: Vec<(&str, Option<&PlanLimit>)> = USAGE_AGENTS.iter().map(|a| (*a, tightest(&limits, a))).collect();
+        let (bar_w, gap) = (34.0, 8.0);
+        let part_w = |r: &Renderer, (agent, l): &(&str, Option<&PlanLimit>)| {
+            r.measure(MONO, 11.5, 400, agent) + gap + bar_w + gap + r.measure(MONO, 11.5, 500, &l.map_or("—".into(), limit_label))
+        };
+        let lead = r.measure(MONO, 11.5, 400, "usage");
+        let sep = 22.0;
+        let inner = lead + 12.0 + parts.iter().map(|p| part_w(r, p)).sum::<f32>() + sep * (parts.len() - 1) as f32;
+        let chip = Rect::new(right_x - inner - 16.0, bar.y + 4.0, inner + 16.0, STATUS_H - 8.0);
+        if chip.x > x + 20.0 {
+            self.usage_btn = chip;
+            r.rect(chip, 0.0, if self.popup == Popup::Usage { t.border2 } else { t.raised });
+            let mut cx = chip.x + 8.0;
+            cx += r.text(cx, y, "usage", MONO, 11.5, 400, t.text3, lead + 2.0) + 12.0;
+            for (k, part) in parts.iter().enumerate() {
+                if k > 0 {
+                    r.rect(Rect::new(cx + sep / 2.0 - 6.0, chip.y + 4.0, 1.0, chip.h - 8.0), 0.0, t.border2);
+                    cx += sep;
+                }
+                let (agent, l) = part;
+                cx += r.text(cx, y, agent, MONO, 11.5, 400, t.text2, 80.0) + gap;
+                let track = Rect::new(cx, chip.y + chip.h / 2.0 - 2.0, bar_w, 4.0);
+                r.rect(track, 0.0, t.border2);
+                let color = l.map_or(t.text3, |l| limit_color(t, l));
+                let fill = l.and_then(|l| l.used).unwrap_or(0.0).clamp(0.0, 100.0) as f32 / 100.0;
+                r.rect(Rect::new(track.x, track.y, bar_w * fill, track.h), 0.0, color);
+                cx += bar_w + gap;
+                let label = l.map_or("—".into(), limit_label);
+                cx += r.text(cx, y, &label, MONO, 11.5, 500, if color == t.work { t.text2 } else { color }, 80.0);
+            }
+            if self.hit(r, chip) {
+                self.actions.push(Action::ToggleUsage);
+            }
+        }
     }
 
     /// A one-line text field; returns whether it was clicked.
@@ -4515,5 +4638,161 @@ mod tests {
         let grey = [153, 153, 153, 255];
         assert!(readable(grey, PAPER.term)[0] > readable(white, PAPER.term)[0], "white stays darker than grey");
         assert_eq!(readable(grey, INK.term), grey);
+    }
+
+    fn limit(agent: &str, window: &str, used: Option<f64>, status: &str, seen: u64) -> PlanLimit {
+        PlanLimit { agent: agent.into(), window: window.into(), used, resets: 0, status: status.into(), seen }
+    }
+
+    fn host(name: Option<&str>, link: Link, tasks: Vec<TaskInfo>, limits: Vec<PlanLimit>) -> Host {
+        Host {
+            cfg: name.map(|n| Machine { name: n.into(), ssh: n.into(), repo: String::new() }),
+            link,
+            tasks,
+            limits,
+            removed: false,
+            retry: None,
+            stop: Arc::default(),
+            tunnel: Arc::default(),
+        }
+    }
+
+    fn task(id: u64, machine: usize, state: &str, updated: u64) -> TaskInfo {
+        let mut t = task_in(state, "ok");
+        (t.id, t.machine, t.updated, t.title) = (id, machine, updated, format!("task {id}"));
+        t
+    }
+
+    #[test]
+    fn usage_chip_colours_and_labels_each_window() {
+        // Green below 80%, amber from 80% or on claude's warning, red once spent or refused.
+        assert_eq!(limit_color(&INK, &limit("codex", "5h", Some(79.9), "", 0)), INK.work);
+        assert_eq!(limit_color(&INK, &limit("codex", "5h", Some(80.0), "", 0)), INK.needs);
+        assert_eq!(limit_color(&INK, &limit("claude", "5h", Some(10.0), "allowed_warning", 0)), INK.needs);
+        assert_eq!(limit_color(&INK, &limit("codex", "5h", Some(100.0), "", 0)), INK.del);
+        assert_eq!(limit_color(&INK, &limit("claude", "5h", None, "rejected", 0)), INK.del);
+        assert_eq!(limit_color(&INK, &limit("claude", "5h", None, "allowed", 0)), INK.work);
+        // A percent when the agent gives one, else how it stands.
+        assert_eq!(limit_label(&limit("codex", "5h", Some(42.4), "", 0)), "42%");
+        assert_eq!(limit_label(&limit("claude", "5h", None, "rejected", 0)), "limited");
+        assert_eq!(limit_label(&limit("claude", "5h", None, "allowed_warning", 0)), "near");
+        assert_eq!(limit_label(&limit("claude", "5h", None, "allowed", 0)), "ok");
+    }
+
+    #[test]
+    fn usage_chip_shows_each_agents_tightest_window() {
+        let limits = vec![
+            limit("claude", "5h", Some(42.0), "allowed", 1),
+            limit("claude", "week", Some(18.0), "allowed", 1),
+            limit("codex", "5h", Some(20.0), "", 1),
+            limit("codex", "week", Some(87.0), "", 1),
+        ];
+        assert_eq!(tightest(&limits, "claude").map(|l| l.window.as_str()), Some("5h"));
+        assert_eq!(tightest(&limits, "codex").map(|l| l.window.as_str()), Some("week"));
+        assert!(tightest(&limits, "gemini").is_none(), "no report: the chip shows —");
+        // A refused window is the tightest even without a number.
+        let refused = vec![limit("claude", "5h", Some(99.0), "allowed", 1), limit("claude", "week", None, "rejected", 1)];
+        assert_eq!(tightest(&refused, "claude").map(|l| l.window.as_str()), Some("week"));
+    }
+
+    #[test]
+    fn usage_popover_lists_every_window_newest_report_first() {
+        let here = host(None, Link::Up(0), vec![], vec![limit("codex", "week", Some(30.0), "", 10), limit("codex", "5h", Some(50.0), "", 10)]);
+        let mut there = host(Some("gpu"), Link::Up(3), vec![], vec![limit("codex", "5h", Some(70.0), "", 20), limit("claude", "week (opus)", Some(5.0), "allowed", 5)]);
+        let merged = merged_limits(&[here, there]);
+        let rows: Vec<(&str, &str, Option<f64>)> = merged.iter().map(|l| (l.agent.as_str(), l.window.as_str(), l.used)).collect();
+        // One row per agent and window: the newer report (gpu's) wins; hour windows, then weeks.
+        assert_eq!(rows, [("codex", "5h", Some(70.0)), ("codex", "week", Some(30.0)), ("claude", "week (opus)", Some(5.0))]);
+        // A removed machine's reports drop out.
+        there = host(Some("gpu"), Link::Up(3), vec![], vec![limit("codex", "5h", Some(70.0), "", 20)]);
+        there.removed = true;
+        let merged = merged_limits(&[host(None, Link::Up(0), vec![], vec![limit("codex", "5h", Some(50.0), "", 10)]), there]);
+        assert_eq!(merged.iter().map(|l| l.used).collect::<Vec<_>>(), [Some(50.0)]);
+        // Each agent: its name row and a row per window, or one saying nothing came yet.
+        assert_eq!(usage_rows(&[]), 4);
+        assert_eq!(usage_rows(&[limit("codex", "5h", None, "", 0), limit("codex", "week", None, "", 0)]), 2 + 3);
+    }
+
+    #[test]
+    fn a_machines_limit_report_replaces_its_last() {
+        let mut hosts = vec![host(None, Link::Up(0), vec![], vec![limit("codex", "5h", Some(1.0), "", 1)])];
+        set_limits(&mut hosts, 0, vec![limit("claude", "5h", Some(9.0), "allowed", 2)]);
+        assert_eq!(hosts[0].limits, [limit("claude", "5h", Some(9.0), "allowed", 2)]);
+        set_limits(&mut hosts, 5, vec![limit("codex", "5h", None, "", 3)]); // a machine that isn't there
+        assert_eq!(hosts[0].limits.len(), 1);
+    }
+
+    #[test]
+    fn resets_and_token_counts_read_short() {
+        let now = unix_secs() as u64;
+        assert_eq!(until(now.saturating_sub(5)), "now");
+        assert_eq!(until(now + 38 * 60 + 30), "38m");
+        assert_eq!(until(now + 2 * 3600 + 14 * 60 + 30), "2h 14m");
+        assert_eq!(until(now + 3 * 86400 + 4 * 3600 + 30), "3d 4h");
+        assert_eq!(short_count(950), "950");
+        assert_eq!(short_count(182_400), "182k");
+        assert_eq!(short_count(999_499), "999k");
+        assert_eq!(short_count(1_200_000), "1.2M");
+    }
+
+    #[test]
+    fn one_popup_at_a_time_and_esc_or_an_outside_click_closes_it() {
+        // Clicking the chip opens usage; the settings button then swaps it for settings.
+        let open = Popup::None.toggle(Popup::Usage);
+        assert_eq!(open, Popup::Usage);
+        assert_eq!(open.toggle(Popup::Settings), Popup::Settings);
+        assert_eq!(Popup::Settings.toggle(Popup::Bookmarks), Popup::Bookmarks);
+        // Its own button again closes it.
+        assert_eq!(open.toggle(Popup::Usage), Popup::None);
+        // Esc closes an open popup and stops there; with none open it goes on to the window.
+        let esc = Key::Named(NamedKey::Escape);
+        assert_eq!(Popup::Usage.key(&esc), Some(Popup::None));
+        assert_eq!(Popup::None.key(&esc), None);
+        assert_eq!(Popup::Bookmarks.key(&Key::Character("j".into())), None);
+        // A click outside both the popup and its button closes it; inside either doesn't.
+        let (pop, btn) = (Rect::new(100.0, 100.0, 200.0, 100.0), Rect::new(250.0, 300.0, 80.0, 20.0));
+        assert!(clicked_outside(Some((10.0, 10.0)), pop, btn));
+        assert!(!clicked_outside(Some((150.0, 150.0)), pop, btn));
+        assert!(!clicked_outside(Some((260.0, 305.0)), pop, btn), "the button toggles it itself");
+        assert!(!clicked_outside(None, pop, btn));
+    }
+
+    #[test]
+    fn sidebar_is_one_list_across_machines() {
+        let mut gone = task(5, 0, "exited", 50);
+        gone.title = "old work".into();
+        let mut merged = task(6, 0, "done", 60);
+        merged.shipped = "merged".into();
+        let hosts = vec![
+            host(None, Link::Up(0), vec![task(1, 0, "running", 10), task(2, 0, "needs-you", 20), gone, merged, task(7, 0, "done", 70)], vec![]),
+            host(Some("gpu"), Link::Up(4), vec![task(3, 1, "running", 30), task(4, 1, "setup-needs-you", 5)], vec![]),
+            host(Some("staging"), Link::Down("refused".into()), vec![], vec![]),
+        ];
+        let keys = |s: &Section| s.tasks.iter().map(|t| (t.machine, t.id)).collect::<Vec<_>>();
+        let sections = sidebar_sections(&hosts, "", None);
+        // Needs you first (every machine), then the rest by state and recency; no bookmarks
+        // section, no machine headers, and one row-less section per unreachable machine.
+        assert_eq!(sections.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(), ["needs", "tasks", "host:2"]);
+        assert_eq!(keys(&sections[0]), [(0, 2), (1, 4)]);
+        assert_eq!(keys(&sections[1]), [(1, 3), (0, 1), (0, 7)], "ended and merged tasks are left out");
+        assert!(sections[2].tasks.is_empty());
+        // The foot counts what's left out, per machine.
+        assert_eq!((hidden_tasks(&hosts[0].tasks), hidden_tasks(&hosts[1].tasks)), (2, 0));
+        // The selected ended task stays; filtering finds ended ones too, never merged ones.
+        assert!(keys(&sidebar_sections(&hosts, "", Some((0, 5)))[1]).contains(&(0, 5)));
+        let found = sidebar_sections(&hosts, "OLD", None);
+        assert_eq!((keys(&found[0]), keys(&found[1])), (vec![], vec![(0, 5)]));
+        assert!(sidebar_sections(&hosts, "task 6", None).iter().all(|s| s.tasks.is_empty()));
+        // Machine names match the filter.
+        assert_eq!(keys(&sidebar_sections(&hosts, "gpu", None)[1]), [(1, 3)]);
+    }
+
+    #[test]
+    fn bookmarks_list_saved_tasks_newest_first() {
+        let tasks = [task(1, 0, "exited", 10), task(2, 0, "running", 30), task(3, 1, "done", 20), task(4, 1, "done", 40)];
+        let saved = |t: &TaskInfo| t.id != 4;
+        let rows: Vec<u64> = bookmark_rows(tasks.iter(), saved).iter().map(|t| t.id).collect();
+        assert_eq!(rows, [2, 3, 1], "ended ones too; unsaved ones never");
+        assert!(bookmark_rows(tasks.iter(), |_| false).is_empty());
     }
 }

@@ -4,7 +4,7 @@
 //! claude and codex share one hook JSON shape; gemini uses the same with its own event
 //! and tool names; pi gets a small extension that streams JSON lines.
 
-use crate::proto::{Event, ToolKind};
+use crate::proto::{Event, PlanLimit, ToolKind};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{self, BufRead, BufReader};
@@ -189,7 +189,7 @@ pub fn parse(adapter: &str, v: &Value, totals: &mut Totals) -> (Vec<Event>, bool
             _ => vec![],
         },
         "Stop" | "AfterAgent" => {
-            let mut events: Vec<Event> = v["transcript_path"].as_str().and_then(transcript_usage).into_iter().collect();
+            let mut events: Vec<Event> = v["transcript_path"].as_str().map(transcript_usage).unwrap_or_default();
             let summary = [&v["last_assistant_message"], &v["prompt_response"]].into_iter().map(str).find(|s| !s.is_empty());
             events.extend(summary.map(|text| Event::Summary { text }));
             events.push(Event::TurnDone);
@@ -293,11 +293,13 @@ fn patch_files(patch: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-/// Session token total from a claude or codex transcript (JSONL).
-fn transcript_usage(path: &str) -> Option<Event> {
-    let file = fs::File::open(path).ok()?;
+/// Session token total from a claude or codex transcript (JSONL), and codex's last word on
+/// its plan's limits.
+fn transcript_usage(path: &str) -> Vec<Event> {
+    let Ok(file) = fs::File::open(path) else { return Vec::new() };
     let mut claude = std::collections::HashMap::new(); // message id -> tokens; messages repeat per content block
     let mut codex = None;
+    let mut limits = Vec::new();
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
         let u = &v["message"]["usage"];
@@ -309,10 +311,66 @@ fn transcript_usage(path: &str) -> Option<Event> {
             claude.insert(str(&v["message"]["id"]), tokens);
         } else if v["payload"]["type"] == "token_count" {
             codex = v["payload"]["info"]["total_token_usage"]["total_tokens"].as_u64().or(codex);
+            let found = codex_limits(&v["payload"]["rate_limits"]);
+            if !found.is_empty() {
+                limits = found;
+            }
         }
     }
-    let tokens = codex.or((!claude.is_empty()).then(|| claude.values().sum()))?;
-    Some(Event::Usage { tokens, cost: None })
+    let tokens = codex.or((!claude.is_empty()).then(|| claude.values().sum()));
+    tokens.map(|tokens| Event::Usage { tokens, cost: None }).into_iter().chain(limits).collect()
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Codex's rate limits: `primary` and `secondary` windows, from app-server (camelCase) or a
+/// session log (snake_case).
+pub fn codex_limits(v: &Value) -> Vec<Event> {
+    ["primary", "secondary"]
+        .iter()
+        .filter_map(|k| {
+            let w = v.get(*k).filter(|w| w.is_object())?;
+            let pick = |a: &str, b: &str| w.get(a).or_else(|| w.get(b)).filter(|x| !x.is_null());
+            let used = pick("usedPercent", "used_percent").and_then(Value::as_f64);
+            let mins = pick("windowDurationMins", "window_minutes").and_then(Value::as_u64).unwrap_or(0);
+            let resets = pick("resetsAt", "resets_at")
+                .and_then(Value::as_u64)
+                .or_else(|| pick("resetsInSeconds", "resets_in_seconds").and_then(Value::as_u64).map(|s| now() + s))
+                .unwrap_or(0);
+            let window = match mins {
+                0 if *k == "primary" => "5h".to_string(),
+                0 => "week".to_string(),
+                10080 => "week".to_string(),
+                m if m % 1440 == 0 => format!("{}d", m / 1440),
+                m if m % 60 == 0 => format!("{}h", m / 60),
+                m => format!("{m}m"),
+            };
+            Some(Event::Limit(PlanLimit { agent: "codex".into(), window, used, resets, status: String::new(), seen: 0 }))
+        })
+        .collect()
+}
+
+/// Claude's `rate_limit_event`'s `rate_limit_info`: which window, whether it's still allowed,
+/// when it resets and, when sent, how much of it is spent (a fraction or a percent).
+pub fn claude_limit(info: &Value) -> Option<Event> {
+    let status = str(&info["status"]);
+    let kind = str(&info["rateLimitType"]);
+    if status.is_empty() && kind.is_empty() {
+        return None;
+    }
+    let window = match kind.as_str() {
+        "five_hour" | "" => "5h".to_string(),
+        "seven_day" => "week".to_string(),
+        k => match k.strip_prefix("seven_day_") {
+            Some(model) => format!("week ({model})"),
+            None => k.replace('_', " "),
+        },
+    };
+    let used = info["utilization"].as_f64().map(|u| if u <= 1.0 { u * 100.0 } else { u }).or((status == "rejected").then_some(100.0));
+    let resets = info["resetsAt"].as_u64().or_else(|| info["resetsAt"].as_f64().map(|f| f as u64)).unwrap_or(0);
+    Some(Event::Limit(PlanLimit { agent: "claude".into(), window, used, resets, status, seen: 0 }))
 }
 
 /// Finds OSC 9 / OSC 777 notifications in a PTY byte stream, across read boundaries.
@@ -503,8 +561,48 @@ mod tests {
         let msg = |id: &str| json!({"type": "assistant", "message": {"id": id, "usage": {"input_tokens": 10, "output_tokens": 5}}}).to_string();
         // the same message repeats once per content block and counts once
         fs::write(&path, [msg("a"), msg("a"), msg("b"), "not json".into()].join("\n")).unwrap();
-        assert_eq!(transcript_usage(path.to_str().unwrap()), Some(Event::Usage { tokens: 30, cost: None }));
+        assert_eq!(transcript_usage(path.to_str().unwrap()), vec![Event::Usage { tokens: 30, cost: None }]);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn codex_session_logs_report_tokens_and_plan_usage() {
+        let path = std::env::temp_dir().join(format!("arranger-codex-limits-{}.jsonl", std::process::id()));
+        let count = |total: u64, limits: Value| json!({"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"total_tokens": total}}, "rate_limits": limits}}).to_string();
+        let early = json!({"primary": {"used_percent": 10.0, "window_minutes": 300, "resets_at": 100}});
+        let late = json!({"primary": {"used_percent": 64.0, "window_minutes": 300, "resets_at": 200}, "secondary": {"used_percent": 21.0, "window_minutes": 10080, "resets_at": 900}});
+        // The last report with limits wins; a later one without any doesn't wipe them.
+        fs::write(&path, [count(100, early), count(400, late), count(500, Value::Null)].join("\n")).unwrap();
+        let events = transcript_usage(path.to_str().unwrap());
+        let _ = fs::remove_file(&path);
+        assert_eq!(events[0], Event::Usage { tokens: 500, cost: None });
+        let limits: Vec<(String, Option<f64>, u64)> = events[1..].iter().map(|e| match e { Event::Limit(l) => (l.window.clone(), l.used, l.resets), _ => panic!("{e:?}") }).collect();
+        assert_eq!(limits, [("5h".into(), Some(64.0), 200), ("week".into(), Some(21.0), 900)]);
+        // A session log with no limits at all: just the tokens.
+        fs::write(&path, count(7, Value::Null)).unwrap();
+        assert_eq!(transcript_usage(path.to_str().unwrap()), vec![Event::Usage { tokens: 7, cost: None }]);
+        let _ = fs::remove_file(&path);
+        assert!(transcript_usage("/nonexistent/arranger.jsonl").is_empty());
+    }
+
+    #[test]
+    fn plan_limits() {
+        let limit = |e: &Event| match e { Event::Limit(l) => l.clone(), _ => panic!("{e:?}") };
+        let app = json!({"primary": {"usedPercent": 42.5, "windowDurationMins": 300, "resetsAt": 1700000000u64},
+            "secondary": {"usedPercent": 10.0, "windowDurationMins": 10080, "resetsAt": 1700500000u64}});
+        let got: Vec<PlanLimit> = codex_limits(&app).iter().map(limit).collect();
+        assert_eq!((got[0].window.as_str(), got[0].used, got[0].resets), ("5h", Some(42.5), 1700000000));
+        assert_eq!((got[1].window.as_str(), got[1].used), ("week", Some(10.0)));
+        let log = json!({"primary": {"used_percent": 7.0, "window_minutes": 300, "resets_in_seconds": 60}, "secondary": null});
+        let got: Vec<PlanLimit> = codex_limits(&log).iter().map(limit).collect();
+        assert_eq!(got.len(), 1, "a missing window is left out");
+        assert!(got[0].resets > 60);
+        let l = limit(&claude_limit(&json!({"status": "allowed_warning", "rateLimitType": "seven_day_opus", "utilization": 0.81, "resetsAt": 5})).unwrap());
+        assert_eq!((l.agent.as_str(), l.window.as_str(), l.resets, l.status.as_str()), ("claude", "week (opus)", 5, "allowed_warning"));
+        assert!((l.used.unwrap() - 81.0).abs() < 1e-9);
+        let l = limit(&claude_limit(&json!({"status": "rejected", "rateLimitType": "five_hour"})).unwrap());
+        assert_eq!((l.window.as_str(), l.used), ("5h", Some(100.0)));
+        assert_eq!(claude_limit(&json!({})), None);
     }
 
     #[test]

@@ -9,7 +9,7 @@ Linux and macOS. Rust throughout; no webview.
   <img alt="arranger workspace with six agents on three machines, permission and question cards in the sidebar, and a completed Codex task selected" src="assets/screenshot.png">
 </picture>
 
-Threads can be saved with **Bookmark** in the thread header, or **Bookmark thread** in a thread's right-click menu. Open any saved thread from **Bookmarks** at the top of the sidebar. Saved threads remain available after restarting, including ended and merged threads; click **Bookmarked** or choose **Remove bookmark** to unsave one.
+Threads can be saved with **Bookmark** in the thread header, or **Bookmark thread** in a thread's right-click menu. Open any saved thread from **Bookmarks** in the title bar. Saved threads remain available after restarting, including ended and merged threads; click **Bookmarked** or choose **Remove bookmark** to unsave one.
 
 ## Install
 
@@ -53,7 +53,7 @@ Claude Code and Codex tasks run in a chat by default: arranger drives the agent 
 
 A task started in a terminal runs the agent there, drawn as-is and sized to the pane. When it asks for permission or a choice, answer in its own menu: ↑/↓ and ↵, or with Vim keys on, normal mode switches on by itself and j/k/↵ work the menu.
 
-A soft ding plays when an agent finishes or needs your help. Toggle **Ding sound** in the scheme menu (top right) to turn it off or on; your preference is saved. On Linux, sound requires `paplay` (PulseAudio/PipeWire) or `aplay` (ALSA).
+A soft ding plays when an agent finishes or needs your help. Toggle **Ding sound** in **Settings** (top right) to turn it off or on; your preference is saved. On Linux, sound requires `paplay` (PulseAudio/PipeWire) or `aplay` (ALSA).
 
 Each task gets its own worktree on a new branch, `arranger/<id>`, made from the base branch you pick when you start it (the current branch by default). The base branch only changes when you merge into it from Review.
 
@@ -115,11 +115,13 @@ In the clone dialog, the source agent, machine and branch are fixed and shown as
 
 An agent that has ended can be revived: it resumes its last session in the same worktree, with a new prompt if you give one (also how Review hands a conflict to an agent that has already exited).
 
-Agents waiting on a permission show it as a card at the top of the sidebar, with Allow once and Deny right there. **See all** on a machine's header opens every task on it, ended ones too, grouped by state with one action per row: Approve, Answer, Review, Open or Revive.
+The sidebar is one list across every machine: tasks that need you first, with Allow once and Deny (or Answer) right there, then running, queued and done. A task on another machine shows that machine next to its agent. ⌘F (or `/` with Vim keys on) shows a filter over the list; Esc clears it. Ended and merged tasks are left out: **N ended · see all** at the end of the list, or a machine in **Settings**, opens every task on that machine, grouped by state with one action per row: Approve, Answer, Review, Open or Revive.
 
-Twelve colour schemes are in the menu at the top right: Gruvbox, Ink, Moss, Ember, Ocean and Plum (dark), Gruvbox Light, Snow, Paper, Linen, Seafoam and Blossom (light).
+**Settings** at the top right holds the twelve colour schemes (Gruvbox, Ink, Moss, Ember, Ocean and Plum, dark; Gruvbox Light, Snow, Paper, Linen, Seafoam and Blossom, light), the Vim keys and Ding sound switches, and your machines with **Add machine**.
 
-Prefer vim keys? Turn on **Vim keys** in the scheme menu (top right). The bindings are in [vim.json](vim.json), and `?` shows them in the app.
+The **usage** chip in the status bar shows how much of each agent's plan is spent: for Claude and Codex, its tightest window (amber from 80%, red once it's used up). Click it for every window (the 5-hour session, the week) and when each resets, plus the tokens your tasks have used. Codex reports its limits in a chat and in a terminal (from its session log); Claude reports them only in a chat, so Claude tasks in a terminal don't update it. Until an agent reports, its part of the chip shows —; a task's own token count (and cost, when the agent gives one) is in its header under **Usage**.
+
+Prefer vim keys? Turn on **Vim keys** in **Settings** (top right). The bindings are in [vim.json](vim.json), and `?` shows them in the app.
 
 In normal mode, `h` moves left and `l` moves right through **Workspace → Review**, skipping unavailable tabs and stopping at either end. Press `H` (Shift+H) to open **See all** for the selected task's machine. Press `d` on a task in Workspace to open a confirmation dialog before deleting the thread and its worktree; `y` confirms and `n` or Esc cancels.
 
@@ -145,7 +147,7 @@ arranger stop                              # stop the daemon and its agents
 
 ## Other machines
 
-Agents can run on other machines too, side by side with local ones in the same window. Install arranger on the machine (same release), then click **Add machine** in the sidebar, or:
+Agents can run on other machines too, side by side with local ones in the same window. Install arranger on the machine (same release), then click **Add machine** in **Settings**, or:
 
 ```sh
 arranger machine add gpu-box you@10.0.4.12 ~/src/api   # name, ssh target, default repo
