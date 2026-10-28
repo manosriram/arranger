@@ -219,9 +219,8 @@ fn show_checks(id: u64, runs: usize) -> io::Result<String> {
         let after = if run.auto { " · after a turn" } else { "" };
         println!("run {} · {} · {passed}/{} passed · tree {tree}{after}", run.id, run.state, run.checks.len());
         if run.accepted { println!("  failed checks accepted"); }
-        if !run.note.is_empty() {
-            println!("  {}", run.note);
-        }
+        let details = arranger::commands::check_run_details(run);
+        if !details.is_empty() { println!("{details}"); }
         if run.state == "approval" {
             println!("  waiting for approval: arranger checks {id} --approve [--always]   (or --stop)");
         }
@@ -252,13 +251,13 @@ fn run_checks(id: u64, commands: &[&str], wait: bool) -> io::Result<()> {
     loop {
         let reply = request(&Request::Checks { id })?;
         let Reply::Checks(list) = reply else { return Err(unexpected(reply)) };
-        if list.first().is_none_or(|r| r.state != "running") {
+        if list.first().is_none_or(|r| !matches!(r.state.as_str(), "planning" | "running")) {
             break;
         }
         thread::sleep(std::time::Duration::from_millis(200));
     }
     match show_checks(id, 1)?.as_str() {
-        "passed" => Ok(()),
+        "passed" | "skipped" => Ok(()),
         state => Err(io::Error::other(format!("checks {state}"))),
     }
 }

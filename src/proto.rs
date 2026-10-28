@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub const MAX_FRAME: usize = 16 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 27;
+pub const VERSION: u32 = 28;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -129,6 +129,29 @@ pub struct CheckRun {
     /// It failed, and you chose to go on anyway.
     pub accepted: bool,
     pub checks: Vec<CheckInfo>,
+    /// Requirements and recorded execution evidence for this run, not the agent's claims.
+    pub acceptance: Acceptance,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct Acceptance {
+    pub requirements: Vec<Requirement>,
+    pub summary: String,
+    pub reviewed: bool,
+    /// Explicitly non-executable work, never inferred from file extensions alone.
+    pub non_executable: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct Requirement {
+    pub text: String,
+    /// One-based source instruction, preserved across repairs and clones.
+    pub source: usize,
+    /// Commands chosen to exercise this requirement.
+    pub commands: Vec<String>,
+    pub verified: bool,
+    /// A short reason, or an assertion and excerpt from an actual check's output.
+    pub evidence: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -338,6 +361,7 @@ pub struct Review {
     pub tree: String,
     /// passed, accepted, skipped, stale, unverified, failed, running, or approval.
     pub verification: String,
+    pub verification_note: String,
     pub work_summary: Option<WorkSummary>,
     /// missing, running, ready, stale, or an error message.
     pub summary_state: String,

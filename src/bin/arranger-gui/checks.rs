@@ -122,7 +122,7 @@ impl App {
             }
             ChecksAction::RetryLatest => {
                 let Some(run) = cv.runs.first() else { return };
-                let checks = run.checks.iter().map(|c| proto::CheckSpec { name: c.name.clone(), command: c.command.clone(), why: c.why.clone() }).collect();
+                let checks = run.checks.iter().filter(|c| c.origin != "setup").map(|c| proto::CheckSpec { name: c.name.clone(), command: c.command.clone(), why: c.why.clone() }).collect();
                 self.run_checks_now(host, id, checks);
             }
             ChecksAction::AutoFix => {
@@ -269,7 +269,7 @@ impl App {
                         // The next run starts as the last one's commands.
                         if first && cv.draft.is_empty() {
                             let ran = runs.iter().find(|r| !matches!(r.state.as_str(), "planning" | "approval") && !r.checks.is_empty());
-                            cv.draft = ran.map(|r| r.checks.iter().map(|c| c.command.clone()).collect()).unwrap_or_default();
+                            cv.draft = ran.map(|r| r.checks.iter().filter(|c| c.origin != "setup").map(|c| c.command.clone()).collect()).unwrap_or_default();
                         }
                         if runs.first().map(|r| r.id) != cv.runs.first().map(|r| r.id) {
                             cv.expanded_runs.clear();
@@ -453,7 +453,7 @@ impl App {
                 "failed" if run.accepted => "failed · accepted",
                 "planning" => "planning checks…",
                 "approval" => "waits for approval",
-                "skipped" => "no checks needed",
+                "skipped" => "no executable checks",
                 "stale" => "stale: the agent went on",
                 s => s,
             };
@@ -476,13 +476,25 @@ impl App {
             let by = if run.auto { "after the agent's turn" } else { "run by you" };
             r.text(x + 18.0, y, by, UI, 11.0, 400, t.text3, w - 18.0);
             y += 18.0;
-            if !run.note.is_empty() {
+            let note = if run.note.trim().is_empty() { &run.acceptance.summary } else { &run.note };
+            if !note.trim().is_empty() {
                 let color = if matches!(run.state.as_str(), "unverified" | "error") { color } else { t.text2 };
-                y += self.wrapped(r, x + 18.0, y, w - 18.0, &run.note, UI, 11.5, color, 17.0) + 2.0;
+                let note = arranger::commands::check_excerpt(note, 240);
+                y += self.wrapped(r, x + 18.0, y, w - 18.0, &note, UI, 11.5, color, 17.0) + 2.0;
             }
-            if run.state == "failed" && !run.accepted && runs.first().is_some_and(|r| r.id == run.id) {
+            for requirement in &run.acceptance.requirements {
+                let (mark, color) = if run.state == "skipped" { ("–", t.text3) } else if requirement.verified { ("✓", t.text2) } else { ("!", t.needs) };
+                let text = format!("{mark} {} · instruction {}", arranger::commands::check_excerpt(&requirement.text, 160), requirement.source);
+                y += self.wrapped(r, x + 18.0, y, w - 18.0, &text, UI, 11.5, color, 17.0);
+                let evidence = if requirement.evidence.trim().is_empty() { "No execution evidence" } else { requirement.evidence.trim() };
+                let evidence = arranger::commands::check_excerpt(evidence, 240);
+                y += self.wrapped(r, x + 30.0, y, w - 30.0, &evidence, UI, 11.0, t.text3, 16.0) + 6.0;
+            }
+            if matches!(run.state.as_str(), "failed" | "unverified" | "error") && !run.accepted && runs.first().is_some_and(|r| r.id == run.id) {
                 let mut bx = x + 18.0;
-                for (label, action) in [("Send to agent", ChecksAction::SendFailures), ("Accept anyway", ChecksAction::Accept)] {
+                let mut actions = vec![("Send to agent", ChecksAction::SendFailures)];
+                if run.state == "failed" { actions.push(("Accept anyway", ChecksAction::Accept)); }
+                for (label, action) in actions {
                     let bw = r.measure(UI, 12.0, 500, label) + 18.0;
                     let b = Rect::new(bx, y + 4.0, bw, 28.0);
                     r.frame(b, 0.0, t.bg, t.border2);

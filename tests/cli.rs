@@ -16,6 +16,8 @@ impl Home {
         let planner = if planner.exists() { planner.into_os_string() } else { "off".into() };
         let out = Command::new(env!("CARGO_BIN_EXE_arranger")).current_dir(dir).env("ARRANGER_HOME", &self.0).env_remove("ARRANGER_CLI")
             .env("ARRANGER_PLANNER", planner)
+            // Personal hooks/templates must not alter fixture commits or hide fixture hooks.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             // Commits made by the daemon need an identity even on a clean CI runner.
             .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
@@ -40,6 +42,37 @@ impl Home {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+
+    fn wait_checks(&self, dir: &Path, state: &str) -> String {
+        let start = Instant::now();
+        loop {
+            let (_, out) = self.arranger(dir, &["checks", "1"]);
+            if out.lines().next().is_some_and(|line| line.contains(&format!("· {state} ·"))) {
+                return out;
+            }
+            assert!(start.elapsed() < Duration::from_secs(15), "checks never got to {state}:\n{out}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn verify(&self, dir: &Path, command: &str) {
+        let (ok, out) = self.arranger(dir, &["checks", "1", "--run", command]);
+        assert!(ok, "{out}");
+        let start = Instant::now();
+        loop {
+            let (_, out) = self.arranger(dir, &["checks", "1"]);
+            let latest = out.lines().next().unwrap_or("");
+            if latest.contains("· passed ·") { return; }
+            if latest.contains("· approval ·") {
+                let (ok, out) = self.arranger(dir, &["checks", "1", "--approve", "--always"]);
+                assert!(ok, "{out}");
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(15), "checks never passed or asked for approval:\n{out}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        self.wait_checks(dir, "passed");
+    }
 }
 
 impl Drop for Home {
@@ -50,7 +83,7 @@ impl Drop for Home {
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git").arg("-C").arg(dir).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args).output().unwrap();
+    let out = Command::new("git").env("GIT_CONFIG_GLOBAL", "/dev/null").arg("-C").arg(dir).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args).output().unwrap();
     assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
@@ -193,11 +226,11 @@ fn task_lifecycle() {
     let (ok, diff) = home.arranger(&repo, &["diff", "1"]);
     assert!(ok && diff.contains("arranger/1 -> main") && diff.contains("A hello.txt  +1 -0"), "{diff}");
 
-    // Agent-reported tests do not authorize a merge: Arranger runs its own checks first.
+    // Without a verifier, even passing manual commands cannot authorize a merge.
     let (ok, out) = home.arranger(&repo, &["checks", "1", "--run", "--wait", "test -f hello.txt"]);
-    assert!(ok, "{out}");
-    // Merge lands the work on main, which is checked out in the repo itself.
-    let (ok, out) = home.arranger(&repo, &["commit", "1", "--merge", "add hello"]);
+    assert!(!ok && out.contains("unverified"), "{out}");
+    // This is a lifecycle test, not gate proof: explicitly override missing verification.
+    let (ok, out) = home.arranger(&repo, &["commit", "1", "--merge", "--force", "add hello"]);
     assert!(ok, "{out}");
     assert_eq!(git(&repo, &["show", "main:hello.txt"]), "hello");
     assert_eq!(std::fs::read_to_string(repo.join("hello.txt")).unwrap(), "hello\n");
@@ -556,6 +589,10 @@ cat .env dep.txt > seen 2>&1
 echo '{"hook_event_name":"Stop","last_assistant_message":"Looked"}' | "$ARRANGER_BIN" hook claude
 "#;
 
+// These fixtures have neither input: assert that the agent captured both diagnostics,
+// rather than treating the existence of its output file as behavioral proof.
+const SEEN_ASSERTION: &str = r#"python3 -c 'from pathlib import Path; s = Path("seen").read_text(); assert ".env" in s and "dep.txt" in s; print("assertion passed: setup records both missing inputs")'"#;
+
 #[test]
 fn setup_is_planned_approved_and_reused() {
     let home = Home(std::env::temp_dir().join(format!("arranger-setup-{}", std::process::id())));
@@ -646,7 +683,7 @@ fn checks_run_log_and_stop() {
     assert!(!ok && out.contains("run 1 · failed · 1/2 passed") && out.contains("checks failed"), "{out}");
     assert!(out.contains("✓ 1") && out.contains("✗ 2") && out.contains("exit 2"), "{out}");
     let (ok, log) = home.arranger(&repo, &["checks", "1", "--log", "1"]);
-    assert!(ok && log == "port 20010\n", "{log:?}");
+    assert!(ok && log == "port 20011\n", "{log:?}"); // isolated checks use the task's check port
     let (_, log) = home.arranger(&repo, &["checks", "1", "--log", "2"]);
     assert_eq!(log, "step 2\nerror: it broke\n");
     // It judged the worktree as it was: the agent's untracked file included.
@@ -656,7 +693,7 @@ fn checks_run_log_and_stop() {
 
     let (ok, report) = home.arranger(&repo, &["checks", "1", "--report"]);
     assert!(ok && report.contains("exit 2") && report.contains("error: it broke") && !report.contains('\x1b'), "{report}");
-    assert!(!report.contains("port 20010"), "passing checks aren't failures: {report}");
+    assert!(!report.contains("port 20011"), "passing checks aren't failures: {report}");
     let wt = home.0.join("worktrees/repo/1");
     std::fs::write(wt.join("changed"), "new work").unwrap();
     let (ok, out) = home.arranger(&repo, &["checks", "1", "--accept"]);
@@ -664,6 +701,10 @@ fn checks_run_log_and_stop() {
     std::fs::remove_file(wt.join("changed")).unwrap();
     assert!(home.arranger(&repo, &["checks", "1", "--accept"]).0);
     assert!(home.arranger(&repo, &["checks", "1"]).1.contains("failed checks accepted"));
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    let (ok, out) = home.arranger(&repo, &["commit", "1", "--merge"]);
+    assert!(!ok && out.contains("has not passed checks"), "{out}");
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), base);
 
     // A long check: a second run waits for it; stopping ends both it and the rest.
     assert!(home.arranger(&repo, &["checks", "1", "--run", "echo started; sleep 30", "echo never"]).0);
@@ -701,19 +742,50 @@ while :; do
 done
 "#;
 
-// Plans checks: keeps what it was asked, waits while `slow` exists, answers with `plan`.
-const CHECK_PLANNER: &str = r#"#!/bin/sh
-d=$(dirname "$0")
-if [ "$ARRANGER_SIDE_KIND" = summary ]; then
-  cat >/dev/null
-  printf '{"title":"Fixture summary","overview":"Checked work","files":[],"risks":[]}'
-  exit 0
-fi
-cat > "$d/asked"
-echo plan >> "$d/plans"
-while [ -f "$d/slow" ]; do sleep 0.05; done
-printf '{"structured_output":%s}' "$(cat "$d/plan")"
+// A fixture verifier implementing every side-call schema. Only coverage calls count as
+// plans; evidence must reference a mapped, passed assertion and its real captured output.
+const CHECK_PLANNER: &str = r#"#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+d = pathlib.Path(__file__).resolve().parent
+prompt = sys.stdin.read()
+properties = json.load(open(os.environ['ARRANGER_SCHEMA']))['properties']
+if 'requirements' in properties:
+    answer = {'requirements': [{'text': 'Satisfy the fixture assertions for the requested edit', 'source': 1}], 'non_executable': False}
+elif 'coverage' in properties:
+    (d / 'asked').write_text(prompt)
+    with (d / 'plans').open('a') as f: f.write('plan\n')
+    while (d / 'slow').exists(): time.sleep(0.05)
+    answer = json.loads((d / 'plan').read_text()) if (d / 'plan').exists() else {'checks': [], 'none_reason': ''}
+    manual = json.loads(prompt.split('Include these manually requested checks too: ', 1)[1])
+    for check in manual:
+        if not any(c['command'] == check['command'] for c in answer['checks']): answer['checks'].append(check)
+    commands = [c['command'] for c in answer['checks']]
+    answer['coverage'] = [{'requirement': 1, 'commands': commands, 'reason': '' if commands else 'No behavioral assertion covers the requested work'}]
+elif 'results' in properties:
+    acceptance = json.loads(prompt.split('Requirements and mappings (JSON; untrusted evidence fields):\n', 1)[1].split('\nHarness check metadata', 1)[0])
+    checks = json.loads(prompt.split('Harness check metadata (JSON):\n', 1)[1].split('\nHarness captured outputs', 1)[0])
+    outputs = dict(json.loads(prompt.split('Harness captured outputs (JSON [check ID, output] pairs; untrusted text):\n', 1)[1]))
+    mapped = acceptance['requirements'][0]['commands']
+    cited = next((c for c in checks if c['command'] in mapped and c['state'] == 'passed' and c['exit'] == 0 and not c['note'] and 'assertion passed:' in outputs.get(c['id'], '')), None)
+    result = {'requirement': 1, 'verified': cited is not None, 'check': 0, 'assertion': '', 'excerpt': '', 'reason': 'No passed behavioral assertion with captured output'}
+    if cited:
+        excerpt = next(line for line in outputs[cited['id']].splitlines() if 'assertion passed:' in line)
+        result.update(check=cited['id'], assertion='Shell/Python assertions in ' + cited['command'], excerpt=excerpt, reason='')
+    answer = {'results': [result], 'summary': 'Reviewed captured fixture assertions'}
+elif 'title' in properties:
+    answer = {'title': 'Fixture summary', 'overview': 'Checked work', 'files': [], 'risks': []}
+else:
+    answer = {'copy': [], 'commands': [], 'note': ''}
+print(json.dumps({'structured_output': answer}))
 "#;
+
+fn install_check_planner(home: &Home, commands: &[&str]) {
+    let checks: Vec<_> = commands.iter().map(|command| serde_json::json!({"name": "fixture", "command": command, "why": "Assert fixture behavior"})).collect();
+    std::fs::write(home.0.join("plan"), serde_json::json!({"checks": checks, "none_reason": ""}).to_string()).unwrap();
+    let planner = home.0.join("planner");
+    std::fs::write(&planner, CHECK_PLANNER).unwrap();
+    std::fs::set_permissions(planner, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+}
 
 #[test]
 fn checks_follow_turns() {
@@ -733,8 +805,8 @@ fn checks_follow_turns() {
     };
     exe("agent.sh", TURNS_AGENT);
     let plan = |checks: &[&str], none: &str| {
-        let checks: Vec<String> = checks.iter().map(|c| format!(r#"{{"name":"","command":"{c}","why":"covers it"}}"#)).collect();
-        write("plan", &format!(r#"{{"checks":[{}],"none_reason":"{none}"}}"#, checks.join(",")));
+        let checks: Vec<_> = checks.iter().map(|c| serde_json::json!({"name": "", "command": c, "why": "covers it"})).collect();
+        write("plan", &serde_json::json!({"checks": checks, "none_reason": none}).to_string());
     };
     let until = |what: &str| {
         let start = Instant::now();
@@ -750,16 +822,15 @@ fn checks_follow_turns() {
 
     // Setup runs first (no plan for it here), so the planner only plans checks.
     write("edit0", "echo 'fn b() {}' >> lib.rs");
-    plan(&["test -f lib.rs", "grep -q b lib.rs"], "");
-    exe("planner", "#!/bin/sh\ncat >/dev/null\nprintf '{\"structured_output\":{\"copy\":[],\"commands\":[],\"note\":\"\"}}'\n");
+    let assertion_b = "grep -Fxq 'fn b() {}' lib.rs && printf 'assertion passed: lib.rs defines b\\n'";
+    plan(&["test -f lib.rs", assertion_b], "");
+    exe("planner", CHECK_PLANNER);
     let agent = home.0.join("agent.sh");
     assert!(home.arranger(&repo, &["new", agent.to_str().unwrap(), "add b"]).0);
-    home.wait_state(&repo, &["done"]);
-    exe("planner", CHECK_PLANNER);
 
     // Its turn ended with changes: planned, and the command no rule allows waits on you.
     let out = until("approval");
-    assert!(out.contains("after a turn") && out.contains("test -f lib.rs") && out.contains("grep -q b lib.rs"), "{out}");
+    assert!(out.contains("after a turn") && out.contains("test -f lib.rs") && out.contains(assertion_b), "{out}");
     home.wait_state(&repo, &["needs-you"]);
     let asked = std::fs::read_to_string(home.0.join("asked")).unwrap();
     assert!(asked.contains("+fn b() {}") && asked.contains("lib.rs | 1 +"), "the planner sees the diff:\n{asked}");
@@ -774,7 +845,7 @@ fn checks_follow_turns() {
     until("approval");
     assert!(home.arranger(&repo, &["checks", "1", "--approve"]).0);
     let out = until("failed");
-    assert!(out.contains("✓ 4") && out.contains("left made-by-check behind (removed)"), "a new file is only tidied away:\n{out}");
+    assert!(out.contains("✗ 4") && out.contains("left made-by-check behind (removed)"), "adding a file must fail the check:\n{out}");
     assert!(out.contains("✗ 5") && out.contains("changed lib.rs (put back)"), "{out}");
     assert!(!home.0.join("worktrees/repo/1/lib.rs.bak").exists());
     assert!(!home.0.join("worktrees/repo/1/made-by-check").exists());
@@ -786,9 +857,10 @@ fn checks_follow_turns() {
     write("go2", "");
     let out = until("approval");
     let newest = out.split("\nrun ").next().unwrap();
-    assert!(newest.contains("sed -i.bak s/a/z/ lib.rs") && newest.contains("(failed before)") && !newest.contains("touch made-by-check"), "{out}");
-    assert!(std::fs::read_to_string(home.0.join("asked")).unwrap().contains("Still failing from before (these run anyway; don't repeat them):\n- sed -i.bak s/a/z/ lib.rs"));
+    assert!(newest.contains("sed -i.bak s/a/z/ lib.rs") && newest.contains("(failed before)") && newest.contains("touch made-by-check"), "{out}");
+    let asked = std::fs::read_to_string(home.0.join("asked")).unwrap();
     assert!(home.arranger(&repo, &["checks", "1", "--drop", "sed -i.bak s/a/z/ lib.rs"]).0);
+    assert!(home.arranger(&repo, &["checks", "1", "--drop", "touch made-by-check"]).0);
 
     // A new prompt while checks are planned makes them stale; code no check covers is unverified.
     write("slow", "");
@@ -796,6 +868,13 @@ fn checks_follow_turns() {
     plan(&[], "");
     write("go3", "");
     until("planning");
+    // Planning now includes requirements extraction: hold the coverage stage itself,
+    // so the race cannot finish before the delayed planner has actually been invoked.
+    let start = Instant::now();
+    while std::fs::read_to_string(home.0.join("plans")).unwrap().lines().count() != 4 {
+        assert!(start.elapsed() < Duration::from_secs(15), "coverage planning never started");
+        std::thread::sleep(Duration::from_millis(100));
+    }
     write("edit4", "echo 'fn f() {}' >> lib.rs");
     write("go4", "");
     let start = Instant::now();
@@ -805,25 +884,29 @@ fn checks_follow_turns() {
     }
     std::fs::remove_file(home.0.join("slow")).unwrap();
     let out = until("unverified");
-    assert!(out.starts_with("run 5 ") && out.contains("Code changed and no check covers it"), "{out}");
-    home.wait_state(&repo, &["done"]);
+    assert!(out.starts_with("run 5 ") && out.contains("No executable evidence covers the requested work"), "{out}");
+    home.wait_state(&repo, &["needs-you"]);
     // Unverified work waits for you: the agent isn't sent off to write tests and nothing replans.
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(std::fs::read_to_string(home.0.join("plans")).unwrap().lines().count(), 5, "no replanning after unverified");
-    home.wait_state(&repo, &["done"]);
+    home.wait_state(&repo, &["needs-you"]);
 
-    // Once the code has passed, a docs-only turn with no checks needs none.
+    // A docs-only suffix cannot waive the earlier runtime request's verification.
     write("edit5", "echo 'fn g() {}' >> lib.rs");
-    plan(&["test -f lib.rs"], "");
+    let assertion_g = r#"python3 -c 'from pathlib import Path; assert Path("lib.rs").read_text() == "".join("fn " + c + "() {}\n" for c in "abcdefg"); print("assertion passed: lib.rs defines a through g")'"#;
+    plan(&[assertion_g], "");
     write("go5", "");
+    until("approval");
+    assert!(home.arranger(&repo, &["checks", "1", "--approve"]).0);
     let out = until("· passed ·");
     assert!(out.starts_with("run 6 "), "{out}");
     home.wait_state(&repo, &["done"]);
     write("edit6", "echo more >> README.md");
     plan(&[], "docs only");
     write("go6", "");
-    let out = until("skipped");
+    let out = until("unverified");
     assert!(out.starts_with("run 7 ") && out.contains("docs only"), "{out}");
+    assert!(asked.contains("Still failing from before (these run anyway; don't repeat them):") && asked.contains("- sed -i.bak s/a/z/ lib.rs") && asked.contains("- touch made-by-check"), "{asked}");
 }
 
 #[test]
@@ -905,19 +988,20 @@ fn summaries_match_checked_trees_and_supply_commit_messages() {
         std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     };
     exe("agent", SETUP_AGENT);
+    exe("check-planner", CHECK_PLANNER);
     exe("planner", r#"#!/bin/sh
 d=$(dirname "$0")
-cat > "$d/summary-prompt"
 if [ "$ARRANGER_SIDE_KIND" = summary ]; then
+  cat > "$d/summary-prompt"
   while [ -f "$d/slow-summary" ]; do sleep 0.05; done
   printf '{"title":"Record setup result","overview":"Capture local setup output.","files":[{"path":"seen","change":"Store the output"}],"risks":["Fixture only"],"verified_by":["invented test"]}'
 else
-  printf '{"copy":[],"commands":[],"note":""}'
+  exec "$d/check-planner"
 fi
 "#);
     let (ok, out) = home.arranger(&repo, &["new", home.0.join("agent").to_str().unwrap(), "look"]);
     assert!(ok, "{out}"); home.wait_state(&repo, &["exited"]);
-    assert!(home.arranger(&repo, &["checks", "1", "--run", "--wait", "test -f seen"]).0);
+    home.verify(&repo, SEEN_ASSERTION);
     let wait_summary = |state: &str| {
         let start = Instant::now();
         loop {
@@ -935,7 +1019,7 @@ fi
     let json: String = db.query_row("SELECT json FROM summaries WHERE task = 1 AND state = 'ready'", [], |r| r.get(0)).unwrap();
     let recorded: arranger::proto::WorkSummary = serde_json::from_str(&json).unwrap();
     assert_eq!(recorded.title, "Record setup result");
-    assert_eq!(recorded.verified_by, ["test -f seen"]);
+    assert_eq!(recorded.verified_by, [SEEN_ASSERTION]);
     let wt = home.0.join("worktrees/repo/1");
     std::fs::write(wt.join("new.rs"), "fn new() {}\n").unwrap();
     assert!(home.arranger(&repo, &["summary", "1"]).1.starts_with("Summary: stale"));
@@ -976,30 +1060,48 @@ fn merge_gates_recheck_the_combined_tree_before_updating_base() {
         let agent = home.0.join("agent");
         std::fs::write(&agent, SETUP_AGENT).unwrap();
         std::fs::set_permissions(&agent, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        install_check_planner(&home, &[]);
         assert!(home.arranger(&repo, &["new", agent.to_str().unwrap(), "look"]).0);
         home.wait_state(&repo, &["exited"]);
         let original = git(&repo, &["rev-parse", "HEAD"]);
         let (ok, out) = home.arranger(&repo, &["commit", "1", "--merge"]);
         assert!(!ok && out.contains("has not passed checks"), "{out}");
         assert_eq!(git(&repo, &["rev-parse", "HEAD"]), original);
-        assert!(home.arranger(&repo, &["checks", "1", "--run", "--wait", "test ! -f forbidden"]).0);
+        home.wait_checks(&repo, "unverified"); // the rejected merge schedules verification
+        let command = format!("test ! -e forbidden && {SEEN_ASSERTION}");
+        install_check_planner(&home, &[&command]);
+        home.verify(&repo, &command);
+        let checked_tree = arranger::checks::tree_hash(&home.0.join("worktrees/repo/1")).unwrap();
         let wt = home.0.join("worktrees/repo/1");
         std::fs::write(wt.join("late"), "edit after checks\n").unwrap();
         assert!(!home.arranger(&repo, &["commit", "1", "--merge"]).0);
+        assert!(home.arranger(&repo, &["checks", "1", "--stop"]).0);
         std::fs::remove_file(wt.join("late")).unwrap();
+        home.verify(&repo, &command);
+        let db = rusqlite::Connection::open(home.0.join("arranger.db")).unwrap();
+        let before: u64 = db.query_row("SELECT COUNT(*) FROM check_runs WHERE task = 1", [], |r| r.get(0)).unwrap();
+        let plans_before = std::fs::read_to_string(home.0.join("plans")).unwrap().lines().count();
         std::fs::write(repo.join(if failing_base { "forbidden" } else { "base-addition" }), "new base\n").unwrap();
         git(&repo, &["add", "."]); git(&repo, &["commit", "-q", "-m", "base moved"]);
         let moved = git(&repo, &["rev-parse", "HEAD"]);
         let (ok, out) = home.arranger(&repo, &["commit", "1", "--merge", "task result"]);
-        let db = rusqlite::Connection::open(home.0.join("arranger.db")).unwrap();
-        let (origin, state): (String, String) = db.query_row("SELECT origin, state FROM checks ORDER BY id DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-        assert_eq!(origin, "merge");
+        let (state, tree): (String, String) = db.query_row("SELECT state, tree FROM check_runs WHERE task = 1 ORDER BY id DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let after: u64 = db.query_row("SELECT COUNT(*) FROM check_runs WHERE task = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(after, before + 1, "merging a moved base needs a new verification run");
+        assert_ne!(tree, checked_tree, "the combined tree, not the old task tree, must be checked");
+        assert_eq!(std::fs::read_to_string(home.0.join("plans")).unwrap().lines().count(), plans_before + 1, "the combined tree needs fresh coverage planning");
         if failing_base {
             assert!(!ok && out.contains("base branch was not updated"), "{out}");
             assert_eq!(state, "failed");
             assert_eq!(git(&repo, &["rev-parse", "HEAD"]), moved);
             assert!(!repo.join("seen").exists());
-            // Explicit force is the only way around a failed, unaccepted gate.
+            // Accepting failures still does not authorize an ordinary merge.
+            assert!(home.arranger(&repo, &["checks", "1", "--accept"]).0);
+            let (ok, out) = home.arranger(&repo, &["commit", "1", "--merge", "accepted failure"]);
+            assert!(!ok && out.contains("has not passed checks"), "{out}");
+            assert_eq!(git(&repo, &["rev-parse", "HEAD"]), moved);
+            assert!(home.arranger(&repo, &["checks", "1", "--stop"]).0);
+            // Explicit force is the only way around a failed gate.
             let (ok, out) = home.arranger(&repo, &["commit", "1", "--merge", "--force", "accept failure"]);
             assert!(ok, "{out}");
         } else {
@@ -1060,9 +1162,11 @@ fn merge_refuses_a_commit_hook_that_changes_the_verified_tree() {
     let agent = home.0.join("agent");
     std::fs::write(&agent, SETUP_AGENT).unwrap();
     std::fs::set_permissions(&agent, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    install_check_planner(&home, &[]);
     assert!(home.arranger(&repo, &["new", agent.to_str().unwrap(), "look"]).0);
     home.wait_state(&repo, &["exited"]);
-    assert!(home.arranger(&repo, &["checks", "1", "--run", "--wait", "test -f seen"]).0);
+    install_check_planner(&home, &[SEEN_ASSERTION]);
+    home.verify(&repo, SEEN_ASSERTION);
     let base = git(&repo, &["rev-parse", "HEAD"]);
     let hook = repo.join(".git/hooks/pre-commit");
     std::fs::write(&hook, "#!/bin/sh\necho unchecked > hook-change\ngit add hook-change\n").unwrap();

@@ -1353,12 +1353,12 @@ fn stages(task: &TaskInfo) -> [Stage; 6] {
         "approval" => stage("Checks", Waiting, "approve"),
         "running" => stage("Checks", Active, &if counted.is_empty() { "running".into() } else { format!("{counted} passed") }),
         "passed" => stage("Checks", Done, &if counted.is_empty() { "passed".into() } else { format!("{counted} passed") }),
-        "failed" if c.accepted => stage("Checks", Done, &format!("{} failed · accepted", c.failed)),
+        "failed" if c.accepted => stage("Checks", Waiting, &format!("{} failed · accepted", c.failed)),
         "failed" => stage("Checks", Failed, &format!("{} failed", c.failed)),
         "unverified" => stage("Checks", Waiting, "unverified"),
-        "error" => stage("Checks", Failed, "couldn't plan"),
+        "error" => stage("Checks", Failed, "needs attention"),
         "stale" => stage("Checks", Todo, "outdated"),
-        "skipped" => stage("Checks", Skipped, "nothing to check"),
+        "skipped" => stage("Checks", Skipped, "no executable checks"),
         "stopped" => stage("Checks", Skipped, "stopped"),
         s => stage("Checks", Todo, s),
     };
@@ -3140,12 +3140,7 @@ impl App {
                 "Checks" => !self.checkable(),
                 _ => false,
             };
-            // The summary describes only the latest run; an older pass must not keep this green.
-            let passed = label == "Checks" && self.current().is_some_and(|task| task.checks.state == "passed");
-            if passed {
-                r.rect(Rect::new(tab.x, tab.y + tab.h - 2.0, tab.w, 2.0), 0.0, t.done);
-            }
-            r.text(tab.x + 12.0, r.center(tab, UI, 13.0), label, UI, 13.0, 500, if passed { t.done } else if on { t.text } else if off { alpha(t.text3, 90) } else { t.text3 }, tw);
+            r.text(tab.x + 12.0, r.center(tab, UI, 13.0), label, UI, 13.0, 500, if on { t.text } else if off { alpha(t.text3, 90) } else { t.text3 }, tw);
             if self.hit(r, tab) && !on && !off {
                 self.actions.push(match label {
                     "Review" => Action::OpenReview,
@@ -3357,7 +3352,7 @@ impl App {
         r.text(ask.x, r.center(ask, UI, 12.5), &status_line(task, 0).replace('\n', " "), UI, 12.5, 400, t.needs, ask.w);
 
         let checks_wait = task.checks.state == "approval" && task.state == "needs-you";
-        let buttons: Vec<(&str, bool, Vec<Action>)> = if self.multi_select.is_some() { vec![] } else if task.checks.state == "failed" && !task.checks.accepted && task.state == "needs-you" {
+        let buttons: Vec<(&str, bool, Vec<Action>)> = if self.multi_select.is_some() { vec![] } else if matches!(task.checks.state.as_str(), "failed" | "unverified" | "error") && !task.checks.accepted && task.state == "needs-you" {
             vec![("Review checks", true, vec![Action::Select(key), Action::OpenChecks])]
         } else if checks_wait {
             vec![("Review checks", true, vec![Action::Select(key), Action::OpenChecks]), ("Skip", false, vec![Action::StopChecks(key)])]
@@ -4534,7 +4529,7 @@ mod tests {
         assert_eq!(stages(&task)[2].phase, Failed);
         assert_eq!(stages(&task)[4].phase, Todo, "nothing to review while checks fail");
         task.checks.accepted = true;
-        assert_eq!((stages(&task)[2].phase, stages(&task)[4].phase), (Done, Waiting));
+        assert_eq!((stages(&task)[2].phase, stages(&task)[4].phase), (Waiting, Todo), "an override is not a verified pass");
 
         task.shipped = "committed".into();
         assert_eq!(phases(&task)[4..], [Done, Skipped]);

@@ -6,6 +6,9 @@ use crate::proto::CheckSpec;
 use std::path::Path;
 use std::process::Command;
 
+pub mod acceptance;
+pub mod snapshot;
+
 /// Most checks a run takes.
 pub const MAX_CHECKS: usize = 20;
 
@@ -27,11 +30,34 @@ pub fn tree_hash(worktree: &Path) -> Result<String, String> {
     let real = git(None, &["rev-parse", "--path-format=absolute", "--git-path", "index"])?;
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let copy = std::env::temp_dir().join(format!("arranger-index-{}-{nanos}", std::process::id()));
-    // Its stat cache spares hashing every file again; a fresh one starts from HEAD.
+    // Preserve staged paths (including force-added ignored files), never the real index.
     if std::fs::copy(&real, &copy).is_err() {
         git(Some(&copy), &["read-tree", "HEAD"])?;
     }
-    let tree = git(Some(&copy), &["add", "-A"]).and_then(|_| git(Some(&copy), &["write-tree"]));
+    let tree = (|| {
+        // Index optimization flags must not hide source edits from verification.
+        // Clear them only in the disposable index, including newly staged ignored files.
+        let paths = Command::new("git").arg("-C").arg(worktree).args(["ls-files", "-z"])
+            .env("GIT_INDEX_FILE", &copy).output().map_err(|e| e.to_string())?;
+        if !paths.status.success() { return Err(String::from_utf8_lossy(&paths.stderr).into_owned()); }
+        use std::io::Write;
+        use std::process::Stdio;
+        for flag in ["--no-assume-unchanged", "--no-skip-worktree"] {
+            let mut update = Command::new("git").arg("-C").arg(worktree)
+                .args(["update-index", flag, "-z", "--stdin"])
+                .env("GIT_INDEX_FILE", &copy).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped())
+                .spawn().map_err(|e| e.to_string())?;
+            let written = update.stdin.take().unwrap().write_all(&paths.stdout);
+            let output = update.wait_with_output().map_err(|e| e.to_string())?;
+            if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).into_owned()); }
+            written.map_err(|e| e.to_string())?;
+        }
+        // Copying an index changes its timestamp and can make racily-clean entries
+        // appear trustworthy. Rehash tracked bytes rather than trust that stat cache.
+        git(Some(&copy), &["add", "-A"])?;
+        git(Some(&copy), &["add", "--renormalize", "-A"])?;
+        git(Some(&copy), &["write-tree"])
+    })();
     let _ = std::fs::remove_file(&copy);
     tree
 }
@@ -144,9 +170,9 @@ pub fn plan_schema() -> serde_json::Value {
 
 /// What the check planner sees of a trip.
 pub struct Trip<'a> {
-    /// What the agent was asked this turn.
+    /// Complete acceptance requirements extracted from authoritative instructions.
     pub prompts: &'a [String],
-    /// `git diff --stat` and the diff since the work last passed (or since its base), cut to size.
+    /// `git diff --stat` and the full-task diff from its base, cut to size.
     pub stat: &'a str,
     pub diff: &'a str,
     /// Build and dependency files in the repository, to read for its commands.
@@ -159,12 +185,12 @@ pub struct Trip<'a> {
 
 pub fn plan_prompt(trip: &Trip) -> String {
     let list = |items: Vec<String>| if items.is_empty() { "(none)".to_string() } else { items.join("\n") };
-    let prompts = list(trip.prompts.iter().map(|p| format!("- {}", p.chars().take(2000).collect::<String>())).collect());
+    let prompts = list(trip.prompts.iter().map(|p| format!("- {p}")).collect());
     let manifests = list(trip.manifests.iter().map(|m| format!("- {m}")).collect());
     let previous = list(trip.previous.iter().map(|(c, s)| format!("- {c}: {s}")).collect());
     let sticky = list(trip.sticky.iter().map(|c| format!("- {}", c.command)).collect());
     format!(
-        "A coding agent just finished a turn in this git worktree (the current directory). You decide which checks prove its \
+        "This is a captured verification checkout (the current directory). You decide which checks prove the requested task's \
 work holds up. You don't run them: arranger runs each command from the worktree root, one after another, and shows the \
 results to a human reviewer. You may read the repository (read-only) to find the right commands.
 
@@ -175,10 +201,11 @@ is broad or touches shared code;
 - only commands that report: never formatters or linters that rewrite files (use --check variants), never installs, \
 network calls, servers, deploys, or commands that wait for input;
 - each should finish in under 10 minutes; use the project's own scripts (package.json, Makefile, justfile…) when it has them.
-Give each a short name and say why it covers this change. If nothing needs checking (docs, comments), return no checks and \
-say why in none_reason; otherwise leave none_reason empty.
+Give each a short name and say why it covers this change. Include relevant runtime/tool versions in check output where \
+useful. If there is no executable coverage, return no checks and explain the gap in none_reason; that is not a pass. \
+Only an explicitly non-executable request can be exempt. Otherwise leave none_reason empty.
 
-What the agent was asked this turn:
+Complete requirements for this task:
 {prompts}
 
 Build and dependency files:
@@ -190,7 +217,7 @@ Checks from the last run and how they went:
 Still failing from before (these run anyway; don't repeat them):
 {sticky}
 
-Changes since the work last passed its checks:
+Full task changes from its base:
 {stat}
 
 {diff}",
@@ -424,13 +451,25 @@ mod tests {
         std::fs::create_dir_all(dir.join("target")).unwrap();
         std::fs::write(dir.join("target/x"), "build output").unwrap();
         assert_eq!(tree_hash(&dir).unwrap(), clean, "ignored files don't count");
+        git(&dir, &["config", "core.trustctime", "false"]);
+        let modified = std::fs::metadata(dir.join("a")).unwrap().modified().unwrap();
         std::fs::write(dir.join("a"), "2").unwrap();
+        std::fs::File::options().write(true).open(dir.join("a")).unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
         let edited = tree_hash(&dir).unwrap();
-        assert_ne!(edited, clean);
+        assert_ne!(edited, clean, "same-size, same-mtime edits must be rehashed");
         std::fs::write(dir.join("b"), "new").unwrap();
         assert_ne!(tree_hash(&dir).unwrap(), edited);
         // " M a" unstaged, trimmed by `git` above; b still untracked.
+        git(&dir, &["config", "core.trustctime", "true"]);
         assert_eq!(git(&dir, &["status", "--porcelain"]), "M a\n?? b", "the index is untouched");
+        let current = tree_hash(&dir).unwrap();
+        for flag in ["--assume-unchanged", "--skip-worktree"] {
+            git(&dir, &["update-index", flag, "a"]);
+            let index = std::fs::read(dir.join(".git/index")).unwrap();
+            assert_eq!(tree_hash(&dir).unwrap(), current, "{flag} must not hide edits");
+            assert_eq!(std::fs::read(dir.join(".git/index")).unwrap(), index);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
