@@ -682,6 +682,58 @@ impl App {
             self.chat_copy.clear();
             self.focus = Focus::Term;
         }
+        // Resolve the moving endpoint before painting so every row highlights the same
+        // range. Clamp drags to the nearest visible text row, including margins and gaps.
+        if pressed || self.chat_drag {
+            let mut nearest = None;
+            let mut distance = f32::INFINITY;
+            let mut interactive_press = false;
+            let mut row_y = area.y + 18.0 - top;
+            for (i, h) in heights.iter().enumerate() {
+                let laid = c.laid[i].as_ref().unwrap();
+                for (j, row) in laid.rows.iter().enumerate() {
+                    let ry = row_y + row.y;
+                    let text = row_text(row);
+                    if pressed && Rect::new(x, ry, w, row.h).contains(self.mouse)
+                        && (row.toggle || (task.machine == 0 && image_path(&text).is_some())) {
+                        interactive_press = true;
+                    }
+                    if ry + row.h < area.y || ry > area.y + area.h
+                        || row.toggle || text.is_empty()
+                        || (task.machine == 0 && image_path(&text).is_some()) {
+                        continue;
+                    }
+                    let dy = (self.mouse.1 - self.mouse.1.clamp(ry, ry + row.h)).abs();
+                    if dy < distance {
+                        distance = dy;
+                        nearest = Some((i, j));
+                    }
+                }
+                row_y += h + GAP;
+            }
+            if let Some((i, j)) = nearest.filter(|_| !interactive_press) {
+                let row = &c.laid[i].as_ref().unwrap().rows[j];
+                let mut offset = 0;
+                for run in &row.runs {
+                    if offset > 0 { offset += 1; }
+                    let mut rx = x + run.x;
+                    for ch in run.text.chars() {
+                        let advance = r.advance(run.font, run.size, run.weight, ch);
+                        if self.mouse.0 < rx + advance / 2.0 { break; }
+                        offset += ch.len_utf8();
+                        rx += advance;
+                    }
+                    if self.mouse.0 < rx + 1.0 { break; }
+                }
+                let point = (c.start + i, j, offset.min(row_text(row).len()));
+                if pressed {
+                    c.selection = Some((point, point));
+                    self.chat_drag = true;
+                } else if let Some(selection) = &mut c.selection {
+                    selection.1 = point;
+                }
+            }
+        }
         let mut y = area.y + 18.0 - top;
         if c.start > 0 && y > area.y {
             r.text(x, y - 16.0, "Loading earlier messages…", UI, 11.5, 400, t.faint, w);
@@ -715,25 +767,6 @@ impl App {
                     }
                     if !row.toggle && !text.is_empty() && linked_image.is_none() {
                         r.target(band, Cursor::Text);
-                        if (pressed || self.chat_drag) && band.contains(self.mouse) {
-                            let mut offset = 0;
-                            for run in &row.runs {
-                                if offset > 0 { offset += 1; }
-                                let mut rx = x + run.x;
-                                for ch in run.text.chars() {
-                                    let advance = r.advance(run.font, run.size, run.weight, ch);
-                                    if self.mouse.0 < rx + advance / 2.0 { break; }
-                                    offset += ch.len_utf8();
-                                    rx += advance;
-                                }
-                                if self.mouse.0 < rx + 1.0 { break; }
-                            }
-                            let point = (c.start + i, row_index, offset.min(text.len()));
-                            if pressed {
-                                c.selection = Some((point, point));
-                                self.chat_drag = true;
-                            } else if let Some(selection) = &mut c.selection { selection.1 = point; }
-                        }
                     }
                     let mut run_start = 0;
                     for run in &row.runs {
