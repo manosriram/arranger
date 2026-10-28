@@ -943,6 +943,26 @@ impl App {
     }
 }
 
+
+fn row_text(row: &Row) -> String {
+    row.runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join(" ")
+}
+
+pub(super) fn is_image(path: &std::path::Path) -> bool {
+    path.extension().and_then(|s| s.to_str()).is_some_and(|s| matches!(s.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "heic"))
+}
+
+fn image_path(text: &str) -> Option<std::path::PathBuf> {
+    let (_, rest) = text.split_once("](")?;
+    let path = std::path::PathBuf::from(rest.strip_suffix(')')?);
+    (is_image(&path) && path.is_file()).then_some(path)
+}
+
+fn open_image(path: &std::path::Path) {
+    let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let _ = Command::new(program).arg(path).spawn();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,23 +1004,4 @@ mod tests {
         c.scroll(-200.0);
         assert_eq!(c.top, None, "back at the bottom it follows again");
     }
-}
-
-fn row_text(row: &Row) -> String {
-    row.runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join(" ")
-}
-
-pub(super) fn is_image(path: &std::path::Path) -> bool {
-    path.extension().and_then(|s| s.to_str()).is_some_and(|s| matches!(s.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "heic"))
-}
-
-fn image_path(text: &str) -> Option<std::path::PathBuf> {
-    let (_, rest) = text.split_once("](")?;
-    let path = std::path::PathBuf::from(rest.strip_suffix(')')?);
-    (is_image(&path) && path.is_file()).then_some(path)
-}
-
-fn open_image(path: &std::path::Path) {
-    let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    let _ = Command::new(program).arg(path).spawn();
 }

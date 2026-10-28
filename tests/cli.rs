@@ -679,10 +679,21 @@ fn checks_run_log_and_stop() {
     assert!(list.starts_with("run 2 · stopped · 0/2 passed") && list.contains("– 3") && list.contains("– 4"), "{list}");
     assert!(start.elapsed() < Duration::from_secs(10), "stop waited for the check");
 
+    // A short, reviewable probe retains evidence outside the tree.
+    let command = r#"python3 -c 'import os; from pathlib import Path; p=Path(os.environ["ARRANGER_CHECK_ARTIFACTS"]); (p/"observed.txt").write_text("fixture behavior verified"); print(p)'"#;
+    let (ok, out) = home.arranger(&repo, &["checks", "1", "--run", "--wait", command]);
+    assert!(ok && out.contains("passed"), "{out}");
+    let (_, log) = home.arranger(&repo, &["checks", "1", "--log", "5"]);
+    let evidence = std::path::PathBuf::from(log.trim());
+    assert_eq!(std::fs::read_to_string(evidence.join("observed.txt")).unwrap(), "fixture behavior verified");
+    let (ok, out) = home.arranger(&repo, &["checks", "1", "--run", "--wait", "python3 -c 'assert False, \"wrong observable result\"'"]);
+    assert!(!ok && out.contains("failed"), "{out}");
+
     // Deleting the task takes its checks and their logs.
     assert!(home.0.join("logs/checks/1.log").exists());
     assert!(home.arranger(&repo, &["kill", "1"]).0);
     assert!(!home.0.join("logs/checks/1.log").exists());
+    assert!(!evidence.exists(), "deleting a task must remove its retained artifacts");
     assert!(!home.arranger(&repo, &["checks", "1", "--log", "1"]).0);
 }
 
@@ -733,8 +744,11 @@ fn checks_follow_turns() {
     };
     exe("agent.sh", TURNS_AGENT);
     let plan = |checks: &[&str], none: &str| {
-        let checks: Vec<String> = checks.iter().map(|c| format!(r#"{{"name":"","command":"{c}","why":"covers it"}}"#)).collect();
-        write("plan", &format!(r#"{{"checks":[{}],"none_reason":"{none}"}}"#, checks.join(",")));
+        let acceptance = if checks.is_empty() { serde_json::json!([]) } else {
+            serde_json::json!([{"criterion": "fixture outcome", "commands": checks, "gap": ""}])
+        };
+        let checks: Vec<_> = checks.iter().map(|c| serde_json::json!({"name": "", "command": c, "why": "covers fixture outcome"})).collect();
+        write("plan", &serde_json::json!({"checks": checks, "none_reason": none, "acceptance": acceptance}).to_string());
     };
     let until = |what: &str| {
         let start = Instant::now();
@@ -755,6 +769,7 @@ fn checks_follow_turns() {
     let agent = home.0.join("agent.sh");
     assert!(home.arranger(&repo, &["new", agent.to_str().unwrap(), "add b"]).0);
     home.wait_state(&repo, &["done"]);
+    assert!(home.arranger(&repo, &["settings", "coverage_fix", "0"]).0);
     exe("planner", CHECK_PLANNER);
 
     // Its turn ended with changes: planned, and the command no rule allows waits on you.
@@ -787,7 +802,7 @@ fn checks_follow_turns() {
     let out = until("approval");
     let newest = out.split("\nrun ").next().unwrap();
     assert!(newest.contains("sed -i.bak s/a/z/ lib.rs") && newest.contains("(failed before)") && !newest.contains("touch made-by-check"), "{out}");
-    assert!(std::fs::read_to_string(home.0.join("asked")).unwrap().contains("Still failing from before (these run anyway; don't repeat them):\n- sed -i.bak s/a/z/ lib.rs"));
+    assert!(std::fs::read_to_string(home.0.join("asked")).unwrap().contains("Still failing (run automatically; do not repeat):\nsed -i.bak s/a/z/ lib.rs"));
     assert!(home.arranger(&repo, &["checks", "1", "--drop", "sed -i.bak s/a/z/ lib.rs"]).0);
 
     // A new prompt while checks are planned makes them stale; code no check covers is unverified.
@@ -806,7 +821,299 @@ fn checks_follow_turns() {
     std::fs::remove_file(home.0.join("slow")).unwrap();
     let out = until("unverified");
     assert!(out.starts_with("run 5 ") && out.contains("Code changed and no check covers it"), "{out}");
+    home.wait_state(&repo, &["needs-you"]);
+
+    // A passing command with an uncovered user outcome stays unverified and blocks merge.
+    write("plan", &serde_json::json!({
+        "checks": [{"name": "file exists", "command": "test -f lib.rs", "why": "supporting evidence only"}],
+        "none_reason": "",
+        "acceptance": [{"criterion": "requested behavior", "commands": [], "gap": "No behavioral test exists"}]
+    }).to_string());
+    assert!(home.arranger(&repo, &["checks", "1", "--run"]).0);
+    // This exact command was already approved for the repository.
+    let out = until("unverified");
+    assert!(out.contains("1/1 passed") && out.contains("No behavioral test exists"), "{out}");
+    let asked = std::fs::read_to_string(home.0.join("asked")).unwrap();
+    assert!(asked.contains("add b") && asked.contains("turn 4"), "original intent and latest scope: {asked}");
+    let db = rusqlite::Connection::open(home.0.join("arranger.db")).unwrap();
+    let complete: bool = db.query_row("SELECT coverage_complete FROM check_runs ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    assert!(!complete);
+    let (ok, out) = home.arranger(&repo, &["commit", "1", "--merge", "unchecked behavior"]);
+    assert!(!ok && out.contains("has not passed checks"), "{out}");
+}
+
+#[test]
+fn documentation_changes_without_acceptance_evidence_are_unverified() {
+    let home = Home(std::env::temp_dir().join(format!("arranger-doc-checks-{}", std::process::id())));
+    let repo = home.0.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README.md"), "Original usage\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "initial docs"]);
+    let executable = |name: &str, source: &str| {
+        let path = home.0.join(name);
+        std::fs::write(&path, source).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        path
+    };
+    let agent = executable("agent.sh", TURNS_AGENT);
+    std::fs::write(home.0.join("edit0"), "echo 'Updated usage' >> README.md").unwrap();
+    executable("planner", "#!/bin/sh\ncat >/dev/null\nprintf '{\"structured_output\":{\"copy\":[],\"commands\":[],\"note\":\"\"}}'\n");
+    assert!(home.arranger(&repo, &["new", agent.to_str().unwrap(), "update the usage documentation"]).0);
     home.wait_state(&repo, &["done"]);
+    std::fs::write(home.0.join("plan"), r#"{"checks":[],"none_reason":"No runnable documentation evidence","acceptance":[]}"#).unwrap();
+    assert!(home.arranger(&repo, &["settings", "coverage_fix", "0"]).0);
+    executable("planner", CHECK_PLANNER);
+    let start = Instant::now();
+    loop {
+        let (_, output) = home.arranger(&repo, &["checks", "1"]);
+        if output.starts_with("run 1 · unverified") {
+            assert!(output.contains("No runnable documentation evidence"), "{output}");
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(15), "docs were not marked unverified: {output}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn check_planner_toggle_blocks_model_planning_and_repairs_but_keeps_manual_checks() {
+    let home = Home(std::env::temp_dir().join(format!("arranger-planner-toggle-{}", std::process::id())));
+    let repo = home.0.join("repo");
+    std::fs::create_dir_all(repo.join("bin")).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "fixture"]);
+    let executable = |name: &str, source: &str| {
+        let path = home.0.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, source).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        path
+    };
+    let agent = executable("bin/claude", HEADLESS_CLAUDE);
+    executable("planner", "#!/bin/sh\ncat >/dev/null\nprintf '{\"structured_output\":{\"copy\":[],\"commands\":[],\"note\":\"\"}}'\n");
+    assert_eq!(home.arranger(&repo, &["settings", "check_planner"]).1.trim(), "1");
+    for invalid in ["2", "-1", "maybe"] {
+        assert!(!home.arranger(&repo, &["settings", "check_planner", invalid]).0);
+    }
+    assert!(home.arranger(&repo, &["new", "--headless", agent.to_str().unwrap(), "update usage"]).0);
+    home.wait_state(&repo, &["done"]);
+    assert_eq!(home.arranger(&repo, &["settings", "check_planner", "off"]).1.trim(), "0");
+    executable("planner", CHECK_PLANNER);
+    std::fs::write(home.0.join("plan"), r#"{"checks":[],"none_reason":"No driver available","acceptance":[{"criterion":"requested behavior","commands":[],"gap":"missing tests"}]}"#).unwrap();
+    let wt = home.0.join("worktrees/repo/1");
+    std::fs::write(wt.join("README.md"), "updated fixture\n").unwrap();
+    assert!(home.arranger(&repo, &["send", "1", "finish"]).0);
+    home.wait_state(&repo, &["done"]);
+    // Let the automatic planning timer expire: disabling must gate before any side-run.
+    std::thread::sleep(Duration::from_millis(2400));
+    assert!(!home.0.join("plans").exists());
+    let (ok, output) = home.arranger(&repo, &["checks", "1", "--run"]);
+    assert!(!ok && output.contains("planner is off"), "{output}");
+    assert!(home.arranger(&repo, &["checks", "1", "--run", "--wait", "test -f README.md"]).0);
+    assert!(home.arranger(&repo, &["settings", "auto_fix", "2"]).0);
+    let (ok, output) = home.arranger(&repo, &["checks", "1", "--run", "--wait", "false"]);
+    assert!(!ok && output.contains("failed"), "{output}");
+    let events = home.arranger(&repo, &["events", "1"]).1;
+    assert!(!events.contains("prompt: Missing acceptance tests") && !events.contains("prompt: These checks failed"), "{events}");
+    assert!(!home.0.join("plans").exists(), "explicit commands must not invoke the check planner");
+    assert!(home.arranger(&repo, &["stop"]).0);
+    assert_eq!(home.arranger(&repo, &["settings", "check_planner"]).1.trim(), "0");
+    assert_eq!(home.arranger(&repo, &["settings", "check_planner", "on"]).1.trim(), "1");
+}
+
+#[test]
+fn disabling_the_check_planner_cancels_inflight_plans_and_can_be_reenabled() {
+    let home = Home(std::env::temp_dir().join(format!("arranger-planner-cancel-{}", std::process::id())));
+    let repo = home.0.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "fixture"]);
+    let executable = |name: &str, source: &str| {
+        let path = home.0.join(name);
+        std::fs::write(&path, source).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        path
+    };
+    let agent = executable("agent.sh", TURNS_AGENT);
+    std::fs::write(home.0.join("edit0"), "echo 'updated' >> README.md").unwrap();
+    executable("planner", "#!/bin/sh\ncat >/dev/null\nprintf '{\"structured_output\":{\"copy\":[],\"commands\":[],\"note\":\"\"}}'\n");
+    assert!(home.arranger(&repo, &["new", agent.to_str().unwrap(), "update usage"]).0);
+    home.wait_state(&repo, &["done"]);
+    assert!(home.arranger(&repo, &["settings", "coverage_fix", "0"]).0);
+    std::fs::write(home.0.join("slow"), "").unwrap();
+    std::fs::write(home.0.join("plan"), r#"{"checks":[{"name":"fixture","command":"test -f README.md","why":"fixture"}],"none_reason":"","acceptance":[{"criterion":"fixture","commands":["test -f README.md"],"gap":""}]}"#).unwrap();
+    executable("planner", CHECK_PLANNER);
+    let start = Instant::now();
+    while !home.0.join("asked").exists() {
+        assert!(start.elapsed() < Duration::from_secs(15), "planner never started");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(home.arranger(&repo, &["settings", "check_planner", "off"]).0);
+    let (_, output) = home.arranger(&repo, &["checks", "1"]);
+    assert!(output.starts_with("run 1 · stopped") && output.contains("Check planner turned off"), "{output}");
+    std::fs::remove_file(home.0.join("slow")).unwrap();
+    assert!(home.arranger(&repo, &["settings", "check_planner", "on"]).0);
+    assert!(home.arranger(&repo, &["checks", "1", "--run"]).0);
+    let start = Instant::now();
+    loop {
+        let (_, output) = home.arranger(&repo, &["checks", "1"]);
+        if output.starts_with("run 2 · approval") { break; }
+        assert!(start.elapsed() < Duration::from_secs(15), "planner did not restart: {output}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(home.arranger(&repo, &["checks", "1", "--approve"]).0);
+    let start = Instant::now();
+    loop {
+        let (_, output) = home.arranger(&repo, &["checks", "1"]);
+        if output.starts_with("run 2 · passed") { break; }
+        assert!(start.elapsed() < Duration::from_secs(15), "reenabled checks did not pass: {output}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn missing_tests_are_written_by_the_agent_and_independently_verified_for_any_project() {
+    for kind in ["browser", "native", "mobile"] {
+        let home = Home(std::env::temp_dir().join(format!("arranger-coverage-{kind}-{}", std::process::id())));
+        let repo = home.0.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        // These are protocol fixtures, not browser/device drivers. The regression command
+        // really tests changed project code; Arranger must impose no GUI-specific protocol.
+        std::fs::write(repo.join("project-kind.txt"), kind).unwrap();
+        std::fs::write(repo.join(".gitignore"), "__pycache__/\n").unwrap();
+        std::fs::write(repo.join("logic.py"), "def close(draft, saved, save=False):\n    return saved\n").unwrap();
+        std::fs::write(repo.join("test_existing.py"), "import unittest\nfrom logic import close\nclass Existing(unittest.TestCase):\n    def test_original(self):\n        self.assertEqual(close('new', 'old'), 'old')\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "fixture"]);
+        let executable = |name: &str, source: &str| {
+            let path = home.0.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, source).unwrap();
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+            path
+        };
+        let regression = "import unittest\nfrom logic import close\nclass Behavior(unittest.TestCase):\n    def test_cancel_discards_draft(self):\n        self.assertEqual(close('new', 'old'), 'old')\n    def test_save_keeps_draft(self):\n        self.assertEqual(close('new', 'old', save=True), 'new')\n";
+        let corrected_logic = "def close(draft, saved, save=False):\n    return draft if save else saved\n";
+        let branch = format!("    elif prompt.startswith('Missing acceptance tests'):\n        open(home + '/feedback', 'a').write(json.dumps(prompt) + '\\n')\n        open('test_behavior.py', 'w').write({})\n        open('logic.py', 'w').write({})\n        result()\n", serde_json::to_string(regression).unwrap(), serde_json::to_string(corrected_logic).unwrap());
+        let source = HEADLESS_CLAUDE.replace("    elif prompt == \"hang\":", &(branch + "    elif prompt == \"hang\":"));
+        let agent = executable("bin/claude", &source);
+        executable("planner", "#!/bin/sh\ncat >/dev/null\nprintf '{\"structured_output\":{\"copy\":[],\"commands\":[],\"note\":\"\"}}'\n");
+        let (ok, output) = home.arranger(&repo, &["new", "--headless", agent.to_str().unwrap(), "Cancel discards edits; Save keeps edits using this project's GUI framework"]);
+        assert!(ok, "{output}");
+        home.wait_state(&repo, &["done"]);
+        let wt = home.0.join("worktrees/repo/1");
+        std::fs::write(wt.join("logic.py"), if kind == "mobile" { "def close(draft, saved, save=False):\n    return draft\n" } else { corrected_logic }).unwrap();
+        executable("planner", r#"#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+sys.stdin.read()
+if __import__('os').environ.get('ARRANGER_SIDE_KIND') == 'summary':
+    print(json.dumps({'title':'Verified fixture','overview':'Added regression tests','files':[],'risks':[]}))
+    sys.exit(0)
+ready = Path('test_behavior.py').exists()
+kind = Path('project-kind.txt').read_text()
+command = 'python3 -m unittest test_existing test_behavior' if ready else 'python3 -m unittest test_existing'
+checks = [{'name':'project regression tests','command':command,'why':'assert save/cancel results'}]
+if kind == 'native' and not ready:
+    checks = []
+criterion = {'criterion':'Cancel discards edits; Save keeps edits','commands':[command] if ready else [],'gap':'' if ready else 'Add missing cancel/save interaction regression tests using the project framework'}
+if kind == 'mobile' and not ready:
+    criterion['commands'] = ['python3 -m unittest missing_test']
+print(json.dumps({'checks':checks,'none_reason':'','acceptance':[criterion]}))
+"#);
+        assert!(home.arranger(&repo, &["send", "1", "finish the requested change"]).0);
+        let start = Instant::now();
+        loop {
+            let (_, output) = home.arranger(&repo, &["checks", "1"]);
+            if output.starts_with("run 2 · passed") { break; }
+            assert!(start.elapsed() < Duration::from_secs(25), "{kind}: feedback did not lead to passing tests: {output}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let feedback = std::fs::read_to_string(home.0.join("feedback")).unwrap();
+        assert_eq!(feedback.lines().count(), 1, "each run must get one feedback message");
+        assert!(feedback.contains("Cancel discards edits") && feedback.contains("project-local interaction/visual test harness"));
+        assert!(!feedback.contains("scripts/gui-check.py"));
+        if kind == "mobile" { assert!(feedback.contains("Also fix the observed failures")); }
+        assert_eq!(std::fs::read_to_string(wt.join("test_behavior.py")).unwrap(), regression);
+        let db = rusqlite::Connection::open(home.0.join("arranger.db")).unwrap();
+        let attempts: u32 = db.query_row("SELECT coverage_rounds FROM tasks WHERE id = 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(attempts, 0, "successful verification resets the repair budget");
+    }
+}
+
+#[test]
+fn missing_test_repairs_replan_unchanged_work_and_stop_at_the_persisted_limit() {
+    let home = Home(std::env::temp_dir().join(format!("arranger-coverage-limit-{}", std::process::id())));
+    let repo = home.0.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "fixture"]);
+    let executable = |name: &str, source: &str| {
+        let path = home.0.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, source).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        path
+    };
+    let agent = executable("bin/claude", HEADLESS_CLAUDE);
+    executable("planner", "#!/bin/sh\ncat >/dev/null\nprintf '{\"structured_output\":{\"copy\":[],\"commands\":[],\"note\":\"\"}}'\n");
+    assert!(home.arranger(&repo, &["new", "--headless", agent.to_str().unwrap(), "verify the desktop interaction"]).0);
+    home.wait_state(&repo, &["done"]);
+    assert_eq!(home.arranger(&repo, &["settings", "coverage_fix"]).1.trim(), "2");
+    for invalid in ["-1", "11", "bad"] {
+        assert!(!home.arranger(&repo, &["settings", "coverage_fix", invalid]).0);
+    }
+    let wt = home.0.join("worktrees/repo/1");
+    std::fs::write(wt.join("README.md"), "changed example\n").unwrap();
+    std::fs::write(home.0.join("plan"), r#"{"checks":[],"none_reason":"No desktop driver available","acceptance":[{"criterion":"Escape closes settings without saving","commands":[],"gap":"The project needs a desktop driver"}]}"#).unwrap();
+    executable("planner", CHECK_PLANNER);
+    assert!(home.arranger(&repo, &["send", "1", "finish"]).0);
+    let start = Instant::now();
+    loop {
+        let (_, output) = home.arranger(&repo, &["checks", "1"]);
+        if output.starts_with("run 3 · unverified") && output.contains("repair limit reached (2/2)") { break; }
+        assert!(start.elapsed() < Duration::from_secs(25), "repair loop did not stop: {output}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    home.wait_state(&repo, &["needs-you"]);
+    let events = home.arranger(&repo, &["events", "1"]).1;
+    assert_eq!(events.matches("prompt: Missing acceptance tests").count(), 2, "{events}");
+    let (_, report) = home.arranger(&repo, &["checks", "1", "--report"]);
+    assert!(report.contains("Escape closes settings") && report.contains("desktop driver"));
+    assert!(home.arranger(&repo, &["checks", "1", "--run"]).0);
+    let wait_limit = |number| {
+        let start = Instant::now();
+        loop {
+            let (_, output) = home.arranger(&repo, &["checks", "1"]);
+            if output.starts_with(&format!("run {number} · unverified")) && output.contains("repair limit reached (2/2)") { break; }
+            assert!(start.elapsed() < Duration::from_secs(25), "repair budget was not enforced: {output}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    wait_limit(4);
+    let events = home.arranger(&repo, &["events", "1"]).1;
+    assert_eq!(events.matches("prompt: Missing acceptance tests").count(), 2);
+    // A new user request resets the budget even if the agent still cannot edit/test.
+    assert!(home.arranger(&repo, &["send", "1", "retry adding the missing tests"]).0);
+    wait_limit(7);
+    let events = home.arranger(&repo, &["events", "1"]).1;
+    assert_eq!(events.matches("prompt: Missing acceptance tests").count(), 4);
+    assert!(home.arranger(&repo, &["stop"]).0);
+    assert_eq!(home.arranger(&repo, &["settings", "coverage_fix"]).1.trim(), "2");
+    let db = rusqlite::Connection::open(home.0.join("arranger.db")).unwrap();
+    let used: u32 = db.query_row("SELECT coverage_rounds FROM tasks WHERE id = 1", [], |row| row.get(0)).unwrap();
+    assert_eq!(used, 2);
+    let (ok, output) = home.arranger(&repo, &["commit", "1", "--merge", "unchecked"]);
+    assert!(!ok && output.contains("has not passed checks"), "{output}");
 }
 
 #[test]
@@ -839,7 +1146,7 @@ fn failed_checks_auto_fix_is_bounded_and_persisted() {
     assert!(!home.arranger(&repo, &["settings", "unknown", "1"]).0);
     let wt = home.0.join("worktrees/repo/1");
     std::fs::write(wt.join("lib.rs"), "fn changed() {}\n").unwrap();
-    std::fs::write(home.0.join("plan"), r#"{"checks":[{"name":"test","command":"false","why":"fixture"}],"none_reason":""}"#).unwrap();
+    std::fs::write(home.0.join("plan"), r#"{"checks":[{"name":"test","command":"false","why":"fixture"}],"none_reason":"","acceptance":[{"criterion":"fixture outcome","commands":["false"],"gap":""}]}"#).unwrap();
     exe(&planner, CHECK_PLANNER);
     assert!(home.arranger(&repo, &["send", "1", "check this"]).0);
     let wait_run = |run: u64, state: &str| {

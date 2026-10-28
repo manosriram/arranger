@@ -319,7 +319,8 @@ pub fn run() -> io::Result<()> {
     )
     .map_err(io::Error::other)?;
     for col in ["tasks ADD COLUMN fix_rounds INTEGER NOT NULL DEFAULT 0", "check_runs ADD COLUMN accepted INTEGER NOT NULL DEFAULT 0", "check_runs ADD COLUMN auto INTEGER NOT NULL DEFAULT 0", "check_runs ADD COLUMN note TEXT NOT NULL DEFAULT ''",
-        "checks ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'", "checks ADD COLUMN note TEXT NOT NULL DEFAULT ''"] {
+        "tasks ADD COLUMN coverage_rounds INTEGER NOT NULL DEFAULT 0", "tasks ADD COLUMN coverage_run INTEGER NOT NULL DEFAULT 0",
+        "check_runs ADD COLUMN coverage_complete INTEGER NOT NULL DEFAULT 1", "checks ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'", "checks ADD COLUMN note TEXT NOT NULL DEFAULT ''"] {
         let _ = db.execute(&format!("ALTER TABLE {col}"), []);
     }
     // Checks that were running or being planned when the daemon stopped. Approvals still wait.
@@ -369,6 +370,7 @@ pub fn run() -> io::Result<()> {
         summaries: HashMap::new(),
         merges: HashMap::new(),
     };
+    d.prune_check_artifacts();
     d.start_queued();
 
     let mut events = Events::with_capacity(256);
@@ -476,6 +478,14 @@ fn git_in(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir);
     cmd
+}
+
+fn retained_check_artifacts(db: &Connection) -> rusqlite::Result<std::collections::HashSet<u64>> {
+    db.prepare(
+        "SELECT c.id FROM checks c JOIN check_runs r ON r.id = c.run
+         WHERE r.state IN ('running', 'planning', 'approval') OR r.id IN
+         (SELECT id FROM check_runs WHERE task = r.task ORDER BY id DESC LIMIT 3)"
+    )?.query_map([], |row| row.get(0))?.collect()
 }
 
 fn now() -> u64 {
@@ -721,7 +731,7 @@ impl Daemon {
                 }
             }
             Request::Prompt { id, text } => {
-                let _ = self.db.execute("UPDATE tasks SET fix_rounds = 0 WHERE id = ?1", [id]);
+                let _ = self.db.execute("UPDATE tasks SET fix_rounds = 0, coverage_rounds = 0, coverage_run = 0 WHERE id = ?1", [id]);
                 match self.tasks.get_mut(&id) {
                     Some(task) if task.headless.is_some() => {
                         let agent = task.headless.as_mut().unwrap();
@@ -1924,7 +1934,7 @@ impl Daemon {
 
     fn new_run(&mut self, task: u64, tree: &str, state: &str, auto: bool) -> Result<u64, String> {
         self.db
-            .execute("INSERT INTO check_runs (task, started, tree, state, auto) VALUES (?1, ?2, ?3, ?4, ?5)", params![task, now_secs(), tree, state, auto])
+            .execute("INSERT INTO check_runs (task, started, tree, state, auto, coverage_complete) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![task, now_secs(), tree, state, auto, !auto])
             .map_err(e2s)?;
         self.dirty = true;
         Ok(self.db.last_insert_rowid() as u64)
@@ -1955,6 +1965,15 @@ impl Daemon {
         }
         self.passes.insert(task, Pass { run, queue, current: None });
         self.next_check(task);
+    }
+
+    /// Keep evidence for the latest three runs per task and any active runs; remove orphans too.
+    fn prune_check_artifacts(&self) {
+        let keep = retained_check_artifacts(&self.db);
+        let Ok(keep) = keep else { return };
+        if let Err(error) = checks::prune_artifacts(&self.data.join("artifacts/checks"), &keep) {
+            eprintln!("check artifact cleanup: {error}");
+        }
     }
 
     fn check_log(&self, check: u64) -> PathBuf {
@@ -1992,6 +2011,9 @@ impl Daemon {
             .db
             .query_row("SELECT c.command, t.worktree, t.repo FROM checks c JOIN tasks t ON t.id = c.task WHERE c.id = ?1", [check], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .map_err(e2s)?;
+        let artifacts = self.data.join(format!("artifacts/checks/{check}"));
+        if artifacts.exists() { fs::remove_dir_all(&artifacts).map_err(e2s)?; }
+        security::private_dir(&artifacts).map_err(e2s)?;
         let log = security::private_file(&self.check_log(check), false).map_err(e2s)?;
         log.set_len(0).map_err(e2s)?;
         Command::new("sh")
@@ -2000,6 +2022,7 @@ impl Daemon {
             .stdin(Stdio::null())
             .stdout(log.try_clone().map_err(e2s)?)
             .stderr(log)
+            .env("ARRANGER_CHECK_ARTIFACTS", &artifacts)
             .env("ARRANGER_TASK", task.to_string())
             .env("ARRANGER_ROOT", &repo)
             .env("ARRANGER_WORKTREE", &wt)
@@ -2014,15 +2037,17 @@ impl Daemon {
             .map_err(e2s)
     }
 
-    /// The run is over: failed if a check failed, stopped if one was stopped, else passed.
+    /// Passing commands verify a run only when its planned acceptance coverage is complete.
     fn end_run(&mut self, task: u64) {
         let Some(pass) = self.passes.remove(&task) else { return };
         let count = |state: &str| -> u32 {
             self.db.query_row("SELECT COUNT(*) FROM checks WHERE run = ?1 AND state = ?2", params![pass.run, state], |r| r.get(0)).unwrap_or(0)
         };
-        let state = if count("failed") > 0 { "failed" } else if count("stopped") > 0 { "stopped" } else { "passed" };
+        let complete = self.db.query_row("SELECT coverage_complete FROM check_runs WHERE id = ?1", [pass.run], |r| r.get::<_, bool>(0)).unwrap_or(false);
+        let state = checks::run_outcome(count("failed"), count("stopped"), complete);
         let _ = self.db.execute("UPDATE check_runs SET state = ?1, ended = ?2 WHERE id = ?3", params![state, now_secs(), pass.run]);
         self.dirty = true;
+        self.prune_check_artifacts();
         if state == "failed" {
             let _ = self.db.execute("UPDATE summaries SET state = 'stale' WHERE task = ?1 AND tree = (SELECT tree FROM check_runs WHERE id = ?2)", params![task, pass.run]);
         }
@@ -2032,12 +2057,14 @@ impl Daemon {
             if let Err(output) = result { self.send(pending.conn, &proto::reply_frame(&Reply::JobDone { ok: false, output })); }
             return;
         }
-        if state == "failed" {
+        if state == "unverified" || (state == "failed" && !complete) {
+            if let Err(error) = self.repair_missing_tests(task) { eprintln!("task {task}: missing tests: {error}"); }
+        } else if state == "failed" {
             if let Err(e) = self.auto_fix(task) {
                 eprintln!("task {task}: auto-fix: {e}");
             }
         } else if state == "passed" {
-            let _ = self.db.execute("UPDATE tasks SET fix_rounds = 0 WHERE id = ?1", [task]);
+            let _ = self.db.execute("UPDATE tasks SET fix_rounds = 0, coverage_rounds = 0, coverage_run = 0 WHERE id = ?1", [task]);
         }
     }
 
@@ -2171,18 +2198,22 @@ impl Daemon {
             ended = true;
         }
         self.dirty |= ended;
+        if ended { self.prune_check_artifacts(); }
         ended
     }
 
     /// After a turn: plans checks for what it changed, unless nothing changed since the last
     /// checks, or nobody can plan them.
     fn plan_checks(&mut self, id: u64, force: bool) -> Result<(), String> {
+        if !self.check_planner_enabled()? {
+            return if force { Err("check planner is off; enable it or supply explicit check commands".into()) } else { Ok(()) };
+        }
         if self.passes.contains_key(&id) || self.check_plans.contains_key(&id) || self.merges.contains_key(&id) || self.jobs.values().any(|j| j.task == id) {
             return Err("checks or a commit are already running".into());
         }
-        let (agent, repo, model, base_commit): (String, String, String, String) = self
+        let (agent, repo, model, base_commit, original_prompt): (String, String, String, String, String) = self
             .db
-            .query_row("SELECT agent, repo, model, base_commit FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .query_row("SELECT agent, repo, model, base_commit, prompt FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
             .map_err(e2s)?;
         let Some(planner) = side::planner(&agent) else { return if force { Err("check planning is disabled or no planner is installed; supply check commands explicitly".into()) } else { Ok(()) } };
         let wt = self.checkable_worktree(id)?;
@@ -2220,7 +2251,19 @@ impl Daemon {
             .take(40)
             .map(str::to_string)
             .collect();
-        let prompts = turn_prompts(&self.events(id).unwrap_or_default());
+        let events = self.events(id).unwrap_or_default();
+        let mut prompts = vec![format!("Original task: {}", checks::bounded(&original_prompt, 1024))];
+        let latest = turn_prompts(&events);
+        let mut remaining = 2800;
+        let mut recent = Vec::new();
+        for text in latest.iter().rev().take(4) {
+            if remaining == 0 { break; }
+            let text = checks::bounded(text, remaining);
+            remaining = remaining.saturating_sub(text.len());
+            recent.push(text);
+        }
+        recent.reverse();
+        prompts.extend(recent);
         let previous: Vec<(String, String)> = self
             .db
             .prepare("SELECT command, state, exit FROM checks WHERE run = (SELECT MAX(id) FROM check_runs WHERE task = ?1 AND state NOT IN ('planning', 'approval')) ORDER BY pos")
@@ -2293,15 +2336,20 @@ impl Daemon {
         let (run, repo, changed) = (plan.run, plan.repo.clone(), plan.changed.clone());
         let answer = plan.side.finish(ok).and_then(|(answer, _cost)| checks::plan_from(answer));
         let sticky = self.sticky_checks(task);
-        let (planned, note) = match answer {
-            Ok((planned, reason)) => (planned, reason),
-            Err(e) if !sticky.is_empty() => (Vec::new(), format!("Couldn't plan checks ({e}); running the ones still failing")),
+        let (planned, mut note, mut incomplete) = match answer {
+            Ok(result) => result,
+            Err(e) if !sticky.is_empty() => (Vec::new(), format!("Couldn't plan checks ({e}); running the ones still failing"), true),
             Err(e) => {
                 let _ = self.db.execute("UPDATE check_runs SET state = 'error', note = ?1, ended = ?2 WHERE id = ?3", params![format!("Couldn't plan checks: {e}"), now_secs(), run]);
                 self.dirty = true;
                 return;
             }
         };
+        if planned.is_empty() && !changed.is_empty() {
+            incomplete = true;
+            if note.is_empty() { note = if checks::code_changed(&changed) { "Code changed and no check covers it" } else { "Files changed and no check covers the requested outcome" }.into(); }
+        }
+        let _ = self.db.execute("UPDATE check_runs SET coverage_complete = ?1 WHERE id = ?2", params![!incomplete, run]);
         let mut specs: Vec<(proto::CheckSpec, &str)> = planned.into_iter().map(|s| (s, "planned")).collect();
         for s in sticky {
             if !specs.iter().any(|(p, _)| p.command == s.command) {
@@ -2310,7 +2358,7 @@ impl Daemon {
         }
         specs.truncate(checks::MAX_CHECKS);
         if specs.is_empty() {
-            let (state, note) = if checks::code_changed(&changed) {
+            let (state, note) = if incomplete || !changed.is_empty() {
                 ("unverified", if note.is_empty() { "Code changed and no check covers it".to_string() } else { note })
             } else {
                 ("skipped", if note.is_empty() { "Nothing here needs checking".to_string() } else { note })
@@ -2318,6 +2366,8 @@ impl Daemon {
             let _ = self.db.execute("UPDATE check_runs SET state = ?1, note = ?2, ended = ?3 WHERE id = ?4", params![state, note, now_secs(), run]);
             self.dirty = true;
             if state == "skipped" { self.schedule_summary(task); }
+            if state == "unverified"
+                && let Err(error) = self.repair_missing_tests(task) { eprintln!("task {task}: missing tests: {error}"); }
             return;
         }
         let _ = self.db.execute("UPDATE check_runs SET note = ?1 WHERE id = ?2", params![note, run]);
@@ -2372,7 +2422,15 @@ impl Daemon {
             if !idle || self.passes.contains_key(&id) || self.check_plans.contains_key(&id) {
                 continue;
             }
-            if let Err(e) = self.plan_checks(id, false) {
+            // A test-writing response may have no edits. Reassess once per requested attempt anyway.
+            let coverage_limit: u32 = self.setting("coverage_fix", None).ok().and_then(|value| value.parse().ok()).unwrap_or(0);
+            let repair = self.db.query_row(
+                "SELECT (coverage_run > 0 AND coverage_run = (SELECT MAX(id) FROM check_runs WHERE task = ?1))
+                 OR (coverage_rounds < ?2 AND (SELECT state FROM check_runs WHERE task = ?1 ORDER BY id DESC LIMIT 1) = 'unverified')
+                 FROM tasks WHERE id = ?1",
+                params![id, coverage_limit], |row| row.get::<_, bool>(0),
+            ).unwrap_or(false);
+            if let Err(e) = self.plan_checks(id, repair) {
                 eprintln!("task {id}: checks: {e}");
             }
         }
@@ -2466,16 +2524,39 @@ impl Daemon {
         }
     }
 
-    fn setting(&self, key: &str, value: Option<&str>) -> Result<String, String> {
-        if key != "auto_fix" {
+    fn check_planner_enabled(&self) -> Result<bool, String> {
+        let value: Option<String> = self.db.query_row("SELECT value FROM settings WHERE key = 'check_planner'", [], |row| row.get(0)).optional().map_err(e2s)?;
+        Ok(value.as_deref().unwrap_or("1") == "1")
+    }
+
+    fn setting(&mut self, key: &str, value: Option<&str>) -> Result<String, String> {
+        if !matches!(key, "auto_fix" | "coverage_fix" | "check_planner") {
             return Err(format!("unknown setting: {key}"));
         }
         if let Some(value) = value {
-            let rounds: u32 = value.parse().map_err(|_| "auto_fix must be an integer from 0 to 10")?;
-            if rounds > 10 { return Err("auto_fix must be an integer from 0 to 10".into()); }
-            self.db.execute("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![key, rounds.to_string()]).map_err(e2s)?;
+            let canonical = if key == "check_planner" {
+                match value { "1" | "on" | "true" => "1".to_string(), "0" | "off" | "false" => "0".to_string(),
+                    _ => return Err("check_planner must be on/off or 1/0".into()) }
+            } else {
+                let rounds: u32 = value.parse().map_err(|_| "check repair limits must be an integer from 0 to 10")?;
+                if rounds > 10 { return Err("check repair limits must be an integer from 0 to 10".into()); }
+                rounds.to_string()
+            };
+            self.db.execute("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![key, canonical]).map_err(e2s)?;
+            if key == "check_planner" && canonical == "0" {
+                self.auto_due.clear();
+                // Planning and command execution are mutually exclusive for a task: cancel
+                // planner processes without interrupting already-running explicit commands.
+                let planning: Vec<(u64, u64)> = self.check_plans.iter().map(|(&id, plan)| (id, plan.run)).collect();
+                for (id, run) in planning {
+                    self.end_checks(id, "stopped");
+                    self.db.execute("UPDATE check_runs SET note = 'Check planner turned off' WHERE id = ?1", [run]).map_err(e2s)?;
+                }
+                self.dirty = true;
+            }
         }
-        Ok(self.db.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0)).optional().map_err(e2s)?.unwrap_or_else(|| "0".into()))
+        Ok(self.db.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0)).optional().map_err(e2s)?
+            .unwrap_or_else(|| match key { "check_planner" => "1", "coverage_fix" => "2", _ => "0" }.into()))
     }
 
     fn failed_run(&self, id: u64) -> Result<proto::CheckRun, String> {
@@ -2501,7 +2582,9 @@ impl Daemon {
     }
 
     fn check_report(&self, id: u64) -> Result<String, String> {
-        let run = self.failed_run(id)?;
+        let run = self.check_runs(id)?.into_iter().next().ok_or("no check run")?;
+        if run.state == "unverified" { return Ok(checks::missing_tests_report(&run.note)); }
+        if run.state != "failed" { return Err("the latest checks have not failed and have no missing acceptance tests".into()); }
         let mut failures = Vec::new();
         for check in run.checks.into_iter().filter(|c| c.state == "failed") {
             let mut console = Console::default();
@@ -2520,6 +2603,7 @@ impl Daemon {
     }
 
     fn auto_fix(&mut self, id: u64) -> Result<(), String> {
+        if !self.check_planner_enabled()? { return Ok(()); }
         let limit: u32 = self.setting("auto_fix", None)?.parse().map_err(e2s)?;
         let used: u32 = self.db.query_row("SELECT fix_rounds FROM tasks WHERE id = ?1", [id], |r| r.get(0)).map_err(e2s)?;
         if used >= limit { return Ok(()); }
@@ -2532,7 +2616,41 @@ impl Daemon {
         if run.accepted || checks::tree_hash(Path::new(&wt))? != run.tree { return Ok(()); }
         let text = self.check_report(id)?;
         self.db.execute("UPDATE tasks SET fix_rounds = fix_rounds + 1 WHERE id = ?1", [id]).map_err(e2s)?;
-        let task = self.tasks.get_mut(&id).unwrap();
+        self.send_check_feedback(id, text, "fixing failed checks")
+    }
+
+    /// Ask the existing coding agent to add missing tests, with a separate durable retry budget.
+    fn repair_missing_tests(&mut self, id: u64) -> Result<(), String> {
+        if !self.check_planner_enabled()? { return Ok(()); }
+        let Some(run) = self.check_runs(id)?.into_iter().next() else { return Ok(()) };
+        let complete: bool = self.db.query_row("SELECT coverage_complete FROM check_runs WHERE id = ?1", [run.id], |row| row.get(0)).map_err(e2s)?;
+        if !run.auto || run.accepted || (run.state != "unverified" && (run.state != "failed" || complete)) { return Ok(()); }
+        let limit: u32 = self.setting("coverage_fix", None)?.parse().map_err(e2s)?;
+        let (used, sent): (u32, u64) = self.db.query_row(
+            "SELECT coverage_rounds, coverage_run FROM tasks WHERE id = ?1", [id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(e2s)?;
+        if limit == 0 || sent == run.id { return Ok(()); }
+        if used >= limit {
+            let suffix = format!(" Missing-test repair limit reached ({used}/{limit}); review the remaining gap or change coverage_fix.");
+            if !run.note.contains("Missing-test repair limit reached") {
+                self.db.execute("UPDATE check_runs SET note = note || ?1 WHERE id = ?2", params![suffix, run.id]).map_err(e2s)?;
+            }
+            return Ok(());
+        }
+        let Some(task) = self.tasks.get(&id) else { return Ok(()) };
+        if task.activity != Activity::Done || task.need.is_some() || task.queued > 0 || task.interrupted
+            || task.headless.as_ref().is_some_and(Agent::asking) || self.asks.iter().any(|ask| ask.0 == id) {
+            return Ok(());
+        }
+        if checks::tree_hash(Path::new(&self.checkable_worktree(id)?))? != run.tree { return Ok(()); }
+        let mut text = checks::missing_tests_report(&run.note);
+        if run.state == "failed" { text.push_str(&format!("\n\nAlso fix the observed failures:\n{}", self.check_report(id)?)); }
+        self.db.execute("UPDATE tasks SET coverage_rounds = coverage_rounds + 1, coverage_run = ?1 WHERE id = ?2", params![run.id, id]).map_err(e2s)?;
+        self.send_check_feedback(id, text, "adding missing acceptance tests")
+    }
+
+    fn send_check_feedback(&mut self, id: u64, text: String, action: &str) -> Result<(), String> {
+        let task = self.tasks.get_mut(&id).ok_or("the coding agent is not running")?;
         if let Some(agent) = task.headless.as_mut() {
             let events = agent.prompt(text);
             self.agent_events(id, events);
@@ -2541,7 +2659,7 @@ impl Daemon {
             bytes.push(b'\r');
             write_pty(&task.pty.master, &bytes);
             task.activity = Activity::Running;
-            task.action = "fixing failed checks".into();
+            task.action = action.into();
             task.since = now();
             self.dirty = true;
         }
@@ -2643,6 +2761,7 @@ impl Daemon {
         let checks: Vec<u64> = self.db.prepare("SELECT id FROM checks WHERE task = ?1").and_then(|mut s| s.query_map([id], |r| r.get(0))?.collect()).unwrap_or_default();
         for c in checks {
             let _ = fs::remove_file(self.check_log(c));
+            let _ = fs::remove_dir_all(self.data.join(format!("artifacts/checks/{c}")));
             self.consoles.remove(&c);
         }
         let _ = self.db.execute("DELETE FROM checks WHERE task = ?1", [id]);
@@ -2660,6 +2779,7 @@ impl Daemon {
         self.chats.remove(&id);
         self.db.execute("DELETE FROM tasks WHERE id = ?1", [id]).map_err(e2s)?;
         self.db.execute("DELETE FROM events WHERE task = ?1", [id]).map_err(e2s)?;
+        self.prune_check_artifacts();
         self.dirty = true;
         self.start_queued();
         Ok(())
@@ -2759,6 +2879,10 @@ impl Daemon {
                 info.state = "needs-you".into();
                 info.action = format!("Checks failed ({}/{})", info.checks.failed, info.checks.total);
                 info.need = Some(Event::Attention { text: info.action.clone() });
+            } else if info.checks.state == "unverified" && info.state == "done" {
+                info.state = "needs-you".into();
+                info.action = "Missing acceptance tests".into();
+                info.need = Some(Event::Attention { text: "Review missing acceptance tests or test prerequisites".into() });
             } else if matches!(info.checks.state.as_str(), "planning" | "running") && info.state == "done" {
                 info.action = if info.checks.state == "planning" { "planning checks" } else { "running checks" }.into();
             }
@@ -3051,6 +3175,19 @@ fn queued_label(n: usize) -> String {
 mod tests {
     use super::*;
     use proto::ToolKind;
+
+    #[test]
+    fn evidence_retention_is_per_task_and_preserves_active_runs() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE check_runs (id INTEGER, task INTEGER, state TEXT);
+            CREATE TABLE checks (id INTEGER, run INTEGER);
+            INSERT INTO check_runs VALUES (1, 1, 'running'), (2, 1, 'passed'), (3, 1, 'failed'),
+                (4, 1, 'stopped'), (5, 1, 'passed'), (6, 2, 'passed');
+            INSERT INTO checks VALUES (11, 1), (12, 2), (13, 3), (14, 4), (15, 5), (16, 6), (99, 99);").unwrap();
+        assert_eq!(retained_check_artifacts(&db).unwrap(), std::collections::HashSet::from([11, 13, 14, 15, 16]));
+        db.execute("UPDATE check_runs SET state = 'stopped' WHERE id = 1", []).unwrap();
+        assert!(!retained_check_artifacts(&db).unwrap().contains(&11));
+    }
 
     #[test]
     fn check_run_numbers_start_fresh_for_each_task() {
