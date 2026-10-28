@@ -298,10 +298,10 @@ impl App {
         self.actions.extend(acts);
     }
 
-    /// The scheme menu under its title-bar button: the eight schemes, then the preference switches.
+    /// The scheme menu under its title-bar button: the available schemes, then the preference switches.
     pub fn draw_menu(&mut self, r: &mut Renderer, t: &Theme) {
         let b = self.scheme_btn;
-        let menu = Rect::new(b.x + b.w - 232.0, b.y + b.h + 6.0, 232.0, 12.0 + 2.0 * 24.0 + 8.0 * 30.0 + 13.0 + 2.0 * 30.0);
+        let menu = Rect::new(b.x + b.w - 232.0, b.y + b.h + 6.0, 232.0, 12.0 + 2.0 * 24.0 + THEMES.len() as f32 * 30.0 + 13.0 + 2.0 * 30.0);
         r.rect(Rect::new(menu.x - 1.0, menu.y + 3.0, menu.w + 2.0, menu.h + 2.0), 8.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
         r.frame(menu, 6.0, t.bg, t.border2);
         r.target(menu, Cursor::Arrow);

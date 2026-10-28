@@ -117,7 +117,7 @@ An agent that has ended can be revived: it resumes its last session in the same 
 
 Agents waiting on a permission show it as a card at the top of the sidebar, with Allow once and Deny right there. **See all** on a machine's header opens every task on it, ended ones too, grouped by state with one action per row: Approve, Answer, Review, Open or Revive.
 
-Eight colour schemes are in the menu at the top right: Gruvbox, Ink, Moss and Ember (dark), Gruvbox Light, Snow, Paper and Linen (light).
+Twelve colour schemes are in the menu at the top right: Gruvbox, Ink, Moss, Ember, Ocean and Plum (dark), Gruvbox Light, Snow, Paper, Linen, Seafoam and Blossom (light).
 
 Prefer vim keys? Turn on **Vim keys** in the scheme menu (top right). The bindings are in [vim.json](vim.json), and `?` shows them in the app.
 
