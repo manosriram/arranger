@@ -1952,6 +1952,8 @@ impl Daemon {
         for p in &mut self.plans {
             p.waiting.retain(|&w| w != id);
         }
+        // A shared planner is useful only while at least one task still needs its answer.
+        self.plans.retain(|p| !p.waiting.is_empty());
     }
 
     fn setup_action(&mut self, id: u64, action: proto::SetupAction) -> Result<(), String> {
@@ -3244,22 +3246,21 @@ impl Daemon {
         }
     }
 
-    /// Agents get SIGHUP when their PTY masters close as the process exits; headless ones, which
-    /// have no terminal, get it from us.
+    /// Drop agent owners explicitly: kill their process groups and reap them before returning.
     fn shutdown(&mut self, sock: &Path) {
         for id in self.summaries.keys().copied().collect::<Vec<_>>() { self.cancel_summary(id); }
         let checking: Vec<u64> = self.passes.keys().chain(self.check_plans.keys()).copied().collect();
         for id in checking { self.end_checks(id, "stopped"); }
+        for id in self.setups.keys().copied().collect::<Vec<_>>() { self.stop_setup(id); }
+        self.plans.clear();
         for job in self.jobs.values_mut() {
             let _ = rustix::process::kill_process_group(Pid::from_child(&job.child), Signal::KILL);
             let _ = job.child.wait();
         }
-        for (&id, task) in &mut self.tasks {
-            if task.headless.is_some() {
-                let _ = rustix::process::kill_process_group(Pid::from_child(&task.pty.child), Signal::HUP);
-            }
+        for (id, mut task) in self.tasks.drain() {
             flush_log(&log_path(&self.data, id, task.headless.is_some()), &mut task.log, &mut self.zstd);
         }
+        self.shells.clear();
         let _ = fs::remove_file(sock);
         let _ = fs::remove_file(self.data.join("daemon.pid"));
     }

@@ -42,6 +42,7 @@ pub struct Run {
     pub child: Child,
     planner: Planner,
     files: [PathBuf; 4],
+    owner: Option<std::io::PipeWriter>,
 }
 
 /// Starts `planner` in `cwd` on `prompt`, read-only, answering with JSON matching `schema`.
@@ -101,6 +102,7 @@ fn start_inner(planner: Planner, cwd: &Path, prompt: &str, schema: &Value, model
     for key in crate::adapter::PARENT_SESSION_ENV {
         cmd.env_remove(key);
     }
+    let (mut cmd, owner) = crate::pty::owned(cmd)?;
     // codex writes its answer to -o and its progress to stdout: keep that out of the answer.
     let stdout = if planner == Planner::Codex && summary.is_none() { file("log") } else { files[2].clone() };
     let child = cmd
@@ -112,7 +114,14 @@ fn start_inner(planner: Planner, cwd: &Path, prompt: &str, schema: &Value, model
         .process_group(0)
         .spawn()?;
     let planner = if planner == Planner::Codex && summary.is_some() { Planner::Program(PathBuf::new()) } else { planner };
-    Ok(Run { child, planner, files })
+    Ok(Run { child, planner, files, owner: Some(owner) })
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        self.owner.take();
+        let _ = self.child.wait();
+    }
 }
 
 impl Run {

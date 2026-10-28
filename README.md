@@ -32,6 +32,8 @@ arranger
 
 That's it: it starts the daemon if needed and opens the window. Closing the window leaves the agents running; run `arranger` again to get back to them.
 
+Agent process groups are tied to their owner's lifetime: deleting a task, stopping the daemon, or a daemon crash kills its agents and helpers. Helpers left behind when an agent exits are cleaned up too, and setup/check planners and summaries use the same ownership guard. Open tasks still keep their agents between turns; this is not an idle timeout or a system-wide Claude/Codex process sweep.
+
 ## Use
 
 | Key | Action |

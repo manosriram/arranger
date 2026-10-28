@@ -507,6 +507,85 @@ fn headless_task() {
     assert!(ok && out.contains("> try it"), "{out}");
 }
 
+#[test]
+fn agent_processes_do_not_outlive_their_owners() {
+    fn running(pid: &str) -> bool {
+        let out = Command::new("ps").args(["-o", "stat=", "-p", pid]).output().unwrap();
+        let state = String::from_utf8_lossy(&out.stdout);
+        // Some containers' PID 1 leaves orphaned zombies; they aren't running agents.
+        !state.trim().is_empty() && !state.trim().starts_with('Z')
+    }
+    fn stopped(pids: &[String]) {
+        let start = Instant::now();
+        while pids.iter().any(|p| running(p)) {
+            assert!(start.elapsed() < Duration::from_secs(5), "processes survived cleanup: {pids:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    for action in ["exit", "delete", "stop", "crash"] {
+        let home = Home(std::env::temp_dir().join(format!("arranger-process-{action}-{}", std::process::id())));
+        let repo = home.0.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("README"), "hi\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+        // Ignore HUP/TERM and stdin EOF, like a stuck CLI; leave a helper behind on exit.
+        let script = r#"#!/usr/bin/env python3
+import os, pathlib, signal, time
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+root = pathlib.Path(os.environ["ARRANGER_HOME"])
+task = os.environ["ARRANGER_TASK"]
+helper = os.fork()
+if helper == 0:
+    time.sleep(600)
+    os._exit(0)
+(root / ("pids-" + task)).write_text(f"{os.getpid()} {helper}")
+while not (root / ("exit-" + task)).exists():
+    time.sleep(0.02)
+"#;
+        let mut pids = Vec::new();
+        for (id, agent) in [(1, "claude"), (2, "codex")] {
+            let binary = home.0.join(agent);
+            std::fs::write(&binary, script).unwrap();
+            std::fs::set_permissions(&binary, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+            let (ok, out) = home.arranger(&repo, &["new", "--headless", binary.to_str().unwrap(), "work"]);
+            assert!(ok, "{out}");
+            let path = home.0.join(format!("pids-{id}"));
+            let start = Instant::now();
+            let agent_pids = loop {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let found: Vec<String> = text.split_whitespace().map(str::to_owned).collect();
+                if found.len() == 2 { break found; }
+                assert!(start.elapsed() < Duration::from_secs(5), "agent didn't start");
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            pids.extend(agent_pids);
+        }
+        assert!(pids.iter().all(|p| running(p)), "agents must stay alive while owned");
+        match action {
+            "exit" => {
+                std::fs::write(home.0.join("exit-1"), "").unwrap();
+                home.wait_state(&repo, &["exited"]);
+            }
+            "delete" => assert!(home.arranger(&repo, &["kill", "1"]).0),
+            "stop" => assert!(home.arranger(&repo, &["stop"]).0),
+            "crash" => {
+                let pid = std::fs::read_to_string(home.0.join("daemon.pid")).unwrap().parse::<i32>().unwrap();
+                rustix::process::kill_process(rustix::process::Pid::from_raw(pid).unwrap(), rustix::process::Signal::KILL).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        if matches!(action, "exit" | "delete") {
+            stopped(&pids[..2]);
+            assert!(pids[2..].iter().all(|p| running(p)), "another thread's agent must not be killed");
+            assert!(home.arranger(&repo, &["stop"]).0);
+        }
+        stopped(&pids);
+    }
+}
+
 // A gemini stand-in speaking ACP: answers each prompt after asking to run a command.
 const ACP_GEMINI: &str = r#"#!/usr/bin/env python3
 import json, sys
