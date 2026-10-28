@@ -2754,7 +2754,7 @@ impl App {
                     self.focus = self.rest();
                 }
                 // ⌘T: the same slot in the other half of the list, dark <-> light.
-                Action::ToggleTheme => self.set_theme((self.theme + 4) % THEMES.len()),
+                Action::ToggleTheme => self.set_theme((self.theme + THEMES.len() / 2) % THEMES.len()),
                 Action::PickTheme(i) => {
                     self.set_theme(i);
                     self.popup = Popup::None;
@@ -4536,13 +4536,17 @@ mod tests {
     }
 
     #[test]
-    fn saved_scheme_names_survive_the_new_eight() {
+    fn saved_scheme_names_and_dark_light_pairs() {
         assert_eq!(THEMES[theme::by_name("Paper")].name, "Paper");
         assert_eq!(THEMES[theme::by_name("Graphite")].name, "Ink");
         assert_eq!(THEMES[theme::by_name("Mist")].name, "Snow");
         assert_eq!(theme::by_name(""), 0, "nothing saved: Gruvbox");
         // ⌘T pairs each dark scheme with a light one.
-        assert!((0..4).all(|i| THEMES[i].dark && !THEMES[i + 4].dark));
+        let half = THEMES.len() / 2;
+        assert!((0..half).all(|i| THEMES[i].dark && !THEMES[i + half].dark));
+        for (i, t) in THEMES.iter().enumerate() {
+            assert_eq!(theme::by_name(t.name), i);
+        }
     }
 
     #[test]

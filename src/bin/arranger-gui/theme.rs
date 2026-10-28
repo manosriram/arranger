@@ -1,4 +1,4 @@
-//! Four dark and four light colour schemes, tokens from the Themes mockup.
+//! Six dark and six light colour schemes.
 
 pub type Rgba = [u8; 4];
 
@@ -333,12 +333,141 @@ pub const LINEN: Theme = Theme {
     scrim: [42, 37, 31, 64],
 };
 
-/// Dark ones first; the scheme menu lists them in this order. ⌘T swaps each dark scheme for the
-/// light one four places on (Gruvbox ↔ Gruvbox Light, Ink ↔ Snow, Moss ↔ Paper, Ember ↔ Linen).
-pub const THEMES: [&Theme; 8] = [&GRUVBOX, &INK, &MOSS, &EMBER, &GRUVBOX_LIGHT, &SNOW, &PAPER, &LINEN];
+pub const OCEAN: Theme = Theme {
+    name: "Ocean",
+    dark: true,
+    bg: hex(0x111D28),
+    panel: hex(0x111D28),
+    term: hex(0x0B151F),
+    raised: hex(0x203343),
+    border: hex(0x263B4C),
+    border2: hex(0x38536A),
+    row_line: hex(0x192936),
+    text: hex(0xE0EEF5),
+    text2: hex(0xB1C9D8),
+    text3: hex(0x87A6BA),
+    faint: hex(0x48677C),
+    sel: hex(0x203343),
+    sel_ring: hex(0x38536A),
+    tc: hex(0xC5DCE9),
+    tc_on: hex(0xF0F8FC),
+    primary_bg: hex(0xE0EEF5),
+    primary_fg: hex(0x111D28),
+    on_accent: hex(0x111D28),
+    add: hex(0x80D4B0),
+    del: hex(0xF3938D),
+    needs: hex(0xEBC375),
+    needs_bg: hex(0x242A27),
+    needs_line: hex(0x5E5335),
+    work: hex(0x7DBDEB),
+    done: hex(0x80D4B0),
+    dialog: hex(0x172734),
+    scrim: [0, 0, 0, 150],
+};
 
-/// Index into THEMES for a saved scheme name; names from before the current eight map to their
-/// nearest one, and anything else to Gruvbox.
+pub const PLUM: Theme = Theme {
+    name: "Plum",
+    dark: true,
+    bg: hex(0x211824),
+    panel: hex(0x211824),
+    term: hex(0x18111B),
+    raised: hex(0x35283B),
+    border: hex(0x3C2D42),
+    border2: hex(0x55405D),
+    row_line: hex(0x2A202F),
+    text: hex(0xF0E4F2),
+    text2: hex(0xCDB8D1),
+    text3: hex(0xA78DAD),
+    faint: hex(0x6D5273),
+    sel: hex(0x35283B),
+    sel_ring: hex(0x55405D),
+    tc: hex(0xDDC8E1),
+    tc_on: hex(0xFBF1FC),
+    primary_bg: hex(0xF0E4F2),
+    primary_fg: hex(0x211824),
+    on_accent: hex(0x211824),
+    add: hex(0xA2D5AA),
+    del: hex(0xF29BAA),
+    needs: hex(0xE9C17D),
+    needs_bg: hex(0x30262A),
+    needs_line: hex(0x65513C),
+    work: hex(0xB8A9EF),
+    done: hex(0xA2D5AA),
+    dialog: hex(0x2B202F),
+    scrim: [0, 0, 0, 150],
+};
+
+pub const SEAFOAM: Theme = Theme {
+    name: "Seafoam",
+    dark: false,
+    bg: hex(0xEDF5F2),
+    panel: hex(0xEDF5F2),
+    term: hex(0xF8FCFA),
+    raised: hex(0xDDEBE5),
+    border: hex(0xD1E2DA),
+    border2: hex(0xB5CFC2),
+    row_line: hex(0xE3EEE8),
+    text: hex(0x19382F),
+    text2: hex(0x3B5B4F),
+    text3: hex(0x567568),
+    faint: hex(0x9AB5A7),
+    sel: hex(0xDDEBE5),
+    sel_ring: hex(0xB5CFC2),
+    tc: hex(0x284C3E),
+    tc_on: hex(0x19382F),
+    primary_bg: hex(0x19382F),
+    primary_fg: hex(0xF8FCFA),
+    on_accent: hex(0xF8FCFA),
+    add: hex(0x276D49),
+    del: hex(0xB13F45),
+    needs: hex(0x895B0C),
+    needs_bg: hex(0xFBF4E3),
+    needs_line: hex(0xDEC793),
+    work: hex(0x236C96),
+    done: hex(0x276D49),
+    dialog: hex(0xF8FCFA),
+    scrim: [30, 35, 32, 64],
+};
+
+pub const BLOSSOM: Theme = Theme {
+    name: "Blossom",
+    dark: false,
+    bg: hex(0xF8F0F4),
+    panel: hex(0xF8F0F4),
+    term: hex(0xFFFAFD),
+    raised: hex(0xEEDFE8),
+    border: hex(0xE5D2DF),
+    border2: hex(0xD1B6C9),
+    row_line: hex(0xF1E5ED),
+    text: hex(0x3C2539),
+    text2: hex(0x61465D),
+    text3: hex(0x80637A),
+    faint: hex(0xBCA2B4),
+    sel: hex(0xEEDFE8),
+    sel_ring: hex(0xD1B6C9),
+    tc: hex(0x50334A),
+    tc_on: hex(0x3C2539),
+    primary_bg: hex(0x3C2539),
+    primary_fg: hex(0xFFFAFD),
+    on_accent: hex(0xFFFAFD),
+    add: hex(0x367548),
+    del: hex(0xB13A55),
+    needs: hex(0x895B13),
+    needs_bg: hex(0xFCF3E4),
+    needs_line: hex(0xE2CAA0),
+    work: hex(0x6650A4),
+    done: hex(0x367548),
+    dialog: hex(0xFFFAFD),
+    scrim: [30, 35, 32, 64],
+};
+
+/// Dark schemes first, paired with light schemes in the same order for ⌘T.
+pub const THEMES: [&Theme; 12] = [
+    &GRUVBOX, &INK, &MOSS, &EMBER, &OCEAN, &PLUM,
+    &GRUVBOX_LIGHT, &SNOW, &PAPER, &LINEN, &SEAFOAM, &BLOSSOM,
+];
+
+/// Saved scheme names, with legacy aliases and Gruvbox as the fallback.
 pub fn by_name(name: &str) -> usize {
     let name = match name {
         "Graphite" | "Midnight" => "Ink",

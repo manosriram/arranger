@@ -305,7 +305,7 @@ impl App {
     pub fn menu_rect(&self) -> Rect {
         let b = self.scheme_btn;
         let hosts = self.hosts.iter().filter(|h| !h.removed).count() as f32;
-        let h = 6.0 + 24.0 + 4.0 * 28.0 + 13.0 + 2.0 * 30.0 + 13.0 + 24.0 + hosts * 28.0 + 40.0 + 6.0;
+        let h = 6.0 + 24.0 + THEMES.len().div_ceil(2) as f32 * 28.0 + 13.0 + 2.0 * 30.0 + 13.0 + 24.0 + hosts * 28.0 + 40.0 + 6.0;
         Rect::new(b.x + b.w - 300.0, b.y + b.h + 6.0, 300.0, h)
     }
 
@@ -342,7 +342,7 @@ impl App {
                 acts.push(Action::PickTheme(i));
             }
         }
-        y += 4.0 * 28.0;
+        y += THEMES.len().div_ceil(2) as f32 * 28.0;
         r.rect(Rect::new(menu.x + 8.0, y + 6.0, menu.w - 16.0, 1.0), 0.0, t.border);
         y += 13.0;
         for (label, enabled, action) in [

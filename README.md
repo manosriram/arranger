@@ -113,7 +113,7 @@ An agent that has ended can be revived: it resumes its last session in the same 
 
 The sidebar is one list across every machine: tasks that need you first, with Allow once and Deny (or Answer) right there, then running, queued and done. A task on another machine shows that machine next to its agent. ⌘F (or `/` with Vim keys on) shows a filter over the list; Esc clears it. Ended and merged tasks are left out: **N ended · see all** at the end of the list, or a machine in **Settings**, opens every task on that machine, grouped by state with one action per row: Approve, Answer, Review, Open or Revive.
 
-**Settings** at the top right holds the eight colour schemes (Gruvbox, Ink, Moss and Ember, dark; Gruvbox Light, Snow, Paper and Linen, light), the Vim keys and Ding sound switches, and your machines with **Add machine**.
+**Settings** at the top right holds the twelve colour schemes (Gruvbox, Ink, Moss, Ember, Ocean and Plum, dark; Gruvbox Light, Snow, Paper, Linen, Seafoam and Blossom, light), the Vim keys and Ding sound switches, and your machines with **Add machine**.
 
 The **usage** chip in the status bar shows how much of each agent's plan is spent: for Claude and Codex, its tightest window (amber from 80%, red once it's used up). Click it for every window (the 5-hour session, the week) and when each resets, plus the tokens your tasks have used. Codex reports its limits in a chat and in a terminal (from its session log); Claude reports them only in a chat, so Claude tasks in a terminal don't update it. Until an agent reports, its part of the chip shows —; a task's own token count (and cost, when the agent gives one) is in its header under **Usage**.
 
