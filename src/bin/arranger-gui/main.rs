@@ -1215,7 +1215,9 @@ fn limit_label(l: &PlanLimit) -> String {
         (Some(u), _) => format!("{u:.0}%"),
         (None, "rejected") => "limited".into(),
         (None, "allowed_warning") => "near".into(),
-        _ => "ok".into(),
+        (None, "api_billing") => "API".into(),
+        (None, "allowed") => "ok".into(),
+        _ => "—".into(),
     }
 }
 

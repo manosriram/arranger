@@ -20,3 +20,4 @@ pub mod shell;
 pub mod side;
 
 pub mod summary;
+pub mod usage;

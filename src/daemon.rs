@@ -380,6 +380,7 @@ pub fn run() -> io::Result<()> {
     d.limits = d.db.query_row("SELECT value FROM settings WHERE key = 'plan_limits'", [], |r| r.get::<_, String>(0)).ok()
         .and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
     d.start_queued();
+    let usage = crate::usage::watch();
 
     let mut events = Events::with_capacity(256);
     loop {
@@ -421,6 +422,11 @@ pub fn run() -> io::Result<()> {
         d.time_out_checks();
         d.auto_checks();
         d.reap_summaries();
+        for limits in usage.try_iter().filter(|limits| !limits.is_empty()) {
+            // /usage is a complete account snapshot, including billing-mode changes.
+            d.limits.retain(|l| l.agent != "claude" || limits.iter().any(|new| new.window == l.window));
+            for limit in limits { d.set_limit(limit); }
+        }
         let expired: Vec<Token> = d.conns.iter().filter(|(_, c)| (!c.received || !c.inbuf.is_empty()) && c.last_input.elapsed() > Duration::from_secs(30)).map(|(&t, _)| t).collect();
         for t in expired { d.close(t); }
         if d.dirty {
@@ -1368,7 +1374,12 @@ impl Daemon {
     fn set_limit(&mut self, mut limit: PlanLimit) {
         limit.seen = now();
         match self.limits.iter_mut().find(|l| l.agent == limit.agent && l.window == limit.window) {
-            Some(l) => *l = limit,
+            Some(l) => {
+                // Rate-limit events often contain status but omit the percentage.
+                if limit.used.is_none() { limit.used = l.used; }
+                if limit.resets == 0 { limit.resets = l.resets; }
+                *l = limit;
+            }
             None => self.limits.push(limit),
         }
         let json = serde_json::to_string(&self.limits).unwrap_or_default();

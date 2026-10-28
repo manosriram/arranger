@@ -478,7 +478,9 @@ impl App {
             let mine: Vec<&PlanLimit> = limits.iter().filter(|l| l.agent == agent).collect();
             if mine.is_empty() {
                 let row = Rect::new(x, y, pop.w - 32.0, 24.0);
-                r.text(x + 12.0, r.center(row, UI, 11.5), &format!("Nothing yet: it shows once a {agent} chat task runs"), UI, 11.5, 400, t.text3, row.w - 12.0);
+                let note = if agent == "claude" { "Waiting for Claude /usage; needs a signed-in CLI".into() }
+                    else { format!("Nothing yet: it shows once a {agent} chat task runs") };
+                r.text(x + 12.0, r.center(row, UI, 11.5), &note, UI, 11.5, 400, t.text3, row.w - 12.0);
                 y += 24.0;
             }
             for l in mine {
