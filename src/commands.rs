@@ -41,6 +41,7 @@ pub fn check_excerpt(text: &str, max: usize) -> String {
     let text = crate::security::terminal_text(text).split_whitespace().collect::<Vec<_>>().join(" ");
     if text.chars().count() <= max { return text; }
     let mut excerpt: String = text.chars().take(max - 1).collect();
+    excerpt.truncate(excerpt.trim_end().len());
     excerpt.push('…');
     excerpt
 }
@@ -75,5 +76,6 @@ mod tests {
         assert_eq!(check_excerpt("  First paragraph.\n\nSecond\tparagraph.  ", 240), "First paragraph. Second paragraph.");
         assert_eq!(check_excerpt(&"✓".repeat(240), 240), "✓".repeat(240));
         assert_eq!(check_excerpt(&"✓".repeat(241), 240), format!("{}…", "✓".repeat(239)));
+        assert_eq!(check_excerpt("one two three", 9), "one two…");
     }
 }

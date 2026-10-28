@@ -478,14 +478,28 @@ impl App {
             y += 18.0;
             let note = if run.note.trim().is_empty() { &run.acceptance.summary } else { &run.note };
             if !note.trim().is_empty() {
-                let color = if matches!(run.state.as_str(), "unverified" | "error") { color } else { t.text2 };
                 let note = arranger::commands::check_excerpt(note, 240);
-                y += self.wrapped(r, x + 18.0, y, w - 18.0, &note, UI, 11.5, color, 17.0) + 2.0;
+                if matches!(run.state.as_str(), "failed" | "unverified" | "error") {
+                    let note = note.replacen(". ", ".\n\n", 1);
+                    let lines = wrap(r, &note, UI, 11.5, w - 42.0);
+                    let callout = Rect::new(x + 18.0, y + 2.0, w - 18.0, lines.len() as f32 * 17.0 + 20.0);
+                    r.rect(callout, 4.0, blend(t.panel, color, 0.06));
+                    r.rect(Rect::new(callout.x, callout.y + 8.0, 2.0, callout.h - 16.0), 1.0, color);
+                    for (i, line) in lines.iter().enumerate() {
+                        r.text(callout.x + 12.0, callout.y + 10.0 + i as f32 * 17.0, line, UI, 11.5, 400, t.text2, callout.w - 24.0);
+                    }
+                    y = callout.y + callout.h + 10.0;
+                } else {
+                    y += self.wrapped(r, x + 18.0, y, w - 18.0, &note, UI, 11.5, t.text2, 17.0) + 2.0;
+                }
             }
             for requirement in &run.acceptance.requirements {
                 let (mark, color) = if run.state == "skipped" { ("–", t.text3) } else if requirement.verified { ("✓", t.text2) } else { ("!", t.needs) };
-                let text = format!("{mark} {} · instruction {}", arranger::commands::check_excerpt(&requirement.text, 160), requirement.source);
+                let text = format!("{mark} {}", arranger::commands::check_excerpt(&requirement.text, 160));
                 y += self.wrapped(r, x + 18.0, y, w - 18.0, &text, UI, 11.5, color, 17.0);
+                let source = if requirement.source == 1 { "Original request" } else { "Follow-up request" };
+                r.text(x + 30.0, y, source, UI, 10.5, 400, t.text3, w - 30.0);
+                y += 16.0;
                 let evidence = if requirement.evidence.trim().is_empty() { "No execution evidence" } else { requirement.evidence.trim() };
                 let evidence = arranger::commands::check_excerpt(evidence, 240);
                 y += self.wrapped(r, x + 30.0, y, w - 30.0, &evidence, UI, 11.0, t.text3, 16.0) + 6.0;
