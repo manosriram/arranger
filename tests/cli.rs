@@ -16,6 +16,9 @@ impl Home {
         let planner = if planner.exists() { planner.into_os_string() } else { "off".into() };
         let out = Command::new(env!("CARGO_BIN_EXE_arranger")).current_dir(dir).env("ARRANGER_HOME", &self.0).env_remove("ARRANGER_CLI")
             .env("ARRANGER_PLANNER", planner)
+            // Commits made by the daemon need an identity even on a clean CI runner.
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
             .env("CLAUDE_CONFIG_DIR", self.0.join("claude")).args(args).output().unwrap();
         (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr))
     }
@@ -903,7 +906,13 @@ fi
         }
     };
     let summary = wait_summary("ready");
-    assert!(summary.contains("Record setup result") && summary.contains("test -f seen") && !summary.contains("invented test"), "{summary}");
+    assert_eq!(summary, "Summary: ready\nCapture local setup output.\n");
+    // Verification remains in the structured record, outside the concise summary text.
+    let db = rusqlite::Connection::open(home.0.join("arranger.db")).unwrap();
+    let json: String = db.query_row("SELECT json FROM summaries WHERE task = 1 AND state = 'ready'", [], |r| r.get(0)).unwrap();
+    let recorded: arranger::proto::WorkSummary = serde_json::from_str(&json).unwrap();
+    assert_eq!(recorded.title, "Record setup result");
+    assert_eq!(recorded.verified_by, ["test -f seen"]);
     let wt = home.0.join("worktrees/repo/1");
     std::fs::write(wt.join("new.rs"), "fn new() {}\n").unwrap();
     assert!(home.arranger(&repo, &["summary", "1"]).1.starts_with("Summary: stale"));
@@ -917,7 +926,6 @@ fi
     std::fs::write(wt.join("new.rs"), "fn new() {}\n").unwrap();
     std::fs::remove_file(home.0.join("slow-summary")).unwrap();
     let start = Instant::now();
-    let db = rusqlite::Connection::open(home.0.join("arranger.db")).unwrap();
     while db.query_row("SELECT state FROM summaries WHERE task = 1", [], |r| r.get::<_, String>(0)).unwrap() == "running" {
         assert!(start.elapsed() < Duration::from_secs(10)); std::thread::sleep(Duration::from_millis(50));
     }
@@ -929,7 +937,7 @@ fi
     let (ok, out) = home.arranger(&repo, &["commit", "1"]);
     assert!(ok, "{out}");
     let message = git(&wt, &["log", "-1", "--format=%B"]);
-    assert!(message.starts_with("Record setup result\n") && message.contains("Verified by:\n- test -f seen"), "{message}");
+    assert_eq!(message, "Capture local setup output.");
 }
 
 #[test]
