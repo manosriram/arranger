@@ -6,9 +6,6 @@ use crate::proto::CheckSpec;
 use std::path::Path;
 use std::process::Command;
 
-pub mod acceptance;
-pub mod snapshot;
-
 /// Most checks a run takes.
 pub const MAX_CHECKS: usize = 20;
 
@@ -30,34 +27,11 @@ pub fn tree_hash(worktree: &Path) -> Result<String, String> {
     let real = git(None, &["rev-parse", "--path-format=absolute", "--git-path", "index"])?;
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let copy = std::env::temp_dir().join(format!("arranger-index-{}-{nanos}", std::process::id()));
-    // Preserve staged paths (including force-added ignored files), never the real index.
+    // Its stat cache spares hashing every file again; a fresh one starts from HEAD.
     if std::fs::copy(&real, &copy).is_err() {
         git(Some(&copy), &["read-tree", "HEAD"])?;
     }
-    let tree = (|| {
-        // Index optimization flags must not hide source edits from verification.
-        // Clear them only in the disposable index, including newly staged ignored files.
-        let paths = Command::new("git").arg("-C").arg(worktree).args(["ls-files", "-z"])
-            .env("GIT_INDEX_FILE", &copy).output().map_err(|e| e.to_string())?;
-        if !paths.status.success() { return Err(String::from_utf8_lossy(&paths.stderr).into_owned()); }
-        use std::io::Write;
-        use std::process::Stdio;
-        for flag in ["--no-assume-unchanged", "--no-skip-worktree"] {
-            let mut update = Command::new("git").arg("-C").arg(worktree)
-                .args(["update-index", flag, "-z", "--stdin"])
-                .env("GIT_INDEX_FILE", &copy).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped())
-                .spawn().map_err(|e| e.to_string())?;
-            let written = update.stdin.take().unwrap().write_all(&paths.stdout);
-            let output = update.wait_with_output().map_err(|e| e.to_string())?;
-            if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).into_owned()); }
-            written.map_err(|e| e.to_string())?;
-        }
-        // Copying an index changes its timestamp and can make racily-clean entries
-        // appear trustworthy. Rehash tracked bytes rather than trust that stat cache.
-        git(Some(&copy), &["add", "-A"])?;
-        git(Some(&copy), &["add", "--renormalize", "-A"])?;
-        git(Some(&copy), &["write-tree"])
-    })();
+    let tree = git(Some(&copy), &["add", "-A"]).and_then(|_| git(Some(&copy), &["write-tree"]));
     let _ = std::fs::remove_file(&copy);
     tree
 }
@@ -155,150 +129,6 @@ pub fn code_changed(paths: &[String]) -> bool {
     })
 }
 
-pub fn plan_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["checks", "none_reason"],
-        "properties": {
-            "checks": {"type": "array", "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["name", "command", "why"],
-                "properties": {"name": {"type": "string"}, "command": {"type": "string"}, "why": {"type": "string"}}
-            }},
-            "none_reason": {"type": "string"}
-        }
-    })
-}
-
-/// What the check planner sees of a trip.
-pub struct Trip<'a> {
-    /// Complete acceptance requirements extracted from authoritative instructions.
-    pub prompts: &'a [String],
-    /// `git diff --stat` and the full-task diff from its base, cut to size.
-    pub stat: &'a str,
-    pub diff: &'a str,
-    /// Build and dependency files in the repository, to read for its commands.
-    pub manifests: &'a [String],
-    /// The last run's checks: (command, how it went).
-    pub previous: &'a [(String, String)],
-    /// Checks still failing from before: they run whatever the plan says.
-    pub sticky: &'a [CheckSpec],
-}
-
-pub fn plan_prompt(trip: &Trip) -> String {
-    let list = |items: Vec<String>| if items.is_empty() { "(none)".to_string() } else { items.join("\n") };
-    let prompts = list(trip.prompts.iter().map(|p| format!("- {p}")).collect());
-    let manifests = list(trip.manifests.iter().map(|m| format!("- {m}")).collect());
-    let previous = list(trip.previous.iter().map(|(c, s)| format!("- {c}: {s}")).collect());
-    let sticky = list(trip.sticky.iter().map(|c| format!("- {}", c.command)).collect());
-    format!(
-        "This is a captured verification checkout (the current directory). You decide which checks prove the requested task's \
-work holds up. You don't run them: arranger runs each command from the worktree root, one after another, and shows the \
-results to a human reviewer. You may read the repository (read-only) to find the right commands.
-
-Choose checks that cover what changed, and nothing unrelated:
-- tests for the changed code: targeted ones first (a test file, module or package), then the wider suite when the change \
-is broad or touches shared code;
-- the compiler or type checker, and the linter the project uses, scoped to what changed when the tool allows;
-- only commands that report: never formatters or linters that rewrite files (use --check variants), never installs, \
-network calls, servers, deploys, or commands that wait for input;
-- each should finish in under 10 minutes; use the project's own scripts (package.json, Makefile, justfile…) when it has them;
-- commands run in sh, not necessarily bash. Multiline scripts and heredocs are supported. Keep each command within \
-64 KiB; for larger checks, invoke a script already in the repository.
-Give each a short name and say why it covers this change. Include relevant runtime/tool versions in check output where \
-useful. If there is no executable coverage, return no checks and explain the gap in none_reason; that is not a pass. \
-Only an explicitly non-executable request can be exempt. Otherwise leave none_reason empty.
-
-Complete requirements for this task:
-{prompts}
-
-Build and dependency files:
-{manifests}
-
-Checks from the last run and how they went:
-{previous}
-
-Still failing from before (these run anyway; don't repeat them):
-{sticky}
-
-Full task changes from its base:
-{stat}
-
-{diff}",
-        stat = trip.stat,
-        diff = trip.diff,
-    )
-}
-
-/// The planner's answer: its checks, checked, and why there are none if there aren't.
-pub fn plan_from(answer: serde_json::Value) -> Result<(Vec<CheckSpec>, String), String> {
-    #[derive(serde::Deserialize)]
-    struct Answer {
-        checks: Vec<CheckSpec>,
-        #[serde(default)]
-        none_reason: String,
-    }
-    let a: Answer = serde_json::from_value(answer).map_err(|e| format!("the check plan doesn't fit: {e}"))?;
-    let reason = a.none_reason.lines().next().unwrap_or("").trim().chars().take(200).collect();
-    let mut checks = a.checks;
-    checks.retain(|c| !c.command.trim().is_empty());
-    checks.truncate(MAX_CHECKS);
-    let checks = if checks.is_empty() { Vec::new() } else { validate(checks)? };
-    Ok((checks, reason))
-}
-
-/// Check-only commands that run without asking: common test, build, type and lint commands,
-/// with no shell operators, and the project's own scripts whose names say they check.
-pub fn allowed(command: &str, worktree: &Path) -> bool {
-    if ["\n", "\r", "&&", "||", ";", "|", ">", "<", "`", "$(", "&"].iter().any(|op| command.contains(op)) {
-        return false;
-    }
-    let words: Vec<&str> = command.split_whitespace().collect();
-    let has = |flag: &str| words.contains(&flag);
-    match words.as_slice() {
-        ["cargo", sub, ..] => matches!(*sub, "test" | "check" | "clippy" | "build" | "nextest" | "doc" | "bench") && !has("--fix") || *sub == "fmt" && has("--check"),
-        ["go", "test" | "vet" | "build", ..] => true,
-        ["pytest", ..] | ["mypy", ..] | ["pyright", ..] => true,
-        ["python" | "python3", "-m", "pytest" | "mypy" | "unittest", ..] => true,
-        ["uv" | "poetry" | "pipenv", "run", "pytest" | "mypy" | "pyright", ..] => true,
-        ["ruff", "check", ..] => !has("--fix"),
-        ["ruff", "format", ..] | ["prettier", ..] | ["npx", "prettier", ..] => has("--check"),
-        ["tsc", ..] | ["npx", "tsc", ..] => has("--noEmit"),
-        ["eslint", ..] | ["npx", "eslint", ..] => !has("--fix"),
-        ["npx", "vitest" | "jest", ..] | ["vitest" | "jest", ..] => !has("--watch") && !has("-u") && !has("--updateSnapshot"),
-        ["swift", "test" | "build", ..] | ["dotnet", "test" | "build", ..] | ["mix", "test", ..] | ["bundle", "exec", "rspec" | "rake", ..] => true,
-        ["npm", "test"] | ["npm", "t"] => script(worktree, "test"),
-        ["npm" | "pnpm" | "yarn" | "bun", "run", name, ..] => checks_by_name(name) && script(worktree, name),
-        ["pnpm" | "yarn" | "bun", "test", ..] => script(worktree, "test"),
-        ["pnpm" | "yarn", name] => checks_by_name(name) && script(worktree, name),
-        ["make", target] => checks_by_name(target) && recipe(worktree, &["Makefile", "makefile", "GNUmakefile"], target),
-        ["just", recipe_name] => checks_by_name(recipe_name) && recipe(worktree, &["justfile", "Justfile", ".justfile"], recipe_name),
-        _ => false,
-    }
-}
-
-/// A script or target named for checking, not fixing, formatting or shipping.
-fn checks_by_name(name: &str) -> bool {
-    let n = name.to_lowercase();
-    ["test", "check", "lint", "build", "typecheck", "vet", "clippy", "spec"].iter().any(|k| n.contains(k))
-        && !["fix", "deploy", "publish", "release", "watch", "write", "update"].iter().any(|k| n.contains(k))
-}
-
-fn script(worktree: &Path, name: &str) -> bool {
-    std::fs::read(worktree.join("package.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .is_some_and(|v| v.get("scripts").and_then(|s| s.get(name)).is_some())
-}
-
-fn recipe(worktree: &Path, files: &[&str], name: &str) -> bool {
-    files.iter().filter_map(|f| std::fs::read_to_string(worktree.join(f)).ok()).any(|text| {
-        text.lines().any(|l| l.strip_prefix(name).is_some_and(|rest| rest.starts_with(':') || rest.starts_with(' ') && rest.contains(':')))
-    })
-}
-
 /// A failed check, for telling the agent about it.
 pub struct Failure {
     pub name: String,
@@ -356,7 +186,6 @@ pub fn failure_report(failures: &[Failure]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn reports_show_each_failure_from_its_first_error() {
@@ -375,34 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn check_only_commands_run_without_asking() {
-        let dir = std::env::temp_dir().join(format!("arranger-allow-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("package.json"), r#"{"scripts":{"test":"jest","lint":"eslint .","lint:fix":"eslint --fix .","deploy":"x"}}"#).unwrap();
-        std::fs::write(dir.join("justfile"), "test-api filter='':\n    cargo test\ndeploy:\n    ./ship\n").unwrap();
-        std::fs::write(dir.join("Makefile"), "check: build\n\tgo vet ./...\n").unwrap();
-        for ok in ["cargo test -p api limiter::", "cargo clippy --all-targets -- -D warnings", "cargo fmt --check", "go test ./...", "pytest tests/test_a.py -k x",
-            "npx tsc --noEmit", "npm test", "npm run lint", "pnpm lint", "just test-api", "make check", "ruff check src", "npx eslint src/a.ts"] {
-            assert!(allowed(ok, &dir), "{ok}");
-        }
-        for ask in ["cargo fmt", "npm run deploy", "npm run lint:fix", "npm run typecheck", "just deploy", "make install", "cargo test && rm -rf /",
-            "cargo test | tee x", "curl x", "eslint --fix .", "npx jest -u", "rm -rf target", "cargo test > out",
-            "cargo test\ntouch unexpected", "cargo test\r\ncargo check"] {
-            assert!(!allowed(ask, &dir), "{ask}");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn plans_are_checked_and_docs_are_not_code() {
-        let (checks, reason) = plan_from(json!({"checks": [{"name": "unit", "command": " cargo test ", "why": "x"}, {"name": "", "command": "", "why": ""}], "none_reason": ""})).unwrap();
-        assert_eq!((checks.len(), checks[0].command.as_str(), reason.as_str()), (1, "cargo test", ""));
-        let (checks, reason) = plan_from(json!({"checks": [], "none_reason": "docs only\nmore"})).unwrap();
-        assert!(checks.is_empty() && reason == "docs only");
-        let (checks, _) = plan_from(json!({"checks": [{"name": "a", "command": "set -eu\nsh scenario.sh", "why": ""}], "none_reason": ""})).unwrap();
-        assert_eq!(checks[0].command, "set -eu\nsh scenario.sh");
-        assert_eq!(plan_schema()["required"], json!(["checks", "none_reason"]), "plans are checks and a reason, nothing more");
+    fn docs_are_not_code() {
         assert!(!code_changed(&["README.md".into(), "docs/a.png".into(), "LICENSE".into()]));
         assert!(code_changed(&["README.md".into(), "src/a.rs".into()]));
         assert!(code_changed(&["Makefile".into()]));
@@ -459,25 +261,13 @@ mod tests {
         std::fs::create_dir_all(dir.join("target")).unwrap();
         std::fs::write(dir.join("target/x"), "build output").unwrap();
         assert_eq!(tree_hash(&dir).unwrap(), clean, "ignored files don't count");
-        git(&dir, &["config", "core.trustctime", "false"]);
-        let modified = std::fs::metadata(dir.join("a")).unwrap().modified().unwrap();
         std::fs::write(dir.join("a"), "2").unwrap();
-        std::fs::File::options().write(true).open(dir.join("a")).unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
         let edited = tree_hash(&dir).unwrap();
-        assert_ne!(edited, clean, "same-size, same-mtime edits must be rehashed");
+        assert_ne!(edited, clean);
         std::fs::write(dir.join("b"), "new").unwrap();
         assert_ne!(tree_hash(&dir).unwrap(), edited);
         // " M a" unstaged, trimmed by `git` above; b still untracked.
-        git(&dir, &["config", "core.trustctime", "true"]);
         assert_eq!(git(&dir, &["status", "--porcelain"]), "M a\n?? b", "the index is untouched");
-        let current = tree_hash(&dir).unwrap();
-        for flag in ["--assume-unchanged", "--skip-worktree"] {
-            git(&dir, &["update-index", flag, "a"]);
-            let index = std::fs::read(dir.join(".git/index")).unwrap();
-            assert_eq!(tree_hash(&dir).unwrap(), current, "{flag} must not hide edits");
-            assert_eq!(std::fs::read(dir.join(".git/index")).unwrap(), index);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

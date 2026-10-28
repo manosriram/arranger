@@ -323,8 +323,6 @@ enum Action {
     Setup(TaskKey, SetupAction),
     /// Open the Checks tab on the selected task.
     OpenChecks,
-    /// Stop (or skip) a task's checks.
-    StopChecks(TaskKey),
     Checks(ChecksAction),
 }
 
@@ -1265,9 +1263,6 @@ fn ago(t: u64) -> String {
 fn status_line(task: &TaskInfo, queue_pos: usize) -> String {
     let since = if task.since == 0 { String::new() } else { format!(" · {}", ago(task.since)) };
     let waiting = if task.since == 0 { String::new() } else { format!(" · waiting {}", ago(task.since)) };
-    if task.checks.state == "approval" && task.state == "needs-you" {
-        return format!("approve its checks{waiting}");
-    }
     if is_setup(&task.state) {
         let first = |prefix: &str| task.setup_detail.lines().find_map(|l| l.strip_prefix(prefix)).map(|l| l.split("  · ").next().unwrap_or(l).to_string());
         return match task.setup.as_str() {
@@ -1333,13 +1328,10 @@ fn stages(task: &TaskInfo) -> [Stage; 6] {
         "failed" => stage("Setup", Failed, "failed"),
         _ => stage("Setup", Skipped, "skipped"), // skipped, or from before setup
     };
-    let checks_wait = task.checks.state == "approval" && task.state == "needs-you";
     let since = if task.since == 0 { String::new() } else { format!(" · {}", ago(task.since)) };
     let working = match group(&task.state) {
         _ if setting_up => stage("Working", Todo, ""),
         2 => stage("Working", Todo, "queued"),
-        // It's its checks that wait on you, not the agent.
-        _ if checks_wait => stage("Working", Done, "turn done"),
         0 => stage("Working", Waiting, &format!("needs you{since}")),
         1 => stage("Working", Active, &format!("working{since}")),
         3 => stage("Working", Done, "turn done"),
@@ -1349,16 +1341,14 @@ fn stages(task: &TaskInfo) -> [Stage; 6] {
     let counted = if c.total == 0 { String::new() } else { format!("{}/{}", c.passed, c.total) };
     let mut checks = match c.state.as_str() {
         "" => stage("Checks", Todo, ""),
-        "planning" => stage("Checks", Active, "planning"),
-        "approval" => stage("Checks", Waiting, "approve"),
         "running" => stage("Checks", Active, &if counted.is_empty() { "running".into() } else { format!("{counted} passed") }),
         "passed" => stage("Checks", Done, &if counted.is_empty() { "passed".into() } else { format!("{counted} passed") }),
-        "failed" if c.accepted => stage("Checks", Waiting, &format!("{} failed · accepted", c.failed)),
+        "failed" if c.accepted => stage("Checks", Done, &format!("{} failed · accepted", c.failed)),
         "failed" => stage("Checks", Failed, &format!("{} failed", c.failed)),
         "unverified" => stage("Checks", Waiting, "unverified"),
-        "error" => stage("Checks", Failed, "needs attention"),
+        "error" => stage("Checks", Failed, "failed to run"),
         "stale" => stage("Checks", Todo, "outdated"),
-        "skipped" => stage("Checks", Skipped, "no executable checks"),
+        "skipped" => stage("Checks", Skipped, "skipped"),
         "stopped" => stage("Checks", Skipped, "stopped"),
         s => stage("Checks", Todo, s),
     };
@@ -1394,9 +1384,6 @@ fn current_stage(stages: &[Stage]) -> Option<usize> {
 
 /// The header pill: why the task is where it is.
 fn reason(task: &TaskInfo) -> String {
-    if task.checks.state == "approval" && task.state == "needs-you" {
-        return "Approve checks".into();
-    }
     if is_setup(&task.state) {
         return match task.setup.as_str() {
             "planning" => "Planning setup",
@@ -1907,20 +1894,6 @@ impl App {
         {
             self.actions.push(Action::Answer((t.machine, t.id), key == "y"));
             self.answering = None;
-            return;
-        }
-        // Checks waiting on you: y runs them, n skips them.
-        if (key == "y" || key == "n")
-            && self.machine_tasks.is_none()
-            && self.review.is_none()
-            && let Some(t) = self.current().filter(|t| t.checks.state == "approval")
-        {
-            let key2 = (t.machine, t.id);
-            self.actions.push(if key == "y" { Action::Select(key2) } else { Action::StopChecks(key2) });
-            if key == "y" {
-                self.actions.push(Action::OpenChecks);
-                self.actions.push(Action::Checks(ChecksAction::Approve(false)));
-            }
             return;
         }
         // Setup waiting on you: y approves it (or retries a failed one), n skips it.
@@ -2827,9 +2800,6 @@ impl App {
                     }
                 }
                 Action::Checks(a) => self.checks_action(a),
-                Action::StopChecks((m, id)) => {
-                    let _ = request_at(self.sock(m).as_deref(), &Request::StopChecks { id });
-                }
                 Action::Setup((m, id), action) => {
                     if let Ok(Reply::Error(e)) | Err(e) = request_at(self.sock(m).as_deref(), &Request::Setup { id, action }).map_err(|e| e.to_string()) {
                         eprintln!("arranger: {e}");
@@ -3140,7 +3110,12 @@ impl App {
                 "Checks" => !self.checkable(),
                 _ => false,
             };
-            r.text(tab.x + 12.0, r.center(tab, UI, 13.0), label, UI, 13.0, 500, if on { t.text } else if off { alpha(t.text3, 90) } else { t.text3 }, tw);
+            // The summary describes only the latest run; an older pass must not keep this green.
+            let passed = label == "Checks" && self.current().is_some_and(|task| task.checks.state == "passed");
+            if passed {
+                r.rect(Rect::new(tab.x, tab.y + tab.h - 2.0, tab.w, 2.0), 0.0, t.done);
+            }
+            r.text(tab.x + 12.0, r.center(tab, UI, 13.0), label, UI, 13.0, 500, if passed { t.done } else if on { t.text } else if off { alpha(t.text3, 90) } else { t.text3 }, tw);
             if self.hit(r, tab) && !on && !off {
                 self.actions.push(match label {
                     "Review" => Action::OpenReview,
@@ -3351,11 +3326,8 @@ impl App {
         let ask = Rect::new(text_x, top.y + top.h, card.w - 38.0, 20.0);
         r.text(ask.x, r.center(ask, UI, 12.5), &status_line(task, 0).replace('\n', " "), UI, 12.5, 400, t.needs, ask.w);
 
-        let checks_wait = task.checks.state == "approval" && task.state == "needs-you";
-        let buttons: Vec<(&str, bool, Vec<Action>)> = if self.multi_select.is_some() { vec![] } else if matches!(task.checks.state.as_str(), "failed" | "unverified" | "error") && !task.checks.accepted && task.state == "needs-you" {
+        let buttons: Vec<(&str, bool, Vec<Action>)> = if self.multi_select.is_some() { vec![] } else if task.checks.state == "failed" && !task.checks.accepted && task.state == "needs-you" {
             vec![("Review checks", true, vec![Action::Select(key), Action::OpenChecks])]
-        } else if checks_wait {
-            vec![("Review checks", true, vec![Action::Select(key), Action::OpenChecks]), ("Skip", false, vec![Action::StopChecks(key)])]
         } else if task.state == "setup-needs-you" {
             let first = if task.setup == "failed" { ("Retry", SetupAction::Retry) } else { ("Approve", SetupAction::Approve) };
             vec![(first.0, true, vec![Action::Setup(key, first.1)]), ("Skip setup", false, vec![Action::Setup(key, SetupAction::Skip)])]
@@ -4519,17 +4491,15 @@ mod tests {
     fn pipeline_marks_waits_failures_and_skips() {
         use Phase::*;
         let mut task = task_in("needs-you", "skipped");
-        task.checks.state = "approval".into();
-        // Its checks wait on you, not the agent.
-        assert_eq!(phases(&task)[..3], [Skipped, Done, Waiting]);
-        assert_eq!(current_stage(&stages(&task)), Some(2));
+        assert_eq!(phases(&task)[..3], [Skipped, Waiting, Todo]);
+        assert_eq!(current_stage(&stages(&task)), Some(1));
 
         task.state = "done".into();
         task.checks = proto::ChecksSummary { state: "failed".into(), failed: 2, total: 3, ..Default::default() };
         assert_eq!(stages(&task)[2].phase, Failed);
         assert_eq!(stages(&task)[4].phase, Todo, "nothing to review while checks fail");
         task.checks.accepted = true;
-        assert_eq!((stages(&task)[2].phase, stages(&task)[4].phase), (Waiting, Todo), "an override is not a verified pass");
+        assert_eq!((stages(&task)[2].phase, stages(&task)[4].phase), (Done, Waiting));
 
         task.shipped = "committed".into();
         assert_eq!(phases(&task)[4..], [Done, Skipped]);

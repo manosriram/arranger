@@ -6,14 +6,14 @@ Every thread runs one pipeline, driven by the daemon:
 
 ```
 Setup ──▶ Working ──▶ Checks ──▶ Summary ──▶ Review ──▶ Merge
-  once     a trip      planned per trip,       on the tree      the tree that
+  once     a trip      explicit commands,     on the tree      the tree that
            = one turn  run by arranger         that passed      passed is merged
              ▲            │ fail
              └────────────┘ send failures to the agent (a new trip)
 ```
 
-- **No config in the repository.** Agents design setup and checks. Arranger keeps plans,
-  approvals and settings in its own database.
+- **No config in the repository.** Agents design setup; users supply check commands. Arranger
+  keeps setup plans, command lists and settings in its own database.
 - **Trip** = one agent turn, from a prompt to `Event::TurnDone`.
 - **Arranger runs every step itself** and records exit codes. The agent never reports its own
   checks as passed.
@@ -35,7 +35,7 @@ task's chat or session.
   the cost in `total_cost_usd`.
 - **codex:** `codex exec --ephemeral --sandbox read-only --output-schema <file> -o <file> -`.
 - **Which one:** the task's own agent if it's claude or codex, otherwise whichever is installed.
-  `$ARRANGER_PLANNER` overrides this: a program for tests, or `off`.
+  `$ARRANGER_SIDE_RUNNER` overrides this: a program for tests, or `off`.
 
 ## 1. Setup
 
@@ -83,44 +83,25 @@ On `TurnDone` (the Stop hook for terminal tasks, the result message for headless
 starts 2 s later if all of these hold:
 
 - the task is idle, with no ask and no queued prompts;
+- the user has explicitly supplied a command list;
 - the tree hash differs from the last tree that had a pass;
 - no pass is already running.
 
 Other triggers:
 
-- **Run checks** (a button, `arranger checks <id> --run`) always runs.
-- **Merge on a stale tree** runs a pass first.
+- **Run checks** runs commands supplied in Checks. `arranger checks <id> --run '<command>' …`
+  supplies a list; bare `--run` repeats the saved list, or asks for commands if none exist.
+- **Merge on a stale tree** asks the user to run checks and retry.
 
 A prompt sent while a pass runs stops the pass (SIGTERM to the process group, SIGKILL after 5 s)
 and marks it stale.
 
-### Planning
+### Commands
 
-A **separate read-only planner** side-run, so the agent isn't grading its own work. It sees:
-
-- the trip's prompts;
-- the diff since the last passing tree, capped at 100 KB;
-- the manifests;
-- the previous trip's checks and their results.
-
-It answers `{checks: [{name, command, why}], none_reason}`.
-
-**The final list (built by arranger):**
-
-- the planner's checks;
-- **plus every check that failed earlier and hasn't passed since**, even if the planner left it out.
-
-So the agent can't get rid of a failure by having it go unchecked. If code changed and the list is
-empty, the result is "Unverified" (amber). If only docs or non-code files changed, the result is
-"No checks needed".
-
-**Approval:**
-
-- These run without asking: a built-in list (`cargo test|check|clippy|build`, `npm|pnpm|yarn|bun
-  run <existing script>`, `go test|vet`, `pytest`, `tsc --noEmit`, `eslint`, `ruff check`,
-  `mypy`, `make|just <existing target>`), and commands you've already approved for the repo
-  (`approved_checks`).
-- Anything else waits in needs-you for Approve / Always allow / Edit / Remove.
+Users choose commands explicitly. No side-run selects, reviews or approves checks. Later turns
+rerun the saved list, including failed commands; supplying a new list replaces it. With no saved
+commands, no checks run and the tree remains unverified. Passing commands record execution
+results, not a claim that every requirement has been covered.
 
 ### Running
 
@@ -149,7 +130,7 @@ empty, the result is "Unverified" (amber). If only docs or non-code files change
 - **Protocol.** `Request::Console { job, start, limit }` returns a page plus a subscription, and
   `ConsolePatch` pushes updates every ≤50 ms.
 - **Checks tab** (Workspace → Checks → Review):
-  - **Rail:** trips and their steps (setup, planner, checks, summary).
+  - **Rail:** manual commands and recorded check runs.
   - **Console header:** name, command, exit code, duration, origin, Rerun / Stop / Send to agent.
   - **Console body:** line numbers, error gutter marks, tail-follow, ⌘F search, jump to first
     error, wrap, copy.
@@ -183,8 +164,8 @@ empty, the result is "Unverified" (amber). If only docs or non-code files change
 
 - **Gate.** If the current tree isn't the tree that passed, the button becomes a red **Force
   merge**. The CLI needs `--force`.
-- **Base moved.** When merging base into the task's branch changes the tree, a quick pass runs (the
-  last list, no planner) before the fast-forward.
+- **Base moved.** When merging base into the task's branch changes the tree, a pass reruns the
+  last command list before the fast-forward.
 - **Message.** The commit message is prefilled from the summary.
 
 ## Phases
@@ -197,15 +178,15 @@ empty, the result is "Unverified" (amber). If only docs or non-code files change
    - the CLI.
 2. **Console + manual checks:** `console.rs`, the Checks tab, `arranger checks`, Run checks with a
    command list you give.
-3. **Trigger + planner:** the TurnDone trigger, the check planner, building the list, approvals,
-   the mutation guard.
+3. **Saved-command reruns:** the TurnDone trigger repeats explicit commands; the mutation guard
+   rejects checks that edit the work.
 4. **Failure loop:** Send to agent, Accept anyway, auto-fix.
 5. **Summary.**
 6. **Review and Merge gates.**
 
 ## Progress in worktree 145
 
-Phases 1–3 were carried forward from worktree 143. Phase 4 now includes editable failure
+Setup and manual checks were carried forward from worktree 143. Phase 4 includes editable failure
 reports in the GUI, acceptance tied to the checked tree, needs-you status, rerunning the
 latest list, and persisted auto-fix rounds (default 0; configurable in Checks or the CLI).
 Auto-fix rounds reset when checks pass or a prompt is sent through Arranger. The report
@@ -216,8 +197,8 @@ composer also works for terminal tasks. Phases 5–6 are now implemented too:
   thread fork. Missing sessions and other agents use fresh read-only runs with context.
 - Review shows verification and summary freshness, per-file notes, and defaults the commit
   message from a matching summary. Verification is taken from Arranger's actual runs.
-- Normal merges require a matching passed/skipped/accepted run. Stale merge attempts request
-  checks; the GUI exposes Force merge and the CLI requires --force for an override.
+- Normal merges require a matching passed/skipped/accepted run. Stale merge attempts ask you to
+  run checks; the GUI exposes Force merge and the CLI requires --force for an override.
 - Merge preparation never updates the base. If integrating the base changes the tree, the last
   check list runs again; only a successful run allows the final fast-forward. Snapshot changes,
   changed commit-hook output, further base moves, or interrupted/failed checks block that update.

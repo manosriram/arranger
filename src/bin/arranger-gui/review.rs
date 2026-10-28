@@ -87,7 +87,6 @@ pub enum ReviewAction {
     Run,
     Refresh,
     GenerateSummary,
-    PlanChecks,
     Check,
     File(usize),
     Split(bool),
@@ -435,11 +434,6 @@ impl App {
             }
             ReviewAction::Check => self.open_checks(),
             ReviewAction::GenerateSummary => self.spawn_request(host, Tag::Summary, Request::GenerateSummary { id }),
-            ReviewAction::PlanChecks => {
-                let reply = request_at(self.sock(host).as_deref(), &Request::RunChecks { id, checks: Vec::new() });
-                if let Err(e) = reply { self.review.as_mut().unwrap().status = e.to_string(); }
-                else { self.open_checks(); }
-            }
             ReviewAction::Refresh => self.spawn_request(host, Tag::Review(id), Request::Review { id }),
             ReviewAction::File(i) => {
                 rv.file = i;
@@ -510,7 +504,7 @@ impl App {
                 .into();
                 let message = rv.message.clone();
                 self.focus = rest;
-                let force = ship == Ship::Merge && rv.data.as_ref().is_some_and(|d| !matches!(d.verification.as_str(), "passed" | "skipped"));
+                let force = ship == Ship::Merge && rv.data.as_ref().is_some_and(|d| !matches!(d.verification.as_str(), "passed" | "accepted" | "skipped"));
                 self.spawn_request(host, Tag::Commit, Request::Commit { id, message, ship, force });
             }
             ReviewAction::ShipMenu(open) => rv.ship_menu = open.then(Rect::default),
@@ -647,32 +641,20 @@ impl App {
         };
         if let Some(d) = &rv.data {
             let (label, color) = match d.verification.as_str() {
-                "passed" => ("Checks passed", t.add),
+                "passed" => ("Passed on this exact diff", t.add),
                 "accepted" => ("Failed checks accepted", t.needs),
-                "skipped" => ("No executable checks", t.text3),
-                "stale" => ("Checks out of date", t.needs),
-                "failed" | "error" => ("Checks need attention", t.del),
-                "running" | "planning" => ("Checks running", t.work),
-                _ => ("Checks need attention", t.needs),
+                "skipped" => ("Checks skipped for this diff", t.needs),
+                "stale" => ("Checks are out of date", t.needs),
+                "failed" => ("Checks failed", t.del),
+                "running" => ("Checks running", t.work),
+                _ => ("This diff is unverified", t.needs),
             };
-            let result = Rect::new(rail.x + 16.0, y - 4.0, rail.w - 32.0, 24.0);
             r.text(rail.x + 16.0, y, label, UI, 12.0, 500, color, rail.w - 32.0);
-            if self.hit(r, result) { acts.push(ReviewAction::Check); }
             y += 25.0;
-            if !d.verification_note.trim().is_empty() {
-                let note = d.verification_note.split_whitespace().collect::<Vec<_>>().join(" ");
-                let lines = wrap(r, &note, UI, 11.5, rail.w - 32.0);
-                for (i, line) in lines.iter().take(3).enumerate() {
-                    let line = if i == 2 && lines.len() > 3 { format!("{line}…") } else { line.clone() };
-                    r.text(rail.x + 16.0, y, &line, UI, 11.5, 400, t.text2, rail.w - 32.0);
-                    y += 17.0;
-                }
-                y += 8.0;
-            }
             let b = Rect::new(rail.x + 16.0, y, 100.0, 26.0);
             r.frame(b, 0.0, t.bg, t.border2);
             r.text(b.x + 9.0, r.center(b, UI, 12.0), "Run checks", UI, 12.0, 500, t.text, b.w);
-            if self.hit(r, b) { acts.push(ReviewAction::PlanChecks); }
+            if self.hit(r, b) { acts.push(ReviewAction::Check); }
             y += 40.0;
         }
         section(r, y, "FILES");
@@ -1135,7 +1117,7 @@ impl App {
         let branch = rv.data.as_ref().map_or("", |d| d.branch.as_str());
         // Conflicts turn the main button into asking the agent; ▾ then settles them by side instead.
         let conflicted = rv.data.as_ref().is_some_and(|d| !d.conflicts.is_empty());
-        let force_merge = rv.data.as_ref().is_some_and(|d| !matches!(d.verification.as_str(), "passed" | "skipped"));
+        let force_merge = rv.data.as_ref().is_some_and(|d| !matches!(d.verification.as_str(), "passed" | "accepted" | "skipped"));
         let merge_label = match (conflicted, ended) {
             (true, false) => format!("Ask {agent} to resolve"),
             (true, true) => format!("Revive {agent} to resolve"),

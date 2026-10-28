@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub const MAX_FRAME: usize = 16 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 28;
+pub const VERSION: u32 = 29;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -84,11 +84,6 @@ pub enum Request {
     Checks { id: u64 },
     /// Lines `start..start + limit` of a check's output; replied to with Console.
     Console { check: u64, start: usize, limit: usize },
-    /// Run the planned checks waiting on approval; `always`: and don't ask about these
-    /// commands again in this repository.
-    ApproveChecks { id: u64, always: bool },
-    /// Stop requiring a check that failed before: it no longer runs again by itself.
-    DropCheck { id: u64, command: String },
     /// Go on despite the latest run's failures. Replied to with Ok.
     AcceptChecks { id: u64 },
     /// What to tell the agent about its latest run's failures; replied to with Text.
@@ -118,9 +113,8 @@ pub struct CheckRun {
     pub ended: u64,
     /// The worktree's tree hash when it started, uncommitted edits included.
     pub tree: String,
-    /// "planning", "approval", "running", "passed", "failed", "stopped", "stale" (the agent
-    /// started another turn), "skipped" (nothing needed checking), "unverified" (code changed and
-    /// no check covers it) or "error" (it couldn't be planned).
+    /// "running", "passed", "failed", "stopped", "stale" (the agent started another turn),
+    /// "skipped" (no checks ran), or "error" (execution failed).
     pub state: String,
     /// Arranger started it after the agent's turn (not you).
     pub auto: bool,
@@ -129,29 +123,6 @@ pub struct CheckRun {
     /// It failed, and you chose to go on anyway.
     pub accepted: bool,
     pub checks: Vec<CheckInfo>,
-    /// Requirements and recorded execution evidence for this run, not the agent's claims.
-    pub acceptance: Acceptance,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct Acceptance {
-    pub requirements: Vec<Requirement>,
-    pub summary: String,
-    pub reviewed: bool,
-    /// Explicitly non-executable work, never inferred from file extensions alone.
-    pub non_executable: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct Requirement {
-    pub text: String,
-    /// One-based source instruction, preserved across repairs and clones.
-    pub source: usize,
-    /// Commands chosen to exercise this requirement.
-    pub commands: Vec<String>,
-    pub verified: bool,
-    /// A short reason, or an assertion and excerpt from an actual check's output.
-    pub evidence: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -166,7 +137,7 @@ pub struct CheckInfo {
     pub exit: Option<i32>,
     pub started: u64,
     pub ended: u64,
-    /// "planned" (by the check planner), "sticky" (it failed before and must pass), or "manual".
+    /// "manual" (explicitly supplied commands), or "merge" (rerun on the combined tree).
     pub origin: String,
     /// What arranger saw: files it changed (and were put back), or why it was stopped.
     pub note: String,
@@ -361,7 +332,6 @@ pub struct Review {
     pub tree: String,
     /// passed, accepted, skipped, stale, unverified, failed, running, or approval.
     pub verification: String,
-    pub verification_note: String,
     pub work_summary: Option<WorkSummary>,
     /// missing, running, ready, stale, or an error message.
     pub summary_state: String,

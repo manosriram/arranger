@@ -13,7 +13,7 @@ pub struct Plan {
     /// Ignored files to copy from the main checkout, relative to its root.
     pub copy: Vec<String>,
     pub commands: Vec<Step>,
-    /// One line on what the planner found.
+    /// One line on what the agent found.
     pub note: String,
 }
 
@@ -144,7 +144,7 @@ The commands run with $ARRANGER_ROOT set to the main checkout and $PORT to a por
     )
 }
 
-/// The planner's answer, checked: only offered files, and single-line commands of sane length.
+/// The agent's setup answer, checked: only offered files, and single-line commands of sane length.
 pub fn validate(answer: Value, candidates: &[String]) -> Result<Plan, String> {
     let mut plan: Plan = serde_json::from_value(answer).map_err(|e| format!("the setup plan doesn't fit: {e}"))?;
     plan.copy.retain(|c| candidates.contains(c));

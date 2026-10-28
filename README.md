@@ -32,7 +32,7 @@ arranger
 
 That's it: it starts the daemon if needed and opens the window. Closing the window leaves the agents running; run `arranger` again to get back to them.
 
-Agent process groups are tied to their owner's lifetime: deleting a task, stopping the daemon, or a daemon crash kills its agents and helpers. Helpers left behind when an agent exits are cleaned up too, and setup/check planners and summaries use the same ownership guard. Open tasks still keep their agents between turns; this is not an idle timeout or a system-wide Claude/Codex process sweep.
+Agent process groups are tied to their owner's lifetime: deleting a task, stopping the daemon, or a daemon crash kills its agents and helpers. Helpers left behind when an agent exits are cleaned up too, and setup runs and summaries use the same ownership guard. Open tasks still keep their agents between turns; this is not an idle timeout or a system-wide Claude/Codex process sweep.
 
 ## Use
 
@@ -68,43 +68,37 @@ A new worktree has your tracked files but nothing git ignores, so before its age
 
 Nothing is read from or written to the repository for this.
 
-**Checks** (the tab between Workspace and Review) test the requested behavior in a disposable checkout of the exact source being reviewed, including uncommitted and non-ignored new files. Only the latest run starts expanded; click its header to see requirements, evidence, and commands.
+**Checks** (the tab between Workspace and Review) run commands that prove a task's work holds up (tests, builds, linters) in its worktree, one after another. Only the latest run starts expanded; click a run header to expand or collapse its checks.
 
-**After each agent turn**, checks cover the whole task:
-- **Planning.** A fresh read-only run extracts requirements from the original request and follow-ups, without implementation context. Another plans checks against those requirements and the complete task changes. Normal chat can correct the requirements; automatic repair messages do not replace them.
-- **Evidence.** After execution, a fresh read-only review checks whether real assertions exercised every requirement. A pass needs recorded passing commands, cited output, and matching source and instructions. Build/lint success alone is not behavioral proof. Review shows one result and a short explanation; click it for evidence in Checks.
-- **Still failing.** Any check that failed earlier and hasn't passed since runs again too, whatever the planner picks, until it passes or you choose **Don't require**.
-- **No checks.** Missing coverage, evidence, or a verifier means **Unverified**, never a pass. Explicit documentation-only requests can say **No executable checks** in a neutral color; changing only a README does not exempt a runtime request.
-- **Approval.** Common check-only commands (`cargo test`, `go test`, `pytest`, `tsc --noEmit`, the project's own `test`/`lint`/`check` scripts…) run straight away. Anything else waits for **Approve** (or **Always allow** for that repository) and puts the task under Needs you.
-- **Stale.** Changing the source or instructions invalidates acceptance, even when a follow-up makes no code changes. Unobserved terminal instructions cannot inherit a pass.
-- **Isolated execution.** Setup is replayed under the existing approval rules, without copying task build output. Source mutations fail the check; only the disposable checkout is restored or removed, never concurrent user/agent edits. Stopping or restarting discards interrupted snapshots and requires a fresh run.
+**Choose the commands yourself.** Add tests, builds or linters in Checks and run them. Arranger never selects commands automatically. After a later agent turn changes the work, Arranger reruns that same saved list once the agent is idle. With no saved list, no checks run.
+
+- **Stale.** Sending the agent another prompt marks the turn's checks stale and stops them.
+- **Checks must not change the work.** A check that changes or deletes files fails, and its changes are put back. New files it leaves behind (a lockfile, a snapshot) are removed and noted.
 
 **When checks fail**, the task appears under Needs you. Open **Review checks** to:
 - **Send to agent:** prepare an editable message with the failed commands, exit codes, and relevant output. Sending it starts another turn.
 - **Rerun:** run the latest list again.
-- **Accept anyway:** acknowledge a failed run without making it green or enabling normal merge. **Force merge** remains the explicit override; failures stay visible and remain required on later runs.
+- **Accept anyway:** record that you accept the checked worktree as is. Changed work must be checked again; failures stay visible.
 
-**Auto-fix rounds** in the Checks tab sets how many failure reports Arranger sends automatically (0–10, default 0). This is a daemon-wide setting, also available as `arranger settings auto_fix 2`. The round count is stored per task and resets after checks pass or you send a prompt through Arranger. Automatic fixes wait for an idle agent and use the normal check approval rules.
+**Auto-fix rounds** in the Checks tab sets how many failure reports Arranger sends automatically (0–10, default 0). This is a daemon-wide setting, also available as `arranger settings auto_fix 2`. The round count is stored per task and resets after checks pass or you send a prompt through Arranger. Automatic fixes wait for an idle agent and rerun your saved commands.
 
 From the CLI, `arranger checks <id> --report` prints the failure message and `arranger checks <id> --accept` accepts the latest failed run.
 
-**You can also run them yourself:**
+**Using Checks:**
 - **Running them.** Add commands under **Run checks** and press it; the next run starts with the last run's commands.
 - **The record.** Each run records exactly which state of the worktree it judged (uncommitted edits included), and each check its exit status and output.
 - **The output.** It shows as a console: colours kept, progress bars collapsed to their last state, error lines marked, and **Next error** to jump between them.
 - **Rerun, stop, copy.** **Rerun** runs one check again, **Stop** ends a run, **Copy output** copies a check's output.
 - **The pipeline strip** in the task's header shows how the latest run went.
 - **Vim keys.** With Vim keys on, `j`/`k` move between checks and `e` jumps to the next error.
-- **CLI.** `arranger checks <id>` lists runs and evidence, `arranger checks <id> --run [--wait] '<command>' …` starts one (`--wait` succeeds only for passed or documentation-only runs, and returns actionably for approval), `arranger checks <id> --log <check>` prints a check's output, `arranger checks <id> --approve [--always]` runs checks waiting on you, `arranger checks <id> --drop '<command>'` stops requiring a failed check, and `arranger checks <id> --stop` stops (or skips) them. Manual commands without a verifier can run but cannot authorize merge.
+- **CLI.** `arranger checks <id>` lists runs, `arranger checks <id> --run [--wait] '<command>' …` starts one (`--wait` exits non-zero if a check fails), bare `--run` repeats your saved list, `arranger checks <id> --log <check>` prints a check's output, and `arranger checks <id> --stop` stops a run.
 - **Limits.** Checks stop after 10 minutes or 32 MiB of output.
 
-**Summary and review.** After checks pass, are accepted, or are unnecessary for non-code changes, Arranger generates a structured summary of that exact worktree snapshot. It forks an available Claude/Codex session; other agents or missing sessions use a fresh read-only run with the diff and conversation context. The summary contains a title, overview, per-file notes, risks, and the commands Arranger actually observed passing. Review labels old summaries as stale and offers **Regenerate summary**. A current summary supplies the default commit message; your edits to that message are preserved. CLI: `arranger summary <id>` and `arranger summary <id> --regenerate`.
+**Summary and review.** After checks pass or are accepted, Arranger generates a structured summary of that exact worktree snapshot. It forks an available Claude/Codex session; other agents or missing sessions use a fresh read-only run with the diff and conversation context. The summary contains a title, overview, per-file notes, risks, and the commands Arranger actually observed passing. Review labels old summaries as stale and offers **Regenerate summary**. A current summary supplies the default commit message; your edits to that message are preserved. CLI: `arranger summary <id>` and `arranger summary <id> --regenerate`.
 
-**Merge verification.** Review shows whether this exact diff passed, was accepted despite failures, needs no checks, is stale, or is unverified. **Run checks** requests a fresh check plan. An unchecked merge is a red **Force merge** in the GUI; the CLI requires `arranger commit <id> --merge --force`. A normal stale merge requests checks and asks you to retry after reviewing the results.
+**Merge verification.** Review shows whether this exact diff passed, was accepted despite failures, is stale, or is unverified. **Run checks** opens Checks so you can supply commands. An unchecked merge is a red **Force merge** in the GUI; the CLI requires `arranger commit <id> --merge --force`. A normal stale merge asks you to run checks and retry after reviewing the results.
 
-If the base branch moved, Arranger first brings it into the task branch. When that changes the tree, it replans coverage, executes checks in a new snapshot, and reviews the evidence before fast-forwarding the base. Failed, unverified, or interrupted runs leave the base untouched. A further base move or a commit hook changing the verified tree also blocks the merge. Legacy command-only passes need a fresh acceptance run. Explicit force bypasses the check gate, while conflicts must still be resolved. Summary generation failures remain visible and can be retried; they do not replace check results.
-
-**What green promises.** Arranger executed checks against this source and independently reviewed evidence for the requested behavior. Semantic coverage is AI-assisted, not a guarantee of bug-free software. This protects Arranger's normal merge path, not direct Git/GitHub merges. Verification checkouts isolate accidental edits, not hostile commands; external services and copied local configuration are not reproducible source. Unsupported submodules/LFS, missing dependencies, insufficient evidence, or verifier errors block a pass rather than weakening the requirements.
+If the base branch moved, Arranger first brings it into the task branch. When that changes the tree, it reruns the last check list before fast-forwarding the base. Failed or interrupted checks leave the base untouched. A further base move or a commit hook changing the verified tree also blocks the merge. Explicit force bypasses the check gate, while conflicts must still be resolved. Summary generation failures remain visible and can be retried; they do not replace check results.
 
 **Run in worktree** in Review opens a terminal in the task’s checkout (over SSH for remote tasks). Run your app or tests there before merging; uncommitted edits are included. From the CLI, `arranger run <id>` opens a shell, or `arranger run <id> <command> [args…]` runs a command with its original exit status.
 
