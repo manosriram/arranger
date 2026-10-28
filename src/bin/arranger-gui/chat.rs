@@ -943,7 +943,6 @@ impl App {
     }
 }
 
-
 fn row_text(row: &Row) -> String {
     row.runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join(" ")
 }

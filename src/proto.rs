@@ -119,8 +119,8 @@ pub struct CheckRun {
     /// The worktree's tree hash when it started, uncommitted edits included.
     pub tree: String,
     /// "planning", "approval", "running", "passed", "failed", "stopped", "stale" (the agent
-    /// started another turn), "skipped" (nothing needed checking), "unverified" (requested outcomes
-    /// lack acceptance evidence) or "error" (it couldn't be planned).
+    /// started another turn), "skipped" (nothing needed checking), "unverified" (code changed and
+    /// no check covers it) or "error" (it couldn't be planned).
     pub state: String,
     /// Arranger started it after the agent's turn (not you).
     pub auto: bool,

@@ -31,7 +31,6 @@ pub struct ChecksView {
     error: String,
     rail_scroll: f32,
     auto_fix: u32,
-    planner_enabled: bool,
 }
 
 struct ConsoleView {
@@ -58,7 +57,6 @@ pub enum ChecksAction {
     SendFailures,
     Accept,
     AutoFix,
-    TogglePlanner,
     RetryLatest,
     /// Add the typed command to the next run (or, with nothing typed, run).
     Add,
@@ -90,7 +88,6 @@ impl App {
             Ok(Reply::Text(value)) => value.parse().unwrap_or(0),
             _ => 0,
         };
-        let planner_enabled = matches!(request_at(self.sock(host).as_deref(), &Request::Setting { key: "check_planner".into(), value: None }), Ok(Reply::Text(value)) if value == "1");
         self.checks = Some(ChecksView {
             task,
             host,
@@ -107,7 +104,6 @@ impl App {
             error: String::new(),
             rail_scroll: 0.0,
             auto_fix,
-            planner_enabled,
         });
         self.focus = self.rest();
     }
@@ -128,16 +124,6 @@ impl App {
                 let Some(run) = cv.runs.first() else { return };
                 let checks = run.checks.iter().map(|c| proto::CheckSpec { name: c.name.clone(), command: c.command.clone(), why: c.why.clone() }).collect();
                 self.run_checks_now(host, id, checks);
-            }
-            ChecksAction::TogglePlanner => {
-                let value = if cv.planner_enabled { "0" } else { "1" };
-                match request_at(self.sock(host).as_deref(), &Request::Setting { key: "check_planner".into(), value: Some(value.into()) }) {
-                    Ok(Reply::Text(value)) => self.checks.as_mut().unwrap().planner_enabled = value == "1",
-                    Ok(Reply::Error(error)) => self.checks.as_mut().unwrap().error = error,
-                    Err(error) => self.checks.as_mut().unwrap().error = error.to_string(),
-                    _ => {}
-                }
-                self.refresh_runs();
             }
             ChecksAction::AutoFix => {
                 let rounds = (cv.auto_fix + 1) % 11;
@@ -424,16 +410,6 @@ impl App {
             self.actions.push(Action::Checks(action));
         }
         y += 38.0;
-        let enabled = self.checks.as_ref().unwrap().planner_enabled;
-        let row = Rect::new(x, y, w, 44.0);
-        r.text(x, y + 2.0, "Check planner", UI, 12.0, 500, t.text, w - 110.0);
-        r.text(x, y + 21.0, "Automatic · all repositories", UI, 10.5, 400, t.text3, w - 66.0);
-        r.text(x + w - 88.0, y + 5.0, if enabled { "On" } else { "Off" }, UI, 11.5, 500, t.text2, 30.0);
-        let switch = Rect::new(x + w - 48.0, y + 3.0, 48.0, 24.0);
-        r.rect(switch, 12.0, if enabled { t.work } else { t.border2 });
-        r.rect(Rect::new(switch.x + if enabled { 26.0 } else { 2.0 }, switch.y + 2.0, 20.0, 20.0), 10.0, t.text);
-        if self.hit(r, row) { self.actions.push(Action::Checks(ChecksAction::TogglePlanner)); }
-        y += 48.0;
         let rounds = self.checks.as_ref().unwrap().auto_fix;
         let label = format!("Auto-fix rounds: {rounds}");
         let b = Rect::new(x, y, w, 26.0);

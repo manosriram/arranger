@@ -9,28 +9,6 @@ use std::process::Command;
 /// Most checks a run takes.
 pub const MAX_CHECKS: usize = 20;
 
-/// Only numeric check directories are owned by the runner. Do not traverse unknown entries.
-pub fn prune_artifacts(root: &Path, keep: &std::collections::HashSet<u64>) -> std::io::Result<()> {
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let Some(id) = entry.file_name().to_str().and_then(|name| name.parse::<u64>().ok()) else { continue };
-        if keep.contains(&id) { continue; }
-        if entry.file_type()?.is_dir() { std::fs::remove_dir_all(entry.path())?; }
-        else { std::fs::remove_file(entry.path())?; }
-    }
-    Ok(())
-}
-
-/// Passing commands do not verify a task with uncovered acceptance criteria.
-pub fn run_outcome(failed: u32, stopped: u32, coverage_complete: bool) -> &'static str {
-    if failed > 0 { "failed" } else if stopped > 0 { "stopped" } else if !coverage_complete { "unverified" } else { "passed" }
-}
-
 /// The worktree's contents as a git tree, uncommitted and untracked (not ignored) files
 /// included, without touching its index: a copy of the index takes the changes.
 pub fn tree_hash(worktree: &Path) -> Result<String, String> {
@@ -48,9 +26,7 @@ pub fn tree_hash(worktree: &Path) -> Result<String, String> {
     };
     let real = git(None, &["rev-parse", "--path-format=absolute", "--git-path", "index"])?;
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    static INDEX_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = INDEX_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let copy = std::env::temp_dir().join(format!("arranger-index-{}-{nanos}-{sequence}", std::process::id()));
+    let copy = std::env::temp_dir().join(format!("arranger-index-{}-{nanos}", std::process::id()));
     // Its stat cache spares hashing every file again; a fresh one starts from HEAD.
     if std::fs::copy(&real, &copy).is_err() {
         git(Some(&copy), &["read-tree", "HEAD"])?;
@@ -153,24 +129,15 @@ pub fn plan_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["checks", "none_reason", "acceptance"],
+        "required": ["checks", "none_reason"],
         "properties": {
-            "checks": {"type": "array", "maxItems": MAX_CHECKS, "items": {
+            "checks": {"type": "array", "items": {
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["name", "command", "why"],
-                "properties": {"name": {"type": "string"}, "command": {"type": "string", "maxLength": 500}, "why": {"type": "string"}}
+                "properties": {"name": {"type": "string"}, "command": {"type": "string"}, "why": {"type": "string"}}
             }},
-            "none_reason": {"type": "string"},
-            "acceptance": {"type": "array", "items": {
-                "type": "object", "additionalProperties": false,
-                "required": ["criterion", "commands", "gap"],
-                "properties": {
-                    "criterion": {"type": "string"},
-                    "commands": {"type": "array", "items": {"type": "string"}},
-                    "gap": {"type": "string"}
-                }
-            }}
+            "none_reason": {"type": "string"}
         }
     })
 }
@@ -190,125 +157,63 @@ pub struct Trip<'a> {
     pub sticky: &'a [CheckSpec],
 }
 
-/// Hard byte budgets include untrusted prompts, diffs, and previous command output.
-pub const PLAN_PROMPT_MAX: usize = 24 * 1024;
-
-pub fn bounded(text: &str, bytes: usize) -> String {
-    if text.len() <= bytes { return text.to_string(); }
-    let suffix = "\n… [truncated; read repository files for details]";
-    let mut cut = bytes.saturating_sub(suffix.len());
-    while !text.is_char_boundary(cut) { cut -= 1; }
-    if bytes < suffix.len() { return text[..cut].to_string(); }
-    format!("{}{suffix}", &text[..cut])
-}
-
 pub fn plan_prompt(trip: &Trip) -> String {
-    let prompts = bounded(&trip.prompts.join("\n"), 4096);
-    let manifests = bounded(&trip.manifests.join("\n"), 1024);
-    let previous = bounded(&trip.previous.iter().take(MAX_CHECKS).map(|(c, s)| format!("{c}: {s}")).collect::<Vec<_>>().join("\n"), 2048);
-    let sticky = bounded(&trip.sticky.iter().take(MAX_CHECKS).map(|c| c.command.as_str()).collect::<Vec<_>>().join("\n"), 2048);
-    let stat = bounded(trip.stat, 1024);
-    let diff = bounded(trip.diff, 12 * 1024);
-    bounded(&format!(
-        "Plan checks for the user's requested outcomes, not merely the implementation. Read only; do not run checks or edit files.
-Arranger executes each selected command from the worktree root with a 10-minute timeout.
-Derive concrete acceptance criteria from the original task and latest corrections. Read actual tests and code before
-claiming coverage. Include omitted requested behavior, relevant negative/boundary cases, and affected regressions.
-For each criterion give exact selected commands and any gap. Compilation/lint, test names, source-string searches,
-and file-existence assertions do not prove behavior. GUI changes need relevant interaction and rendering evidence:
-clicks/keys, resulting state, layout assertions or a reviewed visual baseline. Screenshots alone are not assertions.
-For web, desktop, mobile and custom-rendered GUIs, discover the target project's framework and automation driver.
-Use that project's runnable tests; never assume Arranger's GUI or an Arranger-specific test protocol. Report missing
-interaction tests or drivers as concrete gaps for the coding agent to address.
-Use the repository's existing test harness and scripts; inspect its guidance. If tests are missing, propose a short
-behavioral probe only when it exercises the real code with isolated fixtures and explicit expected results. Commands
-must be a single readable line of at most 500 bytes. Substantial probes belong in reviewable repository test files;
-if missing, report the test that the coding agent must add as a coverage gap. Never encode a large script in a command.
-Retain evidence in $ARRANGER_CHECK_ARTIFACTS outside the checkout. Isolated local apps/servers are allowed only with
-bounded lifetimes and cleanup. Never drive live user data/apps. No installs, external network calls, persistent servers,
-deploys, interactive commands or file-rewriting tools; use check-only flags. Prefer targeted tests, then broader checks
-for shared code. Documentation examples and claims need relevant checks too. A build directly covers a build-only task.
-If no meaningful check can execute, return no checks and explain why in none_reason. Otherwise leave none_reason empty.
-Give each command a short name and explain what its assertions prove. Missing/uncertain evidence belongs in gap;
-do not weaken acceptance criteria to fit available tests. Context is bounded; inspect files if the diff is truncated.
+    let list = |items: Vec<String>| if items.is_empty() { "(none)".to_string() } else { items.join("\n") };
+    let prompts = list(trip.prompts.iter().map(|p| format!("- {}", p.chars().take(2000).collect::<String>())).collect());
+    let manifests = list(trip.manifests.iter().map(|m| format!("- {m}")).collect());
+    let previous = list(trip.previous.iter().map(|(c, s)| format!("- {c}: {s}")).collect());
+    let sticky = list(trip.sticky.iter().map(|c| format!("- {}", c.command)).collect());
+    format!(
+        "A coding agent just finished a turn in this git worktree (the current directory). You decide which checks prove its \
+work holds up. You don't run them: arranger runs each command from the worktree root, one after another, and shows the \
+results to a human reviewer. You may read the repository (read-only) to find the right commands.
 
-Task goal and latest turn (later corrections take precedence):
+Choose checks that cover what changed, and nothing unrelated:
+- tests for the changed code: targeted ones first (a test file, module or package), then the wider suite when the change \
+is broad or touches shared code;
+- the compiler or type checker, and the linter the project uses, scoped to what changed when the tool allows;
+- only commands that report: never formatters or linters that rewrite files (use --check variants), never installs, \
+network calls, servers, deploys, or commands that wait for input;
+- each should finish in under 10 minutes; use the project's own scripts (package.json, Makefile, justfile…) when it has them.
+Give each a short name and say why it covers this change. If nothing needs checking (docs, comments), return no checks and \
+say why in none_reason; otherwise leave none_reason empty.
+
+What the agent was asked this turn:
 {prompts}
 
-Build/dependency paths:
+Build and dependency files:
 {manifests}
 
-Previous checks:
+Checks from the last run and how they went:
 {previous}
 
-Still failing (run automatically; do not repeat):
+Still failing from before (these run anyway; don't repeat them):
 {sticky}
 
-Changes since last verified tree:
+Changes since the work last passed its checks:
 {stat}
-{diff}"), PLAN_PROMPT_MAX)
+
+{diff}",
+        stat = trip.stat,
+        diff = trip.diff,
+    )
 }
 
-/// Validated commands, a coverage note, and whether acceptance evidence is incomplete.
-pub fn plan_from(answer: serde_json::Value) -> Result<(Vec<CheckSpec>, String, bool), String> {
-    #[derive(serde::Deserialize)]
-    struct Criterion {
-        criterion: String,
-        commands: Vec<String>,
-        gap: String,
-    }
+/// The planner's answer: its checks, checked, and why there are none if there aren't.
+pub fn plan_from(answer: serde_json::Value) -> Result<(Vec<CheckSpec>, String), String> {
     #[derive(serde::Deserialize)]
     struct Answer {
         checks: Vec<CheckSpec>,
-        acceptance: Vec<Criterion>,
         #[serde(default)]
         none_reason: String,
     }
     let a: Answer = serde_json::from_value(answer).map_err(|e| format!("the check plan doesn't fit: {e}"))?;
     let reason = a.none_reason.lines().next().unwrap_or("").trim().chars().take(200).collect();
-    let mut checks = Vec::new();
-    let mut gaps = Vec::new();
-    for check in a.checks {
-        if check.command.trim().is_empty() { continue; }
-        match validate(vec![check]) {
-            Ok(mut valid) if checks.len() < MAX_CHECKS => checks.append(&mut valid),
-            Ok(_) => gaps.push("Too many checks; extra checks were omitted".into()),
-            Err(error) => gaps.push(format!("Skipped invalid check: {error}")),
-        }
-    }
-    let answer_acceptance_missing = a.acceptance.is_empty();
-    for c in a.acceptance {
-        if c.criterion.trim().is_empty() {
-            gaps.push("An acceptance criterion is empty".into());
-            continue;
-        }
-        if c.commands.iter().any(|command| !checks.iter().any(|check| check.command == command.trim())) {
-            gaps.push(format!("{}: references an unselected or rejected command", c.criterion));
-        }
-        if !c.gap.trim().is_empty() || c.commands.is_empty() {
-            gaps.push(format!("{}: {}", c.criterion.trim(), if c.gap.trim().is_empty() { "no check covers this outcome" } else { c.gap.trim() }));
-        }
-    }
-    if !checks.is_empty() && gaps.is_empty() && answer_acceptance_missing {
-        gaps.push("No user acceptance criteria were identified".into());
-    }
-    let incomplete = !gaps.is_empty();
-    let note = if incomplete { bounded(&format!("Unverified requirements: {}", gaps.join("; ")), 4096) } else { reason };
-    Ok((checks, note, incomplete))
-}
-
-/// Feedback to the coding agent: durable tests and their actual execution, not a coverage claim.
-pub fn missing_tests_report(note: &str) -> String {
-    format!("Missing acceptance tests for the requested change.\n\n{}\n\nAdd the missing executable regression tests to this repository and run them against the real changed code. \
-Each test must assert the user's requested observable outcome, including relevant negative/boundary cases. \
-Do not remove or weaken acceptance criteria, substitute compilation/source searches for behavior, or mark gaps covered without evidence. \
-For any GUI (web, desktop, mobile, or custom-rendered), inspect this project's framework and available automation; \
-use or add an appropriate project-local interaction/visual test harness. Exercise actual input, resulting state, \
-focus and layout where relevant; screenshots alone are not assertions. Do not assume an Arranger-specific GUI or inject \
-Arranger hooks. Use isolated fixtures and bounded processes, never live user data. Keep test code in reviewable files \
-and provide short commands (at most 500 bytes) that Arranger can rerun. Follow the project's dependency and permission rules. \
-If a display, driver, credentials, or expected behavior is unavailable, explain the precise blocker rather than fabricating a pass. \
-Arranger will independently replan and execute checks after your turn.", bounded(note, 4096))
+    let mut checks = a.checks;
+    checks.retain(|c| !c.command.trim().is_empty());
+    checks.truncate(MAX_CHECKS);
+    let checks = if checks.is_empty() { Vec::new() } else { validate(checks)? };
+    Ok((checks, reason))
 }
 
 /// Check-only commands that run without asking: common test, build, type and lint commands,
@@ -421,92 +326,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn planner_context_is_bounded_for_large_unicode_inputs() {
-        let huge = "user request 🦀\n".repeat(100_000);
-        let prompt = plan_prompt(&Trip {
-            prompts: std::slice::from_ref(&huge), stat: &huge, diff: &huge, manifests: std::slice::from_ref(&huge),
-            previous: &[(huge.clone(), huge.clone())], sticky: &[],
-        });
-        assert!(prompt.len() <= PLAN_PROMPT_MAX);
-        assert!(prompt.contains("[truncated"));
-        assert_eq!(bounded("ééé", 1), "");
-    }
-
-    #[test]
-    fn partial_plans_keep_valid_checks_and_report_uncovered_criteria() {
-        let (checks, note, incomplete) = plan_from(json!({
-            "checks": [
-                {"name": "valid", "command": "cargo test dialog", "why": "dialog assertions"},
-                {"name": "invalid", "command": "x".repeat(501), "why": "unreviewable"}
-            ],
-            "none_reason": "",
-            "acceptance": [
-                {"criterion": "dialog closes", "commands": [" cargo test dialog "], "gap": ""},
-                {"criterion": "focus restored", "commands": ["cargo test typo"], "gap": ""}
-            ]
-        })).unwrap();
-        assert_eq!(checks.len(), 1);
-        assert_eq!(checks[0].command, "cargo test dialog");
-        assert!(incomplete && note.contains("Skipped invalid check") && note.contains("focus restored"));
-    }
-
-    #[test]
-    fn artifact_pruning_keeps_current_evidence_and_does_not_follow_links() {
-        let root = std::env::temp_dir().join(format!("arranger-prune-{}", std::process::id()));
-        std::fs::create_dir_all(root.join("1")).unwrap();
-        std::fs::create_dir_all(root.join("2")).unwrap();
-        std::fs::create_dir_all(root.join("unrelated")).unwrap();
-        let outside = root.join("unrelated/keep.txt");
-        std::fs::write(&outside, "keep").unwrap();
-        std::os::unix::fs::symlink(root.join("unrelated"), root.join("3")).unwrap();
-        prune_artifacts(&root, &std::collections::HashSet::from([2])).unwrap();
-        assert!(!root.join("1").exists() && !root.join("3").exists());
-        assert!(root.join("2").is_dir() && outside.is_file());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn passing_build_does_not_verify_an_untested_user_outcome() {
-        let (checks, note, incomplete) = plan_from(json!({
-            "checks": [{"name": "build", "command": "cargo check", "why": "compilation only"}],
-            "none_reason": "",
-            "acceptance": [{"criterion": "Escape closes the dialog", "commands": [], "gap": "No interaction test exists"}]
-        })).unwrap();
-        assert_eq!(checks[0].command, "cargo check");
-        assert!(note.contains("Escape closes the dialog") && note.contains("No interaction test exists"));
-        assert!(incomplete);
-        assert_eq!(run_outcome(0, 0, !incomplete), "unverified");
-        assert_eq!(run_outcome(1, 0, !incomplete), "failed");
-        assert_eq!(run_outcome(0, 1, !incomplete), "stopped");
-    }
-
-    #[test]
-    fn acceptance_requires_selected_evidence_and_explicit_coverage() {
-        let answer = json!({
-            "checks": [{"name": "dialog", "command": "cargo test dialog_escape", "why": "asserts Escape closes dialog"}],
-            "none_reason": "",
-            "acceptance": [{"criterion": "Escape closes the dialog", "commands": ["cargo test dialog_escape"], "gap": ""}]
-        });
-        let (_, _, incomplete) = plan_from(answer.clone()).unwrap();
-        assert!(!incomplete);
-        assert_eq!(run_outcome(0, 0, !incomplete), "passed");
-        let mut wrong = answer.clone();
-        wrong["acceptance"][0]["commands"] = json!(["cargo test nonexistent"]);
-        let (valid, note, incomplete) = plan_from(wrong).unwrap();
-        assert_eq!(valid.len(), 1);
-        assert!(incomplete && note.contains("unselected or rejected command"));
-        let mut missing = answer.clone();
-        missing.as_object_mut().unwrap().remove("acceptance");
-        assert!(plan_from(missing).is_err());
-        let mut empty = answer.clone();
-        empty["acceptance"] = json!([]);
-        assert!(plan_from(empty).unwrap().2);
-        let mut partial = answer;
-        partial["acceptance"][0]["gap"] = json!("Keyboard covered; visual layout still untested");
-        assert!(plan_from(partial).unwrap().2);
-    }
-
-    #[test]
     fn reports_show_each_failure_from_its_first_error() {
         let mut lines: Vec<(String, bool)> = (0..200).map(|i| (format!("line {i}"), false)).collect();
         lines[150].1 = true;
@@ -543,12 +362,12 @@ mod tests {
 
     #[test]
     fn plans_are_checked_and_docs_are_not_code() {
-        let (checks, reason, _) = plan_from(json!({"checks": [{"name": "unit", "command": " cargo test ", "why": "x"}, {"name": "", "command": "", "why": ""}], "none_reason": "", "acceptance": [{"criterion": "unit behavior", "commands": ["cargo test"], "gap": ""}]})).unwrap();
+        let (checks, reason) = plan_from(json!({"checks": [{"name": "unit", "command": " cargo test ", "why": "x"}, {"name": "", "command": "", "why": ""}], "none_reason": ""})).unwrap();
         assert_eq!((checks.len(), checks[0].command.as_str(), reason.as_str()), (1, "cargo test", ""));
-        let (checks, reason, _) = plan_from(json!({"checks": [], "none_reason": "docs only\nmore", "acceptance": []})).unwrap();
+        let (checks, reason) = plan_from(json!({"checks": [], "none_reason": "docs only\nmore"})).unwrap();
         assert!(checks.is_empty() && reason == "docs only");
-        let (checks, note, incomplete) = plan_from(json!({"checks": [{"name": "a", "command": "a\nb", "why": ""}], "none_reason": "", "acceptance": []})).unwrap();
-        assert!(checks.is_empty() && incomplete && note.contains("Skipped invalid check"));
+        assert!(plan_from(json!({"checks": [{"name": "a", "command": "a\nb", "why": ""}], "none_reason": ""})).is_err());
+        assert_eq!(plan_schema()["required"], json!(["checks", "none_reason"]), "plans are checks and a reason, nothing more");
         assert!(!code_changed(&["README.md".into(), "docs/a.png".into(), "LICENSE".into()]));
         assert!(code_changed(&["README.md".into(), "src/a.rs".into()]));
         assert!(code_changed(&["Makefile".into()]));

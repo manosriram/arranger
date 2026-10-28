@@ -28,7 +28,7 @@ const USAGE: &str = "usage: arranger            open the workspace window
        arranger [ls [--files] | new [--headless|--terminal] [--effort <e>] <agent> [--branch <base>] [prompt] | attach <id> | kill <id>
                  | approve <id> | deny <id> [reason] | events <id> | chat <id> | diff <id> | revert <id> <path> <hunk#>
                  | run <id> [command ...] | send <id> <text> | interrupt <id> | mode <id> <default|acceptEdits|plan> | revive <id> [prompt] | clone <id> [--model <m>] [prompt] | commit <id> [--merge [--force]|--pr] [message]
-                 | setup <id> [approve|skip|retry|replan|log] | checks <id> [--run [--wait] <command> ... | --stop | --approve [--always] | --drop <command> | --log <check> | --report | --accept] | summary <id> [--regenerate] | settings <auto_fix|coverage_fix> [0..10] | settings check_planner [on|off] | ping | stop | serve | hook <adapter>
+                 | setup <id> [approve|skip|retry|replan|log] | checks <id> [--run [--wait] <command> ... | --stop | --approve [--always] | --drop <command> | --log <check> | --report | --accept] | summary <id> [--regenerate] | settings auto_fix [0..10] | ping | stop | serve | hook <adapter>
                  | machine [ls | add <name> <user@host> [repo] | rm <name>] | endpoint]";
 /// Ctrl-\, raw and in kitty keyboard encoding.
 const DETACH: &[&[u8]] = &[b"\x1c", b"\x1b[92;5u"];
