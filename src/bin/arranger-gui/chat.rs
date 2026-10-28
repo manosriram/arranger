@@ -82,6 +82,7 @@ struct Laid {
 }
 
 pub struct ChatView {
+    selection: Option<((usize, usize, usize), (usize, usize, usize))>,
     slash: Slash,
     pub key: TaskKey,
     seq: u64,
@@ -211,6 +212,10 @@ fn markdown(r: &Renderer, text: &str, w: f32) -> Vec<Row> {
             rows.push(spacer(8.0, None));
             continue;
         }
+        if image_path(trimmed).is_some() {
+            rows.push(Row { y: 0.0, h: 26.0, runs: vec![one(0.0, trimmed, UI, BODY, 400, Ink::Text, w)], fill: Some(Fill::Box), toggle: false });
+            continue;
+        }
         let heading = trimmed.starts_with('#');
         let ordered = trimmed.split_once(". ").filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
         let (marker, body) = if heading {
@@ -262,7 +267,11 @@ fn layout(r: &Renderer, item: &ChatItem, w: f32, open: bool) -> Laid {
             rows.push(spacer(8.0, Some(Fill::User)));
             rows.push(Row { y: 0.0, h: 18.0, runs: vec![one(14.0, "YOU", UI, 10.5, 600, Ink::Dim, 60.0)], fill: Some(Fill::User), toggle: false });
             for para in text.lines() {
-                rows.extend(wrap_runs(r, &[(para.to_string(), UI, BODY, 400, Ink::Text)], 14.0, w - 28.0, BODY_H, Some(Fill::User)));
+                if image_path(para).is_some() {
+                    rows.push(Row { y: 0.0, h: 26.0, runs: vec![one(14.0, para, UI, BODY, 400, Ink::Text, w - 28.0)], fill: Some(Fill::User), toggle: false });
+                } else {
+                    rows.extend(wrap_runs(r, &[(para.to_string(), UI, BODY, 400, Ink::Text)], 14.0, w - 28.0, BODY_H, Some(Fill::User)));
+                }
             }
             rows.push(spacer(8.0, Some(Fill::User)));
         }
@@ -430,6 +439,7 @@ impl App {
             }
         });
         self.chat = Some(ChatView {
+            selection: None,
             slash: Slash::default(),
             key,
             seq,
@@ -665,6 +675,13 @@ impl App {
         let old_clip = r.clip();
         r.set_clip(Some(area));
         let mut toggled = None;
+        let mut image = None;
+        let pressed = self.click.is_some_and(|p| area.contains(p)) && self.dialog.is_none();
+        if pressed {
+            c.selection = None;
+            self.chat_copy.clear();
+            self.focus = Focus::Term;
+        }
         let mut y = area.y + 18.0 - top;
         if c.start > 0 && y > area.y {
             r.text(x, y - 16.0, "Loading earlier messages…", UI, 11.5, 400, t.faint, w);
@@ -675,7 +692,7 @@ impl App {
             }
             if y + h >= area.y {
                 let laid = c.laid[i].as_ref().unwrap();
-                for row in &laid.rows {
+                for (row_index, row) in laid.rows.iter().enumerate() {
                     let ry = y + row.y;
                     if ry + row.h < area.y || ry > area.y + area.h {
                         continue;
@@ -690,15 +707,78 @@ impl App {
                             toggled = Some(i);
                         }
                     }
+                    let text = row_text(row);
+                    let linked_image = (task.machine == 0).then(|| image_path(&text)).flatten();
+                    if let Some(path) = linked_image.as_ref() {
+                        r.target(band, Cursor::Pointer);
+                        if pressed && band.contains(self.mouse) { image = Some(path.clone()); }
+                    }
+                    if !row.toggle && !text.is_empty() && linked_image.is_none() {
+                        r.target(band, Cursor::Text);
+                        if (pressed || self.chat_drag) && band.contains(self.mouse) {
+                            let mut offset = 0;
+                            for run in &row.runs {
+                                if offset > 0 { offset += 1; }
+                                let mut rx = x + run.x;
+                                for ch in run.text.chars() {
+                                    let advance = r.advance(run.font, run.size, run.weight, ch);
+                                    if self.mouse.0 < rx + advance / 2.0 { break; }
+                                    offset += ch.len_utf8();
+                                    rx += advance;
+                                }
+                                if self.mouse.0 < rx + 1.0 { break; }
+                            }
+                            let point = (c.start + i, row_index, offset.min(text.len()));
+                            if pressed {
+                                c.selection = Some((point, point));
+                                self.chat_drag = true;
+                            } else if let Some(selection) = &mut c.selection { selection.1 = point; }
+                        }
+                    }
+                    let mut run_start = 0;
                     for run in &row.runs {
                         let ty = r.center(Rect::new(0.0, ry, 0.0, row.h), run.font, run.size);
+                        if let Some((a, b)) = c.selection {
+                            let (a, b) = if a <= b { (a, b) } else { (b, a) };
+                            let point = (c.start + i, row_index);
+                            if point >= (a.0, a.1) && point <= (b.0, b.1) && a != b {
+                                let from = if point == (a.0, a.1) { a.2.saturating_sub(run_start).min(run.text.len()) } else { 0 };
+                                let to = if point == (b.0, b.1) { b.2.saturating_sub(run_start).min(run.text.len()) } else { run.text.len() };
+                                if from < to && run.text.is_char_boundary(from) && run.text.is_char_boundary(to) {
+                                    let left = r.measure(run.font, run.size, run.weight, &run.text[..from]);
+                                    let width = r.measure(run.font, run.size, run.weight, &run.text[from..to]);
+                                    r.rect(Rect::new(x + run.x + left, ry, width, row.h), 0.0, t.sel);
+                                }
+                            }
+                        }
                         r.text(x + run.x, ty, &run.text, run.font, run.size, run.weight, ink(t, run.ink), run.max_w);
+                        run_start += run.text.len() + 1;
                     }
                 }
             }
             y += h + GAP;
         }
         r.set_clip(old_clip);
+        if let Some((a, b)) = c.selection {
+            let (a, b) = if a <= b { (a, b) } else { (b, a) };
+            let mut selected = Vec::new();
+            for (i, laid) in c.laid.iter().enumerate() {
+                if let Some(laid) = laid {
+                    for (j, row) in laid.rows.iter().enumerate() {
+                        let point = (c.start + i, j);
+                        if point < (a.0, a.1) || point > (b.0, b.1) { continue; }
+                        let text = row_text(row);
+                        let from = if point == (a.0, a.1) { a.2.min(text.len()) } else { 0 };
+                        let to = if point == (b.0, b.1) { b.2.min(text.len()) } else { text.len() };
+                        if from <= to && text.is_char_boundary(from) && text.is_char_boundary(to) {
+                            selected.push(text[from..to].to_string());
+                        }
+                    }
+                }
+            }
+            self.chat_copy = selected.join("\n");
+        }
+        if let Some(path) = image.take() { open_image(&path); }
         if let Some(i) = toggled {
             c.toggle(i);
             self.click = None;
@@ -789,7 +869,9 @@ impl App {
         let caret = self.caret_for(Focus::Message, &draft).map(|at| caret_line_at(&lines, &starts, at));
         let shown = lines.len().clamp(2, COMPOSER_LINES);
         let first = caret.map_or(lines.len().saturating_sub(shown), |(line, _)| line.saturating_sub(shown - 1)).min(lines.len().saturating_sub(shown));
-        let box_h = shown as f32 * 20.0 + 18.0;
+        let images: Vec<_> = draft.lines().filter_map(image_path).collect();
+        let image_h = if images.is_empty() { 0.0 } else { 26.0 };
+        let box_h = shown as f32 * 20.0 + 18.0 + image_h;
         let foot = 26.0;
         let outer = Rect::new(sec.x, sec.y + sec.h - box_h - foot - 12.0, sec.w, box_h + foot + 12.0);
         r.rect(outer, 0.0, t.bg);
@@ -812,6 +894,17 @@ impl App {
                 let at = caret.filter(|c| c.0 == i).map(|c| c.1);
                 self.field_text(r, t, tx, y, line, UI, BODY, text_w, (Focus::Message, starts[i]), focused, at, t.text);
             }
+        }
+        let mut ix = tx;
+        for path in &images {
+            let label = format!("View {}", path.file_name().unwrap_or_default().to_string_lossy());
+            let width = (r.measure(UI, 11.0, 400, &label) + 16.0).min(220.0);
+            if ix + width > b.x + b.w - send_w { break; }
+            let button = Rect::new(ix, b.y + b.h - 28.0, width, 22.0);
+            r.frame(button, 0.0, t.raised, t.border2);
+            r.text(ix + 8.0, r.center(button, UI, 11.0), &label, UI, 11.0, 400, t.text, width - 16.0);
+            if self.hit(r, button) { open_image(path); }
+            ix += width + 6.0;
         }
         let send = Rect::new(b.x + b.w - send_w - 6.0, b.y + b.h - 34.0, send_w, 28.0);
         let ready = !draft.trim().is_empty();
@@ -855,6 +948,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn image_references_preserve_spaces_and_filter_other_files() {
+        let path = std::env::temp_dir().join(format!("arranger image {}.PNG", std::process::id()));
+        std::fs::write(&path, b"test").unwrap();
+        assert_eq!(image_path(&format!("![image]({})", path.display())), Some(path.clone()));
+        assert!(is_image(std::path::Path::new("photo.JPEG")));
+        assert!(!is_image(std::path::Path::new("script.sh")));
+        std::fs::remove_file(&path).unwrap();
+        assert!(image_path(&format!("![image]({})", path.display())).is_none());
+    }
+
+    #[test]
     fn slash_completion_only_at_command_end() {
         assert_eq!(slash_query("/", 1), Some(""));
         assert_eq!(slash_query("/comp", 5), Some("comp"));
@@ -870,7 +974,7 @@ mod tests {
         let line = |kind| arranger::proto::DiffLine { kind, old: 0, new: 0, text: "x\n".into() };
         let tool = |ok, diff| ChatItem::Tool { id: "t".into(), name: "Edit".into(), kind: ToolKind::Edit, target: "a".into(), input: String::new(), output: "out".into(), ok, diff };
         let (sock, _) = UnixStream::pair().unwrap();
-        let mut c = ChatView { slash: Slash::default(), key: (0, 1), seq: 0, writer: sock, start: 10, items: vec![tool(Some(true), vec![line('+')]), tool(Some(false), vec![]), tool(Some(true), vec![line('+'); SMALL_DIFF + 1])], laid: vec![None, None, None], loaded: true, loading: false, width: 0.0, open: HashMap::new(), top: None, max_top: 0.0, prepended: 0 };
+        let mut c = ChatView { selection: None, slash: Slash::default(), key: (0, 1), seq: 0, writer: sock, start: 10, items: vec![tool(Some(true), vec![line('+')]), tool(Some(false), vec![]), tool(Some(true), vec![line('+'); SMALL_DIFF + 1])], laid: vec![None, None, None], loaded: true, loading: false, width: 0.0, open: HashMap::new(), top: None, max_top: 0.0, prepended: 0 };
         assert_eq!((c.is_open(0), c.is_open(1), c.is_open(2)), (true, true, false));
         c.toggle(0);
         assert!(!c.is_open(0) && c.open.get(&10) == Some(&false), "kept by conversation index");
@@ -880,4 +984,23 @@ mod tests {
         c.scroll(-200.0);
         assert_eq!(c.top, None, "back at the bottom it follows again");
     }
+}
+
+fn row_text(row: &Row) -> String {
+    row.runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join(" ")
+}
+
+pub(super) fn is_image(path: &std::path::Path) -> bool {
+    path.extension().and_then(|s| s.to_str()).is_some_and(|s| matches!(s.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "heic"))
+}
+
+fn image_path(text: &str) -> Option<std::path::PathBuf> {
+    let (_, rest) = text.split_once("](")?;
+    let path = std::path::PathBuf::from(rest.strip_suffix(')')?);
+    (is_image(&path) && path.is_file()).then_some(path)
+}
+
+fn open_image(path: &std::path::Path) {
+    let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let _ = Command::new(program).arg(path).spawn();
 }

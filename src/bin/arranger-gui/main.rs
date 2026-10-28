@@ -930,6 +930,18 @@ impl ApplicationHandler<Msg> for App {
                 self.apply();
                 self.redraw();
             }
+            WindowEvent::DroppedFile(path) if self.chat_wanted().is_some() && self.dialog.is_none() => {
+                if chat::is_image(&path) && path.is_file() && self.current().is_some_and(|t| t.machine == 0) {
+                    let key = self.chat_wanted().unwrap();
+                    let draft = self.drafts.entry(key).or_default();
+                    if !draft.is_empty() && !draft.ends_with('\n') { draft.push('\n'); }
+                    draft.push_str(&format!("![image]({})\n", path.display()));
+                    self.focus = Focus::Message;
+                    self.caret = None;
+                    self.anchor = None;
+                    self.redraw();
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 self.caret_on = true;
                 self.blink_at = Instant::now() + BLINK;
@@ -2922,7 +2934,12 @@ impl App {
                 "Checks" => !self.checkable(),
                 _ => false,
             };
-            r.text(tab.x + 12.0, r.center(tab, UI, 13.0), label, UI, 13.0, 500, if on { t.text } else if off { alpha(t.text3, 90) } else { t.text3 }, tw);
+            // The summary describes only the latest run; an older pass must not keep this green.
+            let passed = label == "Checks" && self.current().is_some_and(|task| task.checks.state == "passed");
+            if passed {
+                r.rect(Rect::new(tab.x, tab.y + tab.h - 2.0, tab.w, 2.0), 0.0, t.done);
+            }
+            r.text(tab.x + 12.0, r.center(tab, UI, 13.0), label, UI, 13.0, 500, if passed { t.done } else if on { t.text } else if off { alpha(t.text3, 90) } else { t.text3 }, tw);
             if self.hit(r, tab) && !on && !off {
                 self.actions.push(match label {
                     "Review" => Action::OpenReview,
@@ -3296,7 +3313,10 @@ impl App {
         if self.hit(r, bookmark) { self.actions.push(Action::ToggleBookmark(key)); }
         right = bookmark.x;
         let tx = pill.x + pw + 8.0 + ship_badge(r, t, &task.shipped, pill.x + pw + 8.0, pill.y + pill.h / 2.0) + 4.0;
-        r.text(tx, r.center(top, UI, 15.0), &title(&task), UI, 15.0, 600, t.text, (right - tx - 16.0).max(40.0));
+        let copy = Rect::new(right - 76.0, top.y, 68.0, 28.0);
+        r.text(copy.x + 4.0, r.center(copy, UI, 11.0), "Copy title", UI, 11.0, 400, t.text3, copy.w);
+        if self.hit(r, copy) { set_clipboard(&task.title); }
+        r.text(tx, r.center(top, UI, 15.0), &title(&task), UI, 15.0, 600, t.text, (copy.x - tx - 8.0).max(0.0));
 
         // Details: label over value, as many as fit.
         let stats = self.stats.get(&(task.machine, task.id)).filter(|_| self.changes.get(&(task.machine, task.id)).is_some_and(|c| c.1.is_some()));
