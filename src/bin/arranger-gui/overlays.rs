@@ -1,5 +1,5 @@
-//! What floats over the Workspace: one machine's every task (its sidebar header's "See all"), the
-//! scheme menu and the vim key sheet.
+//! What floats over the Workspace: one machine's every task, the settings menu, bookmarks, plan
+//! usage and the vim key sheet.
 
 use super::*;
 
@@ -11,6 +11,8 @@ const FOOT_H: f32 = 34.0;
 /// Rows the machine popup draws at first, and adds each time its list is scrolled near the end.
 pub const MT_PAGE: usize = 50;
 const GROUPS: [&str; 5] = ["Needs you", "Running", "Queued", "Done", "Ended"];
+/// Bookmarks the title-bar list shows.
+const BOOKMARKS_MAX: usize = 12;
 
 impl App {
     pub(super) fn task_is_selected(&self, key: TaskKey) -> bool {
@@ -298,42 +300,49 @@ impl App {
         self.actions.extend(acts);
     }
 
-    /// The scheme menu under its title-bar button: the eight schemes, then the preference switches.
+    /// The settings menu's box under its title-bar button: the schemes in two columns, the
+    /// switches, then the machines.
+    pub fn menu_rect(&self) -> Rect {
+        let b = self.scheme_btn;
+        let hosts = self.hosts.iter().filter(|h| !h.removed).count() as f32;
+        let h = 6.0 + 24.0 + 4.0 * 28.0 + 13.0 + 2.0 * 30.0 + 13.0 + 24.0 + hosts * 28.0 + 40.0 + 6.0;
+        Rect::new(b.x + b.w - 300.0, b.y + b.h + 6.0, 300.0, h)
+    }
+
     pub fn draw_menu(&mut self, r: &mut Renderer, t: &Theme) {
         let b = self.scheme_btn;
-        let menu = Rect::new(b.x + b.w - 232.0, b.y + b.h + 6.0, 232.0, 12.0 + 2.0 * 24.0 + 8.0 * 30.0 + 13.0 + 2.0 * 30.0);
-        r.rect(Rect::new(menu.x - 1.0, menu.y + 3.0, menu.w + 2.0, menu.h + 2.0), 8.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
-        r.frame(menu, 6.0, t.bg, t.border2);
+        let menu = self.menu_rect();
+        r.rect(Rect::new(menu.x - 1.0, menu.y + 3.0, menu.w + 2.0, menu.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
+        r.frame(menu, 0.0, t.bg, t.border2);
         r.target(menu, Cursor::Arrow);
         let mut acts = Vec::new();
         let mut y = menu.y + 6.0;
-        for (dark, label) in [(true, "DARK"), (false, "LIGHT")] {
-            r.text(menu.x + 14.0, y + 8.0, label, UI, 10.5, 500, t.text3, 100.0);
-            y += 24.0;
-            for (i, th) in THEMES.iter().enumerate().filter(|(_, th)| th.dark == dark) {
-                let row = Rect::new(menu.x + 6.0, y, menu.w - 12.0, 30.0);
-                let on = i == self.theme;
-                if on {
-                    r.rect(row, 3.0, t.sel);
-                }
-                // Swatch: ground, then text and the three state colours.
-                let sw = Rect::new(row.x + 8.0, row.y + 8.0, 34.0, 14.0);
-                r.rect(sw, 3.0, t.border2);
-                let inner = sw.inset(1.0);
-                r.rect(Rect::new(inner.x, inner.y, 13.0, inner.h), 2.0, th.bg);
-                for (k, c) in [th.text, th.needs, th.work, th.done].iter().enumerate() {
-                    r.rect(Rect::new(inner.x + 13.0 + k as f32 * 5.0, inner.y, 5.0, inner.h), 0.0, *c);
-                }
-                r.text(row.x + 52.0, r.center(row, UI, 12.5), th.name, UI, 12.5, 400, t.text, 120.0);
-                if on {
-                    r.path(8, "M14 33.6L25.6 45.2L50 18.8", Some(7.0), row.x + row.w - 22.0, row.y + 9.0, 12.0, t.text);
-                }
-                if self.hit(r, row) {
-                    acts.push(Action::PickTheme(i));
-                }
-                y += 30.0;
+        r.text(menu.x + 14.0, y + 8.0, "THEME", UI, 10.5, 500, t.text3, 100.0);
+        y += 24.0;
+        // Dark schemes, then light, two to a row.
+        let order: Vec<usize> = (0..THEMES.len()).filter(|&i| THEMES[i].dark).chain((0..THEMES.len()).filter(|&i| !THEMES[i].dark)).collect();
+        let col_w = (menu.w - 12.0) / 2.0;
+        for (k, &i) in order.iter().enumerate() {
+            let th = &THEMES[i];
+            let row = Rect::new(menu.x + 6.0 + (k % 2) as f32 * col_w, y + (k / 2) as f32 * 28.0, col_w - 2.0, 28.0);
+            let on = i == self.theme;
+            if on {
+                r.rect(row, 0.0, t.sel);
+            }
+            // Swatch: ground, then text and the three state colours.
+            let sw = Rect::new(row.x + 8.0, row.y + 8.0, 26.0, 12.0);
+            r.rect(sw, 0.0, t.border2);
+            let inner = sw.inset(1.0);
+            r.rect(Rect::new(inner.x, inner.y, 8.0, inner.h), 0.0, th.bg);
+            for (c, color) in [th.text, th.needs, th.work, th.done].iter().enumerate() {
+                r.rect(Rect::new(inner.x + 8.0 + c as f32 * 4.0, inner.y, 4.0, inner.h), 0.0, *color);
+            }
+            r.text(row.x + 42.0, r.center(row, UI, 12.5), th.name, UI, 12.5, 400, if on { t.text } else { t.text2 }, row.w - 48.0);
+            if self.hit(r, row) {
+                acts.push(Action::PickTheme(i));
             }
         }
+        y += 4.0 * 28.0;
         r.rect(Rect::new(menu.x + 8.0, y + 6.0, menu.w - 16.0, 1.0), 0.0, t.border);
         y += 13.0;
         for (label, enabled, action) in [
@@ -346,18 +355,171 @@ impl App {
             let state = if enabled { "on" } else { "off" };
             let sw = r.measure(MONO, 10.5, 400, state);
             r.text(track.x - 8.0 - sw, r.center(row, MONO, 10.5), state, MONO, 10.5, 400, t.text3, sw + 2.0);
-            r.rect(track, 7.0, if enabled { t.work } else { t.border2 });
-            r.rect(Rect::new(track.x + if enabled { 14.0 } else { 2.0 }, track.y + 2.0, 10.0, 10.0), 5.0, if enabled { t.on_accent } else { t.text3 });
+            r.rect(track, 0.0, if enabled { t.work } else { t.border2 });
+            r.rect(Rect::new(track.x + if enabled { 14.0 } else { 2.0 }, track.y + 2.0, 10.0, 10.0), 0.0, if enabled { t.on_accent } else { t.text3 });
             if self.hit(r, row) {
                 acts.push(action);
             }
             y += 30.0;
         }
+        r.rect(Rect::new(menu.x + 8.0, y + 6.0, menu.w - 16.0, 1.0), 0.0, t.border);
+        y += 13.0;
+        r.text(menu.x + 14.0, y + 8.0, "MACHINES", UI, 10.5, 500, t.text3, 100.0);
+        y += 24.0;
+        for (i, h) in self.hosts.iter().enumerate().filter(|(_, h)| !h.removed) {
+            let row = Rect::new(menu.x + 6.0, y, menu.w - 12.0, 28.0);
+            let (dot, note, nc) = match &h.link {
+                Link::Up(_) if h.cfg.is_none() => (t.done, "local".to_string(), t.text3),
+                Link::Up(ms) => (t.done, format!("{ms} ms"), t.text3),
+                Link::Connecting => (t.needs, "connecting…".to_string(), t.text3),
+                Link::Down(_) => (t.del, "unreachable".to_string(), t.del),
+            };
+            r.rect(Rect::new(row.x + 8.0, row.y + 10.0, 8.0, 8.0), 0.0, dot);
+            let nw = r.measure(MONO, 11.0, 400, &note);
+            r.text(row.x + row.w - 8.0 - nw, r.center(row, MONO, 11.0), &note, MONO, 11.0, 400, nc, nw + 2.0);
+            r.text(row.x + 24.0, r.center(row, UI, 12.5), h.name(), UI, 12.5, 500, t.text, row.w - nw - 44.0);
+            // Its every task, ended ones too.
+            if self.hit(r, row) {
+                acts.extend([Action::MachineTasks(Some(i)), Action::ToggleMenu]);
+            }
+            y += 28.0;
+        }
+        let add = Rect::new(menu.x + 10.0, y + 6.0, menu.w - 20.0, 28.0);
+        r.frame(add, 0.0, t.bg, t.border2);
+        let label = "+ Add machine";
+        let lw = r.measure(UI, 12.0, 400, label);
+        r.text(add.x + (add.w - lw) / 2.0, r.center(add, UI, 12.0), label, UI, 12.0, 400, t.text2, add.w);
+        if self.hit(r, add) {
+            acts.extend([Action::OpenAddHost, Action::ToggleMenu]);
+        }
         // A click anywhere else closes it.
-        if self.click.is_some_and(|p| !menu.contains(p) && !b.contains(p)) {
+        if clicked_outside(self.click, menu, b) {
             acts.push(Action::ToggleMenu);
         }
         self.actions.extend(acts);
+    }
+
+    /// Bookmarked threads, most recently active first.
+    fn bookmarked(&self) -> Vec<&TaskInfo> {
+        bookmark_rows(self.all_tasks(), |t| self.is_bookmarked((t.machine, t.id)))
+    }
+
+    pub fn bookmarks_rect(&self) -> Rect {
+        let b = self.bookmarks_btn;
+        let rows = self.bookmarked().len().clamp(1, BOOKMARKS_MAX) as f32;
+        Rect::new(b.x + b.w - 360.0, b.y + b.h + 6.0, 360.0, 12.0 + rows * 34.0)
+    }
+
+    /// The bookmarks list under its title-bar button; a row opens that thread.
+    pub fn draw_bookmarks(&mut self, r: &mut Renderer, t: &Theme) {
+        let b = self.bookmarks_btn;
+        let pop = self.bookmarks_rect();
+        r.rect(Rect::new(pop.x - 1.0, pop.y + 3.0, pop.w + 2.0, pop.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
+        r.frame(pop, 0.0, t.bg, t.border2);
+        r.target(pop, Cursor::Arrow);
+        let mut acts = Vec::new();
+        let saved = self.bookmarked();
+        if saved.is_empty() {
+            let row = Rect::new(pop.x, pop.y + 6.0, pop.w, 34.0);
+            r.text(row.x + 14.0, r.center(row, UI, 12.0), "Bookmark a thread to keep it here", UI, 12.0, 400, t.text3, row.w - 28.0);
+        }
+        for (k, task) in saved.iter().take(BOOKMARKS_MAX).enumerate() {
+            let row = Rect::new(pop.x + 6.0, pop.y + 6.0 + k as f32 * 34.0, pop.w - 12.0, 34.0);
+            let key = (task.machine, task.id);
+            if self.selected == Some(key) {
+                r.rect(row, 0.0, t.sel);
+            }
+            self.icon(r, t, task, row.x + 8.0, row.y + row.h / 2.0);
+            let right = adapter::kind(&task.agent);
+            let rw = r.measure(MONO, 11.5, 400, right);
+            r.text(row.x + row.w - 8.0 - rw, r.center(row, MONO, 11.5), right, MONO, 11.5, 400, t.text3, rw + 2.0);
+            let tc = if group(&task.state) == 4 { t.text3 } else { t.text };
+            r.text(row.x + 30.0, r.center(row, UI, 12.5), &title(task), UI, 12.5, 500, tc, row.w - rw - 50.0);
+            if self.hit(r, row) {
+                acts.extend([Action::Select(key), Action::ToggleBookmarks]);
+            }
+        }
+        if clicked_outside(self.click, pop, b) {
+            acts.push(Action::ToggleBookmarks);
+        }
+        self.actions.extend(acts);
+    }
+
+    pub fn usage_rect(&self, w: f32, h: f32) -> Rect {
+        let limits = self.plan_limits();
+        let rows = usage_rows(&limits);
+        let ph = 14.0 + 22.0 + rows as f32 * 24.0 + 8.0 * USAGE_AGENTS.len() as f32 + 34.0;
+        let pw = 470.0_f32.min(w - 20.0);
+        let x = (self.usage_btn.x + self.usage_btn.w - pw).max(10.0);
+        Rect::new(x, h - STATUS_H - 8.0 - ph, pw, ph)
+    }
+
+    /// Plan usage above its status-bar chip: every window each agent reported, and when it resets.
+    pub fn draw_usage(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
+        let pop = self.usage_rect(w, h);
+        r.rect(Rect::new(pop.x - 1.0, pop.y + 3.0, pop.w + 2.0, pop.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
+        r.frame(pop, 0.0, t.dialog, t.border2);
+        r.target(pop, Cursor::Arrow);
+        let limits = self.plan_limits();
+        let mut y = pop.y + 10.0;
+        r.text(pop.x + 16.0, y + 6.0, "PLAN USAGE", UI, 10.5, 500, t.text3, 200.0);
+        y += 22.0;
+        let x = pop.x + 16.0;
+        let bar_x = x + 110.0;
+        let bar_w = pop.w - 16.0 - 110.0 - 170.0;
+        for agent in USAGE_AGENTS {
+            let row = Rect::new(x, y, pop.w - 32.0, 24.0);
+            r.text(x, r.center(row, UI, 12.5), agent, UI, 12.5, 600, t.text, 100.0);
+            let live = self.all_tasks().filter(|t| adapter::kind(&t.agent) == agent && matches!(group(&t.state), 0..=2)).count();
+            let note = match live { 0 => String::new(), 1 => "1 task running".into(), n => format!("{n} tasks running") };
+            let nw = r.measure(UI, 11.5, 400, &note);
+            r.text(row.x + row.w - nw, r.center(row, UI, 11.5), &note, UI, 11.5, 400, t.text3, nw + 2.0);
+            y += 24.0;
+            let mine: Vec<&PlanLimit> = limits.iter().filter(|l| l.agent == agent).collect();
+            if mine.is_empty() {
+                let row = Rect::new(x, y, pop.w - 32.0, 24.0);
+                r.text(x + 12.0, r.center(row, UI, 11.5), &format!("Nothing yet: it shows once a {agent} chat task runs"), UI, 11.5, 400, t.text3, row.w - 12.0);
+                y += 24.0;
+            }
+            for l in mine {
+                let row = Rect::new(x, y, pop.w - 32.0, 24.0);
+                let cy = r.center(row, MONO, 11.5);
+                r.text(x + 12.0, cy, &l.window, MONO, 11.5, 400, t.text3, 96.0);
+                let color = limit_color(t, l);
+                let track = Rect::new(bar_x, row.y + 9.0, bar_w, 6.0);
+                r.rect(track, 0.0, t.border2);
+                let fill = l.used.unwrap_or(if l.status == "rejected" { 100.0 } else { 0.0 }).clamp(0.0, 100.0) as f32 / 100.0;
+                r.rect(Rect::new(track.x, track.y, track.w * fill, track.h), 0.0, color);
+                let pct = limit_label(l);
+                r.text(bar_x + bar_w + 10.0, cy, &pct, MONO, 11.5, 500, if color == t.work { t.text } else { color }, 60.0);
+                if l.resets > 0 {
+                    r.text(bar_x + bar_w + 70.0, cy, &format!("resets {}", until(l.resets)), MONO, 11.5, 400, t.text3, 100.0);
+                }
+                y += 24.0;
+            }
+            y += 8.0;
+        }
+        let foot = Rect::new(pop.x, pop.y + pop.h - 32.0, pop.w, 32.0);
+        r.rect(Rect::new(pop.x + 12.0, foot.y, pop.w - 24.0, 1.0), 0.0, t.border);
+        let totals: Vec<String> = USAGE_AGENTS
+            .iter()
+            .filter_map(|agent| {
+                let tasks: Vec<&TaskInfo> = self.all_tasks().filter(|t| adapter::kind(&t.agent) == *agent).collect();
+                let tokens: u64 = tasks.iter().map(|t| t.tokens).sum();
+                let cost: f64 = tasks.iter().filter_map(|t| t.cost).sum();
+                (tokens > 0).then(|| if cost > 0.0 { format!("{agent} {} tok ${cost:.2}", short_count(tokens)) } else { format!("{agent} {} tok", short_count(tokens)) })
+            })
+            .collect();
+        let fy = r.center(foot, UI, 11.5);
+        let seen = limits.iter().map(|l| l.seen).max().unwrap_or(0);
+        let right = if seen > 0 { format!("updated {} ago", ago(seen)) } else { String::new() };
+        let rw = r.measure(UI, 11.5, 400, &right);
+        r.text(foot.x + foot.w - 16.0 - rw, fy, &right, UI, 11.5, 400, t.text3, rw + 2.0);
+        let left = if totals.is_empty() { "Tokens per task show in its header".to_string() } else { format!("tasks · {}", totals.join(" · ")) };
+        r.text(foot.x + 16.0, fy, &left, UI, 11.5, 400, t.text3, foot.w - rw - 44.0);
+        if clicked_outside(self.click, pop, self.usage_btn) {
+            self.actions.push(Action::ToggleUsage);
+        }
     }
 
     /// Vim's keybinding sheet, above the status bar on the right.

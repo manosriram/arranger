@@ -311,6 +311,7 @@ impl Transport for Codex {
                 events.extend(self.start_next());
             }
             "error" if p["willRetry"] != true => events.push(Event::Error { message: error_message(&p["error"], "codex") }),
+            "account/rateLimits/updated" => events.extend(crate::adapter::codex_limits(&p["rateLimits"])),
             "thread/tokenUsage/updated" => {
                 if let Some(tokens) = p["tokenUsage"]["total"]["totalTokens"].as_u64() {
                     events.push(Event::Usage { tokens, cost: None });
@@ -394,6 +395,8 @@ mod tests {
         receive(&mut a, json!({"method":"item/completed","params":{"threadId":"th-2","item":{"type":"agentMessage","id":"m","text":"Done."}}}));
         let usage = receive(&mut a, json!({"method":"thread/tokenUsage/updated","params":{"threadId":"th-2","tokenUsage":{"total":{"totalTokens":99}}}}));
         assert_eq!(usage, vec![Event::Usage { tokens: 99, cost: None }]);
+        let limits = receive(&mut a, json!({"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":30.0,"windowDurationMins":300,"resetsAt":9}}}}));
+        assert!(matches!(&limits[..], [Event::Limit(l)] if l.agent == "codex" && l.used == Some(30.0)));
         let events = receive(&mut a, json!({"method":"turn/completed","params":{"threadId":"th-2","turn":{"id":"t1","status":"completed"}}}));
         assert_eq!(events, vec![Event::Summary { text: "Done.".into() }, Event::TurnDone, Event::Prompt { text: "second".into() }]);
     }

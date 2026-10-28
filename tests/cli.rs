@@ -1356,3 +1356,90 @@ fn merge_refuses_a_commit_hook_that_changes_the_verified_tree() {
     assert_eq!(git(&repo, &["rev-parse", "HEAD"]), base);
     assert!(!repo.join("hook-change").exists());
 }
+
+#[test]
+fn plan_limits_are_kept_per_window_pushed_to_watchers_and_survive_restarts() {
+    use arranger::client::connect_at;
+    use arranger::proto::{Event, PlanLimit, Reply, Request, frame, read_msg};
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    let home = Home(std::env::temp_dir().join(format!("arranger-limits-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&home.0);
+    let repo = home.0.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README"), "hi\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    let agent = home.0.join("agent.sh");
+    std::fs::write(&agent, AGENT).unwrap();
+    std::fs::set_permissions(&agent, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let (ok, out) = home.arranger(&repo, &["new", agent.to_str().unwrap(), "say", "hello"]);
+    assert!(ok, "{out}");
+    home.wait_state(&repo, &["needs-you"]);
+
+    let sock = home.0.join("arranger.sock");
+    let watch = || {
+        let mut w = connect_at(Some(&sock)).unwrap();
+        w.write_all(&frame(&Request::Watch)).unwrap();
+        w.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        w
+    };
+    // Hooks send events on a connection of their own, with no reply.
+    let send = |task: u64, event: Event| {
+        let mut c = connect_at(Some(&sock)).unwrap();
+        c.write_all(&frame(&Request::Event { task, event })).unwrap();
+    };
+    let next_limits = |w: &mut UnixStream| loop {
+        if let Reply::Limits(l) = read_msg::<Reply>(w).expect("a Limits push") {
+            break l;
+        }
+    };
+    let limit = |agent: &str, window: &str, used: f64| PlanLimit { agent: agent.into(), window: window.into(), used: Some(used), resets: 1_900_000_000, status: String::new(), seen: 0 };
+    let windows = |l: &[PlanLimit]| l.iter().map(|l| (l.agent.clone(), l.window.clone(), l.used)).collect::<Vec<_>>();
+
+    // On Watch: the task list, then the limits so far (none yet).
+    let mut w = watch();
+    assert!(matches!(read_msg::<Reply>(&mut w).unwrap(), Reply::Tasks(_)));
+    assert!(matches!(read_msg::<Reply>(&mut w).unwrap(), Reply::Limits(l) if l.is_empty()));
+
+    send(1, Event::Limit(limit("codex", "5h", 30.0)));
+    let got = next_limits(&mut w);
+    assert_eq!(windows(&got), [("codex".into(), "5h".into(), Some(30.0))]);
+    assert!(got[0].seen > 0, "the daemon stamps when it heard it");
+
+    // A newer report on the same window replaces it; one for a task that isn't live is dropped.
+    send(999, Event::Limit(limit("claude", "week (opus)", 99.0)));
+    send(1, Event::Limit(limit("codex", "5h", 55.0)));
+    send(1, Event::Limit(limit("codex", "week", 20.0)));
+    let want = [("codex".to_string(), "5h".to_string(), Some(55.0)), ("codex".into(), "week".into(), Some(20.0))];
+    let mut got = next_limits(&mut w);
+    while got.len() < 2 {
+        got = next_limits(&mut w);
+    }
+    assert_eq!(windows(&got), want);
+
+    // Token usage lands on the task itself.
+    send(1, Event::Usage { tokens: 1234, cost: Some(0.5) });
+    loop {
+        if let Reply::Tasks(tasks) = read_msg::<Reply>(&mut w).unwrap()
+            && let Some(t) = tasks.iter().find(|t| t.id == 1)
+            && t.tokens == 1234 {
+            assert_eq!(t.cost, Some(0.5));
+            break;
+        }
+    }
+    // Limits neither move the task along nor go into its history.
+    assert_eq!(home.wait_state(&repo, &["needs-you", "done", "exited"]), "needs-you");
+    let (_, events) = home.arranger(&repo, &["events", "1"]);
+    assert!(events.contains("1234 tokens") && !events.contains("codex 5h") && !events.contains("codex week"), "{events}");
+    drop(w);
+
+    // After a restart a new watcher gets the same limits straight away.
+    assert!(home.arranger(&repo, &["stop"]).0);
+    assert!(home.arranger(&repo, &["ls"]).0);
+    let mut w = watch();
+    assert!(matches!(read_msg::<Reply>(&mut w).unwrap(), Reply::Tasks(_)));
+    assert_eq!(windows(&next_limits(&mut w)), want);
+}
