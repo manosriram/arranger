@@ -57,7 +57,7 @@ use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 const TITLE_H: f32 = 44.0;
 const STATUS_H: f32 = 26.0;
 const SIDEBAR_W: f32 = 340.0;
-const HEADER_H: f32 = 118.0;
+const HEADER_H: f32 = 72.0;
 const ROW_H: f32 = 28.0;
 /// A row with its second line (what the agent is doing / did).
 const ROW2_H: f32 = 48.0;
@@ -1280,103 +1280,6 @@ fn status_line(task: &TaskInfo, queue_pos: usize) -> String {
             "failed" => "failed to start".into(),
             _ => "exited · history kept".into(),
         },
-    }
-}
-
-/// Where one pipeline stage is.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Phase {
-    Todo,
-    Active,
-    /// Waiting on you.
-    Waiting,
-    Done,
-    Failed,
-    Skipped,
-}
-
-/// One stage of the pipeline: its name, where it is, a few words on it, and how far along it is
-/// (0..1) when that's known.
-#[derive(Debug, PartialEq)]
-struct Stage {
-    name: &'static str,
-    phase: Phase,
-    note: String,
-    progress: Option<f32>,
-}
-
-/// The task's pipeline: Setup → Working → Summary → Review → Merge.
-fn stages(task: &TaskInfo) -> [Stage; 5] {
-    use Phase::*;
-    let stage = |name, phase, note: &str| Stage { name, phase, note: note.to_string(), progress: None };
-    let setting_up = is_setup(&task.state);
-    let setup = match task.setup.as_str() {
-        "ok" => stage("Setup", Done, "ready"),
-        "planning" => stage("Setup", Active, "planning"),
-        "running" => stage("Setup", Active, "installing"),
-        "approval" => stage("Setup", Waiting, "approve plan"),
-        "failed" => stage("Setup", Failed, "failed"),
-        _ => stage("Setup", Skipped, "skipped"), // skipped, or from before setup
-    };
-    let since = if task.since == 0 { String::new() } else { format!(" · {}", ago(task.since)) };
-    let working = match group(&task.state) {
-        _ if setting_up => stage("Working", Todo, ""),
-        2 => stage("Working", Todo, "queued"),
-        0 => stage("Working", Waiting, &format!("needs you{since}")),
-        1 => stage("Working", Active, &format!("working{since}")),
-        3 => stage("Working", Done, "turn done"),
-        _ => stage("Working", Done, "ended"),
-    };
-    let summary = match task.summary_state.as_str() {
-        "ready" => stage("Summary", Done, "written"),
-        "running" => stage("Summary", Active, "writing"),
-        "error" => stage("Summary", Failed, "failed"),
-        "stale" => stage("Summary", Todo, "outdated"),
-        _ => stage("Summary", Todo, ""),
-    };
-    let review = match task.shipped.as_str() {
-        "" if group(&task.state) == 3 => stage("Review", Waiting, "ready for you"),
-        "" => stage("Review", Todo, ""),
-        _ => stage("Review", Done, "approved"),
-    };
-    let merge = match task.shipped.as_str() {
-        "merged" => stage("Merge", Done, "merged"),
-        "PR" => stage("Merge", Done, "PR opened"),
-        "committed" => stage("Merge", Skipped, "committed only"),
-        _ => stage("Merge", Todo, ""),
-    };
-    [setup, working, summary, review, merge]
-}
-
-/// The stage to call out: the first that isn't finished, or none once all are.
-fn current_stage(stages: &[Stage]) -> Option<usize> {
-    stages.iter().position(|s| matches!(s.phase, Phase::Waiting | Phase::Failed | Phase::Active)).or_else(|| stages.iter().position(|s| s.phase == Phase::Todo))
-}
-
-/// The header pill: why the task is where it is.
-fn reason(task: &TaskInfo) -> String {
-    if is_setup(&task.state) {
-        return match task.setup.as_str() {
-            "planning" => "Planning setup",
-            "approval" => "Approve setup",
-            "failed" => "Setup failed",
-            _ => "Setting up",
-        }
-        .into();
-    }
-    match (&task.need, task.state.as_str()) {
-        (Some(Event::PermissionRequest { .. }), _) => "Needs approval".into(),
-        (Some(Event::Question { .. }), _) => "Asked a question".into(),
-        (Some(Event::Error { .. }), _) => "Error".into(),
-        (_, "needs-you") => "Needs you".into(),
-        (_, "running") if !task.action.is_empty() => {
-            let mut c = task.action.chars();
-            c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
-        }
-        (_, s) => {
-            let mut c = s.chars();
-            c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
-        }
     }
 }
 
@@ -3320,22 +3223,13 @@ impl App {
             }
             return;
         };
-        let color = state_color(t, &task.state);
-        let tint = alpha(color, if t.dark { 0x14 } else { 0x12 });
-
-        // Header: why it's here, the title and Review; under them, the task's details.
+        // Two compact rows: title and actions, then inline task metadata.
         let head = Rect::new(area.x, area.y, area.w, HEADER_H);
         r.rect(Rect::new(area.x, area.y + HEADER_H - 1.0, area.w, 1.0), 0.0, t.border);
-        let top = Rect::new(area.x, area.y + 10.0, area.w, 28.0);
-        let why = reason(&task);
-        let pw = r.measure(UI, 11.0, 500, &why).min(260.0) + 23.0;
-        let pill = Rect::new(area.x + 20.0, top.y + 4.0, pw, 20.0);
-        r.rect(pill, 3.0, tint);
-        r.rect(Rect::new(pill.x + 6.0, pill.y + 7.5, 5.0, 5.0), 1.0, color);
-        r.text(pill.x + 16.0, r.center(pill, UI, 11.0), &why, UI, 11.0, 500, color, pw - 20.0);
+        let top = Rect::new(area.x, area.y + 8.0, area.w, 28.0);
         let kind = adapter::kind(&task.agent);
         let host = &self.hosts[task.machine];
-        let review_label = "Review changes";
+        let review_label = "Review";
         let review_key = mod_label("R");
         let bw = r.measure(UI, 12.0, 500, review_label) + r.measure(MONO, 10.5, 400, &review_key) + 30.0;
         let review = Rect::new(head.x + head.w - 16.0 - bw, top.y, bw, 28.0);
@@ -3370,13 +3264,12 @@ impl App {
         r.text(bookmark.x + 12.0, r.center(bookmark, UI, 12.0), label, UI, 12.0, 500, if saved { t.tc_on } else { t.text }, bw - 20.0);
         if self.hit(r, bookmark) { self.actions.push(Action::ToggleBookmark(key)); }
         right = bookmark.x;
-        let tx = pill.x + pw + 8.0 + ship_badge(r, t, &task.shipped, pill.x + pw + 8.0, pill.y + pill.h / 2.0) + 4.0;
-        let copy = Rect::new(right - 76.0, top.y, 68.0, 28.0);
-        r.text(copy.x + 4.0, r.center(copy, UI, 11.0), "Copy title", UI, 11.0, 400, t.text3, copy.w);
-        if self.hit(r, copy) { set_clipboard(&task.title); }
-        r.text(tx, r.center(top, UI, 15.0), &title(&task), UI, 15.0, 600, t.text, (copy.x - tx - 8.0).max(0.0));
+        let tx = area.x + 20.0;
+        let title_rect = Rect::new(tx, top.y, (right - tx - 12.0).max(0.0), top.h);
+        r.text(tx, r.center(top, UI, 15.0), &title(&task), UI, 15.0, 600, t.text, title_rect.w);
+        if self.hit(r, title_rect) { set_clipboard(&task.title); }
 
-        // Details: label over value, as many as fit.
+        // Keep metadata on one baseline, separated by quiet dividers.
         let stats = self.stats.get(&(task.machine, task.id)).filter(|_| self.changes.get(&(task.machine, task.id)).is_some_and(|c| c.1.is_some()));
         let from = stats.map(|s| s.0.as_str()).filter(|b| !b.is_empty() && *b != "HEAD" && *b != task.branch);
         let branch = match from {
@@ -3419,22 +3312,31 @@ impl App {
             }
             details
         };
-        let (ly, vy) = (area.y + 46.0, area.y + 60.0);
-        let mut dx = area.x + 20.0;
+        let meta = Rect::new(area.x + 20.0, area.y + 42.0, area.w - 36.0, 20.0);
+        let mut dx = meta.x;
         for (label, parts) in details {
-            let w = parts.iter().map(|(s, _)| r.measure(MONO, 11.5, 400, s)).sum::<f32>().max(r.measure(UI, 10.5, 400, label));
-            if dx + w > head.x + head.w - 16.0 {
-                break;
-            }
-            r.text(dx, ly, label, UI, 10.5, 400, t.text3, w + 2.0);
+            let prefix = match label {
+                "Agent" | "Branch" | "Machine" | "Changes" | "Elapsed" | "Usage" => String::new(),
+                _ => format!("{label} "),
+            };
+            let pw = r.measure(UI, 11.5, 400, &prefix);
+            let w = pw + parts.iter().map(|(s, _)| r.measure(UI, 11.5, 400, s)).sum::<f32>();
+            let remaining = meta.x + meta.w - dx;
+            if remaining < 40.0 { break; }
+            let available = w.min(remaining);
             let mut px = dx;
-            for (s, c) in &parts {
-                px += r.text(px, vy, s, MONO, 11.5, 400, *c, w + 2.0);
+            if !prefix.is_empty() {
+                px += r.text(px, r.center(meta, UI, 11.5), &prefix, UI, 11.5, 400, t.text3, available);
             }
-            dx += w + 32.0;
+            for (s, c) in &parts {
+                let room = (dx + available - px).max(0.0);
+                px += r.text(px, r.center(meta, UI, 11.5), s, UI, 11.5, 400, *c, room);
+            }
+            dx += w + 20.0;
+            if dx + 20.0 < meta.x + meta.w {
+                r.text(dx - 12.0, r.center(meta, UI, 11.5), "·", UI, 11.5, 400, t.text3, 8.0);
+            }
         }
-
-        self.draw_pipeline(r, t, Rect::new(area.x + 20.0, area.y + 84.0, area.w - 36.0, HEADER_H - 92.0), &task);
 
         // The agent's own terminal, sized to the pane; once the agent has ended, a bar to bring it back below.
         let ended = group(&task.state) == 4 && !self.shell;
@@ -3543,61 +3445,6 @@ impl App {
         }
     }
 
-
-    /// The header's pipeline: a segment per stage, its bar filled by where it is, with the stage's
-    /// name and a few words under it. The stage to look at next is lit; the stages
-    /// Review covers open their tabs.
-    fn draw_pipeline(&mut self, r: &mut Renderer, t: &Theme, row: Rect, task: &TaskInfo) {
-        let stages = stages(task);
-        let current = current_stage(&stages);
-        let gap = 6.0;
-        let w = (row.w - gap * (stages.len() - 1) as f32) / stages.len() as f32;
-        for (i, s) in stages.iter().enumerate() {
-            let seg = Rect::new(row.x + i as f32 * (w + gap), row.y, w, row.h);
-            let (mark, color) = match s.phase {
-                Phase::Done => ("✓", t.done),
-                Phase::Active => ("●", t.work),
-                Phase::Waiting => ("■", t.needs),
-                Phase::Failed => ("✗", t.del),
-                Phase::Skipped => ("–", t.text3),
-                Phase::Todo => ("○", t.text3),
-            };
-            let lit = current == Some(i);
-            if lit {
-                r.rect(Rect::new(seg.x, seg.y + 3.0, seg.w, seg.h - 3.0), 0.0, alpha(color, if t.dark { 0x14 } else { 0x10 }));
-            }
-            let bar = Rect::new(seg.x, seg.y, seg.w, 3.0);
-            match s.phase {
-                Phase::Todo => r.rect(bar, 0.0, t.border2),
-                Phase::Skipped => r.rect(bar, 0.0, alpha(t.text3, 0x40)),
-                _ => {
-                    let fill = s.progress.unwrap_or(1.0).clamp(0.0, 1.0);
-                    if fill < 1.0 {
-                        r.rect(bar, 0.0, alpha(color, 0x40));
-                    }
-                    r.rect(Rect::new(bar.x, bar.y, bar.w * fill, bar.h), 0.0, color);
-                }
-            }
-            let reached = !matches!(s.phase, Phase::Todo | Phase::Skipped);
-            let line = Rect::new(seg.x + 8.0, seg.y + 3.0, seg.w - 12.0, seg.h - 3.0);
-            let y = r.center(line, UI, 12.0);
-            let mw = r.text(line.x, r.center(line, UI, 11.0), mark, UI, 11.0, 600, color, 16.0);
-            let nx = line.x + mw + 6.0;
-            let nw = r.text(nx, y, s.name, UI, 12.0, if lit { 600 } else { 500 }, if reached || lit { t.text } else { t.text3 }, line.x + line.w - nx);
-            let note = if lit && matches!(s.phase, Phase::Waiting | Phase::Failed) { color } else { t.text3 };
-            let tx = nx + nw + 7.0;
-            r.text(tx, r.center(line, UI, 11.0), &s.note, UI, 11.0, 400, note, (line.x + line.w - tx).max(0.0));
-            let open = match s.name {
-                "Summary" | "Review" | "Merge" if self.reviewable() && !self.shell => Some(Action::OpenReview),
-                _ => None,
-            };
-            if let Some(action) = open
-                && self.hit(r, seg)
-            {
-                self.actions.push(action);
-            }
-        }
-    }
 
     fn draw_status(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
         let bar = Rect::new(0.0, h - STATUS_H, w, STATUS_H);
@@ -4401,22 +4248,6 @@ mod tests {
             "summary": "", "shipped": "", "updated": 0, "setup": setup, "summary_state": "",
         }))
         .unwrap()
-    }
-
-    fn phases(task: &TaskInfo) -> Vec<Phase> {
-        stages(task).iter().map(|s| s.phase).collect()
-    }
-
-    #[test]
-    fn pipeline_moves_from_work_to_review_without_checks() {
-        use Phase::*;
-        let mut task = task_in("done", "ok");
-        task.summary_state = "ready".into();
-        assert_eq!(phases(&task), [Done, Done, Done, Waiting, Todo]);
-        assert_eq!(current_stage(&stages(&task)), Some(3));
-        task.shipped = "merged".into();
-        assert_eq!(phases(&task), [Done, Done, Done, Done, Done]);
-        assert_eq!(current_stage(&stages(&task)), None);
     }
 
     #[test]
