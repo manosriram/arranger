@@ -18,8 +18,6 @@ const PAD: f32 = 24.0;
 const MAX_W: f32 = 860.0;
 /// Lines of a tool's output or diff shown when opened.
 const MAX_LINES: usize = 400;
-/// An edit this small shows its diff without being opened.
-const SMALL_DIFF: usize = 24;
 /// Lines of the message box before it scrolls.
 const COMPOSER_LINES: usize = 8;
 
@@ -122,14 +120,7 @@ impl ChatView {
     }
 
     fn is_open(&self, i: usize) -> bool {
-        if let Some(&o) = self.open.get(&(self.start + i)) {
-            return o;
-        }
-        match &self.items[i] {
-            ChatItem::Tool { ok: Some(false), .. } => true,
-            ChatItem::Tool { diff, .. } => !diff.is_empty() && diff.iter().filter(|l| l.kind != ' ').count() <= SMALL_DIFF,
-            _ => false,
-        }
+        self.open.get(&(self.start + i)).copied().unwrap_or(false)
     }
 
     fn toggle(&mut self, i: usize) {
@@ -1066,12 +1057,14 @@ mod tests {
     }
 
     #[test]
-    fn small_edits_and_failures_open_by_themselves() {
+    fn tools_stay_collapsed_until_opened() {
         let line = |kind| arranger::proto::DiffLine { kind, old: 0, new: 0, text: "x\n".into() };
         let tool = |ok, diff| ChatItem::Tool { id: "t".into(), name: "Edit".into(), kind: ToolKind::Edit, target: "a".into(), input: String::new(), output: "out".into(), ok, diff };
         let (sock, _) = UnixStream::pair().unwrap();
-        let mut c = ChatView { hist: None, selection: None, slash: Slash::default(), key: (0, 1), seq: 0, writer: sock, start: 10, items: vec![tool(Some(true), vec![line('+')]), tool(Some(false), vec![]), tool(Some(true), vec![line('+'); SMALL_DIFF + 1])], laid: vec![None, None, None], loaded: true, loading: false, width: 0.0, open: HashMap::new(), top: None, max_top: 0.0, prepended: 0 };
-        assert_eq!((c.is_open(0), c.is_open(1), c.is_open(2)), (true, true, false));
+        let mut c = ChatView { hist: None, selection: None, slash: Slash::default(), key: (0, 1), seq: 0, writer: sock, start: 10, items: vec![tool(Some(true), vec![line('+')]), tool(Some(false), vec![]), tool(None, vec![])], laid: vec![None, None, None], loaded: true, loading: false, width: 0.0, open: HashMap::new(), top: None, max_top: 0.0, prepended: 0 };
+        assert_eq!((c.is_open(0), c.is_open(1), c.is_open(2)), (false, false, false));
+        c.toggle(0);
+        assert!(c.is_open(0) && c.open.get(&10) == Some(&true), "kept by conversation index");
         c.toggle(0);
         assert!(!c.is_open(0) && c.open.get(&10) == Some(&false), "kept by conversation index");
         c.max_top = 500.0;
