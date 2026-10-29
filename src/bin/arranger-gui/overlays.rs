@@ -38,32 +38,18 @@ impl App {
         }
         if let Some((key, (x, y))) = self.task_menu {
             let Some(task) = self.task(key) else { self.task_menu = None; return };
-            let name = title(task);
             let can_clone = task.state != "queued" && !task.worktree.is_empty();
             let width = 380.0_f32.min(w - 16.0);
-            let lines = wrap(r, &name, UI, 13.0, width - 60.0);
-            let title_h = 24.0 + lines.len() as f32 * 19.0;
-            let height = title_h + if can_clone { 114.0 } else { 76.0 };
+            let height = if can_clone { 114.0 } else { 76.0 };
             let menu = Rect::new(x.min(w - width - 8.0).max(8.0), y.min(h - height - 8.0).max(8.0), width, height);
             r.frame(menu, 4.0, t.dialog, t.border2);
             r.target(menu, Cursor::Arrow);
-            for (i, line) in lines.iter().enumerate() {
-                r.text(menu.x + 12.0, menu.y + 12.0 + i as f32 * 19.0, line, UI, 13.0, 500, t.text, menu.w - 60.0);
-            }
-            let copy = Rect::new(menu.x + menu.w - 40.0, menu.y + 7.0, 28.0, 28.0);
-            r.frame(Rect::new(copy.x + 7.0, copy.y + 6.0, 10.0, 12.0), 1.0, t.dialog, t.text3);
-            r.frame(Rect::new(copy.x + 11.0, copy.y + 10.0, 10.0, 12.0), 1.0, t.dialog, t.text3);
-            if self.hit(r, copy) {
-                set_clipboard(&name);
-                self.task_menu = None;
-            }
-            r.rect(Rect::new(menu.x + 8.0, menu.y + title_h, menu.w - 16.0, 1.0), 0.0, t.border);
             let label = if self.is_bookmarked(key) { "Remove bookmark" } else { "Bookmark thread" };
             let mut labels = vec![label.to_string()];
             if can_clone { labels.push(format!("Clone task · {}", mod_label("D"))); }
             labels.push("Select task".to_string());
             for (i, label) in labels.iter().enumerate() {
-                let row = Rect::new(menu.x, menu.y + title_h + i as f32 * 38.0, menu.w, 38.0);
+                let row = Rect::new(menu.x, menu.y + i as f32 * 38.0, menu.w, 38.0);
                 r.text(row.x + 12.0, r.center(row, UI, 13.0), label, UI, 13.0, 400, t.text2, row.w - 24.0);
                 if self.hit(r, row) {
                     match i {

@@ -363,6 +363,7 @@ struct App {
     confirm_delete: Option<Vec<TaskKey>>,
     multi_select: Option<Vec<TaskKey>>,
     task_menu: Option<(TaskKey, (f32, f32))>,
+    title_copied: Option<(TaskKey, Instant)>,
     expanded_request: Option<TaskKey>,
     task_regions: std::cell::RefCell<Vec<(TaskKey, Rect)>>,
     /// When Esc was last pressed in vim mode: a second one forwards both to the agent.
@@ -522,6 +523,7 @@ fn run() -> io::Result<()> {
         confirm_delete: None,
         multi_select: None,
         task_menu: None,
+        title_copied: None,
         expanded_request: None,
         task_regions: std::cell::RefCell::new(Vec::new()),
         pending_g: false,
@@ -691,6 +693,10 @@ const BLINK: Duration = Duration::from_millis(530);
 impl ApplicationHandler<Msg> for App {
     fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
         if let StartCause::ResumeTimeReached { .. } = cause {
+            if self.title_copied.is_some_and(|(_, until)| Instant::now() >= until) {
+                self.title_copied = None;
+                self.stale.set(true);
+            }
             if Instant::now() >= self.blink_at {
                 self.caret_on = !self.caret_on;
                 self.blink_at = Instant::now() + BLINK;
@@ -718,7 +724,8 @@ impl ApplicationHandler<Msg> for App {
         // A glide asks for frames at 120Hz; vsync holds that to a 60Hz display's own rate.
         let ms = if self.glide != 0.0 { 8 } else if moving { 33 } else { 80 };
         let frame = (moving || self.sweep().is_some()).then(|| Instant::now() + Duration::from_millis(ms));
-        match blink.into_iter().chain(frame).min() {
+        let copied = self.title_copied.map(|(_, until)| until);
+        match blink.into_iter().chain(frame).chain(copied).min() {
             Some(at) => el.set_control_flow(ControlFlow::WaitUntil(at)),
             None => el.set_control_flow(ControlFlow::Wait),
         }
@@ -3290,9 +3297,20 @@ impl App {
             self.click = None;
         }
         let tx = area.x + 20.0;
-        let title_rect = Rect::new(tx, top.y, (more.x - tx - 12.0).max(0.0), top.h);
-        r.text(tx, r.center(top, UI, 15.0), &title(&task), UI, 15.0, 600, t.text, title_rect.w);
-        if self.hit(r, title_rect) { set_clipboard(&task.title); }
+        let name = title(&task);
+        let available = (more.x - tx - 12.0).max(0.0);
+        let title_hit_w = r.measure(UI, 15.0, 600, &name).min(available);
+        if self.hit(r, Rect::new(tx, top.y, title_hit_w, top.h)) {
+            set_clipboard(&task.title);
+            self.title_copied = Some((key, Instant::now() + Duration::from_secs(2)));
+        }
+        let copied = self.title_copied.is_some_and(|(copied_key, until)| copied_key == key && Instant::now() < until);
+        let message_w = if copied { r.measure(UI, 11.0, 400, "Title copied") + 12.0 } else { 0.0 };
+        let title_rect = Rect::new(tx, top.y, (more.x - tx - 12.0 - message_w).max(0.0), top.h);
+        let title_w = r.text(tx, r.center(top, UI, 15.0), &name, UI, 15.0, 600, t.text, title_rect.w);
+        if copied {
+            r.text(tx + title_w + 12.0, r.center(top, UI, 11.0), "Title copied", UI, 11.0, 400, t.text3, message_w - 12.0);
+        }
 
         // Keep metadata on one baseline, separated by quiet dividers.
         let stats = self.stats.get(&(task.machine, task.id)).filter(|_| self.changes.get(&(task.machine, task.id)).is_some_and(|c| c.1.is_some()));
