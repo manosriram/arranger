@@ -46,6 +46,10 @@ uniform sampler2D atlas;
 out vec4 frag;
 void main() {
     float a;
+    if (v_radius < -1.5) {
+        frag = texture(atlas, v_uv);
+        return;
+    }
     if (v_radius < 0.0) {
         a = texture(atlas, v_uv).r;
     } else {
@@ -121,6 +125,7 @@ pub struct Renderer {
     vao: glow::VertexArray,
     vbo: glow::Buffer,
     atlas: glow::Texture,
+    images: HashMap<std::path::PathBuf, Option<(glow::Texture, u32, u32)>>,
     screen_loc: Option<glow::UniformLocation>,
     verts: Vec<Vertex>,
     scaler: ScaleContext,
@@ -223,6 +228,7 @@ impl Renderer {
                 vao,
                 vbo,
                 atlas,
+                images: HashMap::new(),
                 screen_loc,
                 verts: Vec::new(),
                 scaler: ScaleContext::new(),
@@ -424,6 +430,55 @@ impl Renderer {
         let (x, y) = ((r.x * d).round(), (r.y * d).round());
         let (w, h) = (((r.x + r.w) * d).round() - x, ((r.y + r.h) * d).round() - y);
         self.quad(x, y, w, h, [0.0; 4], 0.0, color);
+    }
+
+    /// Draw a local image inside a bounding box, preserving its aspect ratio.
+    /// Failed decodes are cached too, so invalid attachments do not retry every frame.
+    pub fn image(&mut self, path: &std::path::Path, bounds: Rect) -> bool {
+        if !self.images.contains_key(path) {
+            // Bound GPU memory when browsing long conversations.
+            if self.images.len() >= 64 {
+                self.flush();
+                for (_, entry) in self.images.drain() {
+                    if let Some((texture, _, _)) = entry {
+                        unsafe { self.gl.delete_texture(texture); }
+                    }
+                }
+            }
+            let loaded = (|| {
+                let mut reader = image::ImageReader::open(path).ok()?;
+                let mut limits = image::Limits::default();
+                limits.max_image_width = Some(16384);
+                limits.max_image_height = Some(16384);
+                limits.max_alloc = Some(128 * 1024 * 1024);
+                reader.limits(limits);
+                let pixels = reader.decode().ok()?.thumbnail(1600, 1600).to_rgba8();
+                let (w, h) = pixels.dimensions();
+                self.flush();
+                unsafe {
+                    let gl = &self.gl;
+                    let texture = gl.create_texture().ok()?;
+                    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+                    gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, w as i32, h as i32, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(pixels.as_raw())));
+                    Some((texture, w, h))
+                }
+            })();
+            self.images.insert(path.to_path_buf(), loaded);
+        }
+        let Some((texture, w, h)) = self.images[path] else { return false };
+        let scale = (bounds.w / w as f32).min(bounds.h / h as f32).min(1.0);
+        self.flush();
+        let atlas = self.atlas;
+        self.atlas = texture;
+        let d = self.dpi;
+        self.quad(bounds.x * d, bounds.y * d, w as f32 * scale * d, h as f32 * scale * d, [0.0, 0.0, 1.0, 1.0], -2.0, [255; 4]);
+        self.flush();
+        self.atlas = atlas;
+        true
     }
 
     /// Rect with a 1px border of `line` (drawn as an outer rect behind an inset fill).

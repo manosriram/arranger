@@ -260,7 +260,7 @@ fn tool_verb(kind: ToolKind, name: &str) -> String {
     .to_string()
 }
 
-fn layout(r: &Renderer, item: &ChatItem, w: f32, open: bool) -> Laid {
+fn layout(r: &Renderer, item: &ChatItem, w: f32, open: bool, local: bool) -> Laid {
     let mut rows = Vec::new();
     match item {
         ChatItem::User { text } => {
@@ -377,6 +377,9 @@ fn layout(r: &Renderer, item: &ChatItem, w: f32, open: bool) -> Laid {
     }
     let mut y = 0.0;
     for row in &mut rows {
+        if local && image_path(&row_text(row)).is_some() {
+            row.h = 266.0;
+        }
         row.y = y;
         y += row.h;
     }
@@ -655,7 +658,7 @@ impl App {
         for i in 0..c.items.len() {
             if c.laid[i].is_none() {
                 let open = c.is_open(i);
-                c.laid[i] = Some(layout(r, &c.items[i], w, open));
+                c.laid[i] = Some(layout(r, &c.items[i], w, open, task.machine == 0));
             }
         }
         let heights: Vec<f32> = c.laid.iter().map(|l| l.as_ref().map_or(0.0, |l| l.h)).collect();
@@ -772,6 +775,15 @@ impl App {
                     }
                     if !row.toggle && !text.is_empty() && linked_image.is_none() {
                         r.target(band, Cursor::Text);
+                    }
+                    if let Some(path) = linked_image.as_ref() {
+                        let preview = Rect::new(x + 14.0, ry + 6.0, (w - 28.0).max(1.0), 232.0);
+                        if !r.image(path, preview) {
+                            r.text(preview.x, preview.y + 12.0, "Preview unavailable · click to open", UI, 12.0, 400, t.text3, preview.w);
+                        }
+                        let label = path.file_name().unwrap_or_default().to_string_lossy();
+                        r.text(preview.x, ry + 244.0, &label, UI, 11.0, 400, t.text3, preview.w);
+                        continue;
                     }
                     let mut run_start = 0;
                     for run in &row.runs {
