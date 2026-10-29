@@ -1914,8 +1914,7 @@ impl Daemon {
             diff.truncate(cut);
             diff.push_str("\n(diff truncated; read the worktree for more)");
         }
-        let context = review::chat_summary(&self.events(id)?);
-        let prompt = format!("Summarize the completed work for human review and a commit message. Return JSON matching the schema. Read only; do not edit files, run checks, or send messages. Describe this exact tree {tree}, not intended future work. Keep the overview short: one concise paragraph describing only what the changes do to the existing codebase. Do not include headings, lists, per-file breakdowns, risks, or verification details in the overview. Include a short title and return empty arrays for files and risks. Do not claim verification.\nConversation context:\n{context}\nDiff:\n{diff}");
+        let prompt = format!("Summarize the completed work for human review and a commit message. Return JSON matching the schema. Read only; do not edit files, run checks, or send messages. Describe this exact tree {tree}, not intended future work. Keep the overview short: one concise paragraph describing only what the changes do to the existing codebase. Do not include headings, lists, per-file breakdowns, risks, or verification details in the overview. Include a short title and return empty arrays for files and risks. Do not claim verification.\nDiff:\n{diff}");
         let name = format!("summary-{}", self.next_side);
         self.next_side += 1;
         let side = side::start_summary(backend, Path::new(&wt), &prompt, if own { &model } else { "" }, &self.data.join("side"), &name, &agent, if own { session.trim() } else { "" }, &self.exe).map_err(e2s)?;
@@ -2113,7 +2112,6 @@ impl Daemon {
             .db
             .query_row("SELECT branch, base FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(e2s)?;
-        let events = self.events(id)?;
         let tree = tree_hash(Path::new(&wt))?;
         let verification = String::new();
         let stored: Option<(String, String, String, String)> = self.db.query_row(
@@ -2122,7 +2120,7 @@ impl Daemon {
             Some((old, state, json, error)) => (serde_json::from_str::<proto::WorkSummary>(&json).ok(), if old != tree { "stale".into() } else if state == "error" { error } else { state }),
             None => (None, "missing".into()),
         };
-        let summary = work_summary.as_ref().map(crate::summary::message).unwrap_or_else(|| review::chat_summary(&events));
+        let summary = work_summary.as_ref().map(crate::summary::message).unwrap_or_default();
         let (conflicts, merging) = review::conflicts(Path::new(&wt))?;
         Ok(proto::Review {
             tree: tree.clone(), verification, work_summary, summary_state,

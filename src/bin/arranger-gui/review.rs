@@ -635,7 +635,13 @@ impl App {
                 y += 32.0;
             }
         }
-        if let Some(summary) = rv.data.as_ref().map(|d| d.summary.trim()).filter(|s| !s.is_empty()) {
+        if let Some(summary) = rv.data.as_ref().map(|d| {
+            if d.work_summary.is_none() || d.summary_state == "running" {
+                "Generating summary..."
+            } else {
+                d.summary.trim()
+            }
+        }).filter(|s| !s.is_empty()) {
             y += 18.0;
             section(r, y, "AGENT SUMMARY");
             y = draw_markdown(r, t, summary, rail.x + 16.0, y + 24.0, self.rail_w - 32.0);
