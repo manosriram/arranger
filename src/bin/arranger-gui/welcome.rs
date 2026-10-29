@@ -19,7 +19,7 @@ impl App {
         r.text(x, y, "Pick a project to work on", UI, 30.0, 600, t.text, text_w + 100.0);
         y += 50.0;
         let about = "arranger runs AI coding helpers side by side. Each works on its own copy of your project, and nothing changes in your files until you approve it.";
-        for line in wrap(r, about, UI, 15.0, text_w) {
+        for line in wrap(r, about, UI, 15.0, 400, text_w) {
             r.text(x, y, &line, UI, 15.0, 400, t.text2, text_w);
             y += 23.0;
         }

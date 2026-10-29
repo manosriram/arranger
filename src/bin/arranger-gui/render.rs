@@ -11,10 +11,12 @@ use swash::{FontRef, NormalizedCoord};
 
 pub const UI: usize = 0;
 pub const MONO: usize = 1;
-/// JetBrains Mono (variable weight) for everything: the UI and the terminal share one face.
+/// Inter for interface text; JetBrains Mono for code and the terminal. Both have variable weights.
+/// Inter source: google/fonts@9862abc066c9b83bf84c3e8ed1fc2d8d48f9bbf0/ofl/inter (SIL OFL).
+const INTER: &[u8] = include_bytes!("../../../assets/fonts/Inter.ttf");
 const JETBRAINS: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono.ttf");
-const BUNDLED: [&[u8]; 2] = [JETBRAINS, JETBRAINS];
-/// System fonts tried, in order, for glyphs JetBrains Mono lacks (❯ ⏺ ⎿ ✳ …). Missing files are skipped.
+const BUNDLED: [&[u8]; 2] = [INTER, JETBRAINS];
+/// System fonts tried, in order, for glyphs the bundled faces lack (❯ ⏺ ⎿ ✳ …). Missing files are skipped.
 const FALLBACKS: &[&str] = &[
     "/System/Library/Fonts/Menlo.ttc",
     "/System/Library/Fonts/Apple Symbols.ttf",
@@ -146,7 +148,7 @@ pub struct Renderer {
     layer: Option<(glow::Framebuffer, glow::Texture, (u32, u32))>,
 }
 
-/// Added to every requested weight: the mono face reads thin on screen at its nominal weights.
+/// A small weight lift keeps interface and terminal text readable at small sizes.
 const WEIGHT_BOOST: f32 = 50.0;
 
 fn coords(font: &FontRef, weight: u16) -> Vec<NormalizedCoord> {
@@ -269,7 +271,7 @@ impl Renderer {
         if let Some((r, clip, Cursor::Pointer)) = hot {
             self.set_clip(clip);
             // Mid grey: lightens dark buttons and darkens light ones, in either theme.
-            self.rect(r, 0.0, [128, 128, 128, 0x24]);
+            self.rect(r, 4.0, [128, 128, 128, 0x24]);
         }
         self.set_clip(None);
         self.present();

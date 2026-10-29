@@ -19,8 +19,41 @@ impl App {
         self.multi_select.as_ref().map_or(self.selected == Some(key), |tasks| tasks.contains(&key))
     }
 
-    pub(super) fn register_task_region(&self, key: TaskKey, row: Rect) {
-        self.task_regions.borrow_mut().push((key, row));
+    pub(super) fn register_task_region(&self, r: &Renderer, key: TaskKey, row: Rect) {
+        let row = if let Some(clip) = r.clip() {
+            let x = row.x.max(clip.x);
+            let y = row.y.max(clip.y);
+            Rect::new(x, y, (row.x + row.w).min(clip.x + clip.w) - x, (row.y + row.h).min(clip.y + clip.h) - y)
+        } else { row };
+        if row.w > 0.0 && row.h > 0.0 { self.task_regions.borrow_mut().push((key, row)); }
+    }
+
+    /// A non-interactive preview beside a dense row, so the list keeps space for task titles.
+    pub fn draw_task_hover(&self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
+        if !self.layered || self.welcome || self.review.is_some() || self.multi_select.is_some() || !self.dense() { return; }
+        let regions = self.task_regions.borrow();
+        let Some(&(key, row)) = regions.iter().rev().find(|(_, row)| row.contains(self.mouse)) else { return };
+        let Some(task) = self.task(key).filter(|task| group(&task.state) != 0) else { return };
+        let width = 380.0_f32.min(w - self.sidebar_w - 16.0);
+        if width < 120.0 { return; }
+        let titles = wrap(r, &title(task), UI, 13.0, 500, width - 24.0);
+        let queue_pos = self.hosts[key.0].tasks.iter().filter(|x| x.state == "queued" && x.id <= task.id).count();
+        let activity = wrap(r, &status_line(task, queue_pos), UI, 12.0, 400, width - 24.0);
+        let height = 52.0 + titles.len() as f32 * 18.0 + activity.len() as f32 * 17.0;
+        let pop = Rect::new(self.sidebar_w + 8.0, row.y.min(h - STATUS_H - height - 8.0).max(TITLE_H + 8.0), width, height);
+        r.frame(pop, 4.0, t.dialog, t.border2);
+        let mut y = pop.y + 12.0;
+        for line in titles {
+            r.text(pop.x + 12.0, y, &line, UI, 13.0, 500, t.text, width - 24.0);
+            y += 18.0;
+        }
+        let agent = format!("{} · {}", adapter::kind(&task.agent), self.hosts[key.0].name());
+        r.text(pop.x + 12.0, y + 3.0, &agent, UI, 11.0, 400, t.text3, width - 24.0);
+        y += 26.0;
+        for line in activity {
+            r.text(pop.x + 12.0, y, &line, UI, 12.0, 400, t.text2, width - 24.0);
+            y += 17.0;
+        }
     }
 
     pub fn draw_task_selection(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
@@ -38,19 +71,62 @@ impl App {
         }
         if let Some((key, (x, y))) = self.task_menu {
             let Some(task) = self.task(key) else { self.task_menu = None; return };
+            let name = title(task);
             let can_clone = task.state != "queued" && !task.worktree.is_empty();
             let width = 380.0_f32.min(w - 16.0);
-            let height = if can_clone { 114.0 } else { 76.0 };
+            let lines = wrap(r, &name, UI, 13.0, 500, width - 60.0);
+            let title_h = 24.0 + lines.len() as f32 * 19.0;
+            let mut details = vec![
+                ("Branch", task.branch.clone(), MONO),
+                ("Machine", self.hosts[key.0].name().to_string(), UI),
+                ("View", if task.headless { "Chat" } else { "Terminal" }.to_string(), UI),
+                ("Elapsed", age(task), MONO),
+            ];
+            if task.tokens > 0 || task.cost.is_some() {
+                let mut usage = format!("{} tokens", short_count(task.tokens));
+                if let Some(cost) = task.cost { usage.push_str(&format!(" · ${cost:.2}")); }
+                details.push(("Usage", usage, MONO));
+            }
+            if let Some(source) = task.cloned_from { details.push(("Cloned from", format!("#{source}"), MONO)); }
+            let details: Vec<_> = details.into_iter().map(|(label, value, font)| {
+                (label, wrap(r, &value, font, 11.5, 400, width - 108.0), font)
+            }).collect();
+            let details_h = 12.0 + details.iter().map(|(_, lines, _)| lines.len() as f32 * 16.0 + 6.0).sum::<f32>();
+            let height = title_h + details_h + if can_clone { 114.0 } else { 76.0 };
             let menu = Rect::new(x.min(w - width - 8.0).max(8.0), y.min(h - height - 8.0).max(8.0), width, height);
             r.frame(menu, 4.0, t.dialog, t.border2);
             r.target(menu, Cursor::Arrow);
+            for (i, line) in lines.iter().enumerate() {
+                r.text(menu.x + 12.0, menu.y + 12.0 + i as f32 * 19.0, line, UI, 13.0, 500, t.text, menu.w - 60.0);
+            }
+            let copy = Rect::new(menu.x + menu.w - 40.0, menu.y + 7.0, 28.0, 28.0);
+            r.path(13, "M18 42H10V10H42V18M22 22H54V54H22Z", Some(5.0), copy.x + 6.0, copy.y + 6.0, 16.0, t.text3);
+            if self.hit(r, copy) {
+                set_clipboard(&name);
+                self.task_menu = None;
+            }
+            r.rect(Rect::new(menu.x + 8.0, menu.y + title_h, menu.w - 16.0, 1.0), 0.0, t.border);
+            let mut dy = menu.y + title_h + 10.0;
+            for (label, lines, font) in &details {
+                r.text(menu.x + 12.0, dy, label, UI, 11.5, 400, t.text3, 78.0);
+                for (i, line) in lines.iter().enumerate() {
+                    r.text(menu.x + 96.0, dy + i as f32 * 16.0, line, *font, 11.5, 400, t.text2, menu.w - 108.0);
+                }
+                dy += lines.len() as f32 * 16.0 + 6.0;
+            }
+            let actions_y = menu.y + title_h + details_h;
+            r.rect(Rect::new(menu.x + 8.0, actions_y, menu.w - 16.0, 1.0), 0.0, t.border);
             let label = if self.is_bookmarked(key) { "Remove bookmark" } else { "Bookmark thread" };
-            let mut labels = vec![label.to_string()];
-            if can_clone { labels.push(format!("Clone task · {}", mod_label("D"))); }
-            labels.push("Select task".to_string());
-            for (i, label) in labels.iter().enumerate() {
-                let row = Rect::new(menu.x, menu.y + i as f32 * 38.0, menu.w, 38.0);
-                r.text(row.x + 12.0, r.center(row, UI, 13.0), label, UI, 13.0, 400, t.text2, row.w - 24.0);
+            let mut labels = vec![(label, None)];
+            if can_clone { labels.push(("Clone task", Some(mod_label("D")))); }
+            labels.push(("Select task", None));
+            for (i, (label, shortcut)) in labels.iter().enumerate() {
+                let row = Rect::new(menu.x, actions_y + i as f32 * 38.0, menu.w, 38.0);
+                let sw = shortcut.as_ref().map_or(0.0, |s| r.measure(MONO, 10.5, 400, s) + 12.0);
+                r.text(row.x + 12.0, r.center(row, UI, 13.0), label, UI, 13.0, 400, t.text2, row.w - 24.0 - sw);
+                if let Some(shortcut) = shortcut {
+                    r.text(row.x + row.w - sw, r.center(row, MONO, 10.5), shortcut, MONO, 10.5, 400, t.text3, sw);
+                }
                 if self.hit(r, row) {
                     match i {
                         0 => self.actions.push(Action::ToggleBookmark(key)),
@@ -237,7 +313,7 @@ impl App {
             if self.hit(r, row) && clicked(self.click) {
                 acts.push(Action::Select(key));
             }
-            self.register_task_region(key, row);
+            self.register_task_region(r, key, row);
             self.icon(r, t, task, col_x[0], row.y + row.h / 2.0);
             let (x, w) = col("task");
             let bw = if task.shipped.is_empty() { 0.0 } else { r.measure(UI, 11.0, 500, &format!("✓ {}", task.shipped)) + 16.0 };
