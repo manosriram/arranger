@@ -124,6 +124,9 @@ impl ChatView {
     }
 
     fn toggle(&mut self, i: usize) {
+        // Keep the clicked header in place when its details change the content height.
+        // Following the newest item here would jump to the end of the opened output.
+        self.top = Some(self.top.unwrap_or(self.max_top).min(self.max_top));
         let open = !self.is_open(i);
         self.open.insert(self.start + i, open);
         self.laid[i] = None;
@@ -1075,10 +1078,15 @@ mod tests {
         let (sock, _) = UnixStream::pair().unwrap();
         let mut c = ChatView { hist: None, selection: None, slash: Slash::default(), key: (0, 1), seq: 0, writer: sock, start: 10, items: vec![tool(Some(true), vec![line('+')]), tool(Some(false), vec![]), tool(None, vec![])], laid: vec![None, None, None], loaded: true, loading: false, width: 0.0, open: HashMap::new(), top: None, max_top: 0.0, prepended: 0 };
         assert_eq!((c.is_open(0), c.is_open(1), c.is_open(2)), (false, false, false));
+        c.max_top = 500.0;
         c.toggle(0);
+        assert_eq!(c.top, Some(500.0), "opening output pins the current viewport instead of following the bottom");
         assert!(c.is_open(0) && c.open.get(&10) == Some(&true), "kept by conversation index");
+        c.top = Some(200.0);
         c.toggle(0);
+        assert_eq!(c.top, Some(200.0), "toggling while scrolled up preserves the viewport");
         assert!(!c.is_open(0) && c.open.get(&10) == Some(&false), "kept by conversation index");
+        c.top = None;
         c.max_top = 500.0;
         c.scroll(100.0);
         assert_eq!(c.top, Some(400.0));
