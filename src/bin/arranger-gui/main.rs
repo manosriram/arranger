@@ -63,7 +63,7 @@ const ROW_H: f32 = 28.0;
 const ROW2_H: f32 = 48.0;
 /// A one-line row, when the sidebar is dense.
 const DENSE_ROW_H: f32 = 32.0;
-const NEEDS_CARD_H: f32 = 92.0;
+const NEEDS_CARD_H: f32 = 116.0;
 const TERM_SIZE: f32 = 12.0;
 const LINE_H: f32 = 18.0;
 
@@ -262,6 +262,7 @@ struct AddHost {
 enum Action {
     Select(TaskKey),
     ToggleBookmark(TaskKey),
+    ToggleRequest(TaskKey),
     Focus(Focus),
     NewTask,
     ToggleTheme,
@@ -362,6 +363,7 @@ struct App {
     confirm_delete: Option<Vec<TaskKey>>,
     multi_select: Option<Vec<TaskKey>>,
     task_menu: Option<(TaskKey, (f32, f32))>,
+    expanded_request: Option<TaskKey>,
     task_regions: std::cell::RefCell<Vec<(TaskKey, Rect)>>,
     /// When Esc was last pressed in vim mode: a second one forwards both to the agent.
     last_esc: Option<Instant>,
@@ -520,6 +522,7 @@ fn run() -> io::Result<()> {
         confirm_delete: None,
         multi_select: None,
         task_menu: None,
+        expanded_request: None,
         task_regions: std::cell::RefCell::new(Vec::new()),
         pending_g: false,
         last_esc: None,
@@ -1425,8 +1428,16 @@ fn wrap(r: &Renderer, text: &str, font: usize, size: f32, max_w: f32) -> Vec<Str
                 line.push(' ');
                 width += space;
             }
-            line.push_str(word);
-            width += word_width;
+            // Paths, URLs and other long tokens must remain readable in narrow request cards.
+            for ch in word.chars() {
+                let advance = r.advance(font, size, 400, ch);
+                if !line.is_empty() && width + advance > max_w {
+                    lines.push(std::mem::take(&mut line));
+                    width = 0.0;
+                }
+                line.push(ch);
+                width += advance;
+            }
         }
         lines.push(line);
     }
@@ -2581,6 +2592,9 @@ impl App {
                     self.focus = f;
                 }
                 Action::NewTask => self.open_dialog(),
+                Action::ToggleRequest(key) => {
+                    self.expanded_request = if self.expanded_request == Some(key) { None } else { Some(key) };
+                }
                 Action::CloseDialog => {
                     self.dialog = None;
                     self.focus = self.rest();
@@ -3009,11 +3023,17 @@ impl App {
         r.rect(side, 0.0, t.panel);
         r.rect(Rect::new(self.sidebar_w - 1.0, TITLE_H, 1.0, side.h), 0.0, t.border);
 
-        // The filter shows only while it's in use: ⌘F or / opens it, Esc clears it.
+        // Primary task controls stay visible; shortcuts still focus the same search field.
         let filtering = self.focus == Focus::Filter || !self.filter.is_empty();
-        let mut top = TITLE_H + 8.0;
-        if filtering {
-            let f = Rect::new(8.0, top, self.sidebar_w - 16.0, 26.0);
+        let new = Rect::new(8.0, TITLE_H + 8.0, self.sidebar_w - 16.0, 32.0);
+        r.rect(new, 4.0, t.primary_bg);
+        r.text(new.x + 12.0, r.center(new, UI, 13.0), "+ New task", UI, 13.0, 500, t.primary_fg, new.w - 90.0);
+        let shortcut = mod_label("N");
+        let sw = r.measure(MONO, 10.5, 400, &shortcut);
+        r.text(new.x + new.w - sw - 12.0, r.center(new, MONO, 10.5), &shortcut, MONO, 10.5, 400, t.primary_fg, sw + 2.0);
+        if self.hit(r, new) { self.actions.push(Action::NewTask); }
+        let top = {
+            let f = Rect::new(8.0, new.y + new.h + 8.0, self.sidebar_w - 16.0, 28.0);
             let focused = self.focus == Focus::Filter;
             r.frame(f, 0.0, t.bg, if focused { t.work } else { t.border2 });
             for (i, lw) in [16.0, 10.0, 4.0].iter().enumerate() {
@@ -3021,16 +3041,18 @@ impl App {
             }
             let filter = self.filter.clone();
             if filter.is_empty() && !focused {
-                r.text(f.x + 25.0, r.center(f, UI, 12.0), "Filter", UI, 12.0, 400, t.text3, f.w - 50.0);
+                r.text(f.x + 25.0, r.center(f, UI, 12.0), "Search tasks", UI, 12.0, 400, t.text3, f.w - 110.0);
             } else {
-                self.field_text(r, t, f.x + 25.0, r.center(f, UI, 12.0), &filter, UI, 12.0, f.w - 50.0, (Focus::Filter, 0), focused, self.caret_for(Focus::Filter, &filter), t.work);
+                self.field_text(r, t, f.x + 25.0, r.center(f, UI, 12.0), &filter, UI, 12.0, f.w - 100.0, (Focus::Filter, 0), focused, self.caret_for(Focus::Filter, &filter), t.work);
             }
-            r.text(f.x + f.w - 8.0 - r.measure(MONO, 10.0, 400, "esc"), r.center(f, MONO, 10.0), "esc", MONO, 10.0, 400, t.text3, 40.0);
+            let hint = if filtering { "esc".to_string() } else { mod_label("F") };
+            let hw = r.measure(MONO, 10.0, 400, &hint);
+            r.text(f.x + f.w - 8.0 - hw, r.center(f, MONO, 10.0), &hint, MONO, 10.0, 400, t.text3, hw + 2.0);
             if self.hit_as(r, f, Cursor::Text) {
                 self.actions.push(Action::Focus(Focus::Filter));
             }
-            top = f.y + f.h + 6.0;
-        }
+            f.y + f.h + 6.0
+        };
 
         // One list: needs-you cards, then every other task, across machines.
         let list = Rect::new(0.0, top, self.sidebar_w - 1.0, side.y + side.h - top);
@@ -3071,9 +3093,13 @@ impl App {
             for task in &sec.tasks {
                 let chip = (multi && task.machine != 0).then(|| self.hosts[task.machine].name());
                 if sec.key == "needs" {
-                    let card = Rect::new(6.0, y, self.sidebar_w - 13.0, NEEDS_CARD_H);
-                    picks.extend(self.draw_needs_card(r, t, task, card, chip, clicked(self.click)));
-                    y += NEEDS_CARD_H;
+                    let expanded = self.expanded_request == Some((task.machine, task.id));
+                    let detail = if is_setup(&task.state) { task.setup_detail.clone() } else { status_line(task, 0) };
+                    let lines = if expanded { wrap(r, &detail, UI, 12.5, self.sidebar_w - 51.0) } else { Vec::new() };
+                    let height = NEEDS_CARD_H + (lines.len() as f32 * 18.0 - 20.0).max(0.0);
+                    let card = Rect::new(6.0, y, self.sidebar_w - 13.0, height);
+                    picks.extend(self.draw_needs_card(r, t, task, card, chip, clicked(self.click), &lines));
+                    y += height;
                 } else {
                     let row_h = if dense { DENSE_ROW_H } else { ROW2_H };
                     let row = Rect::new(6.0, y, self.sidebar_w - 13.0, row_h);
@@ -3103,7 +3129,7 @@ impl App {
                 let label = if multi { format!("{n} ended on {} · see all →", host.name()) } else { format!("{n} ended · see all →") };
                 let row = Rect::new(6.0, y + 4.0, self.sidebar_w - 13.0, 28.0);
                 let hot = row.contains(self.mouse);
-                r.text(row.x + 10.0, r.center(row, UI, 12.0), &label, UI, 12.0, 400, if hot { t.text2 } else { t.faint }, row.w - 20.0);
+                r.text(row.x + 10.0, r.center(row, UI, 12.0), &label, UI, 12.0, 400, if hot { t.text2 } else { t.text3 }, row.w - 20.0);
                 if self.hit(r, row) && clicked(self.click) {
                     picks.push(Action::MachineTasks(Some(m)));
                 }
@@ -3156,7 +3182,7 @@ impl App {
     /// A needs-you card: what the agent is waiting on, with the answer right there. A permission
     /// ask the daemon is holding (`asking`) gets Allow once and Deny; anything else (a question, or
     /// an ask showing in the agent's own terminal) gets Answer, which opens that terminal on its menu.
-    fn draw_needs_card(&self, r: &mut Renderer, t: &Theme, task: &TaskInfo, card: Rect, machine: Option<&str>, live: bool) -> Vec<Action> {
+    fn draw_needs_card(&self, r: &mut Renderer, t: &Theme, task: &TaskInfo, card: Rect, machine: Option<&str>, live: bool, lines: &[String]) -> Vec<Action> {
         let key = (task.machine, task.id);
         let hit_card = card;
         self.register_task_region(key, card);
@@ -3176,7 +3202,20 @@ impl App {
         r.text(card.x + card.w - 8.0 - rw, r.center(top, MONO, 12.0), &right, MONO, 12.0, 400, t.text3, rw);
         r.text(text_x, r.center(top, UI, 13.0), &title(task), UI, 13.0, 500, t.text, card.w - 30.0 - rw - 18.0);
         let ask = Rect::new(text_x, top.y + top.h, card.w - 38.0, 20.0);
-        r.text(ask.x, r.center(ask, UI, 12.5), &status_line(task, 0).replace('\n', " "), UI, 12.5, 400, t.needs, ask.w);
+        let expanded = self.expanded_request == Some(key);
+        if expanded {
+            for (i, line) in lines.iter().enumerate() {
+                r.text(ask.x, ask.y + i as f32 * 18.0, line, UI, 12.5, 400, t.needs, ask.w);
+            }
+        } else {
+            r.text(ask.x, r.center(ask, UI, 12.5), &status_line(task, 0).replace('\n', " "), UI, 12.5, 400, t.needs, ask.w);
+        }
+        let details = Rect::new(text_x, card.y + card.h - 64.0, card.w - 38.0, 22.0);
+        r.text(details.x, r.center(details, UI, 11.5), if expanded { "Hide details ↑" } else { "Show full request ↓" }, UI, 11.5, 500, t.text2, details.w);
+        if self.hit(r, details) && live {
+            acts.clear();
+            acts.push(Action::ToggleRequest(key));
+        }
 
         let buttons: Vec<(&str, bool, Vec<Action>)> = if self.multi_select.is_some() { vec![]
         } else if task.state == "setup-needs-you" {
@@ -3241,31 +3280,17 @@ impl App {
         if can && self.hit(r, review) {
             self.actions.push(Action::OpenReview);
         }
-        // Clone, beside it: what vim's `c` does, for everyone.
-        let mut right = review.x;
-        if task.state != "queued" && !task.worktree.is_empty() {
-            let (label, key) = ("Clone", mod_label("D"));
-            let cw = r.measure(UI, 12.0, 500, label) + r.measure(MONO, 10.5, 400, &key) + 30.0;
-            let clone = Rect::new(review.x - 8.0 - cw, top.y, cw, 28.0);
-            r.frame(clone, 4.0, t.bg, t.border2);
-            let lw = r.text(clone.x + 12.0, r.center(clone, UI, 12.0), label, UI, 12.0, 500, t.text, cw);
-            r.text(clone.x + 18.0 + lw, r.center(clone, MONO, 10.5), &key, MONO, 10.5, 400, t.text3, 60.0);
-            if self.hit(r, clone) {
-                self.actions.push(Action::Clone((task.machine, task.id)));
-            }
-            right = clone.x;
-        }
+        // Secondary actions live in the same menu as a task's right-click actions.
         let key = (task.machine, task.id);
-        let saved = self.is_bookmarked(key);
-        let label = if saved { "Bookmarked" } else { "Bookmark" };
-        let bw = r.measure(UI, 12.0, 500, label) + 24.0;
-        let bookmark = Rect::new(right - 8.0 - bw, top.y, bw, 28.0);
-        r.frame(bookmark, 4.0, if saved { t.sel } else { t.bg }, t.border2);
-        r.text(bookmark.x + 12.0, r.center(bookmark, UI, 12.0), label, UI, 12.0, 500, if saved { t.tc_on } else { t.text }, bw - 20.0);
-        if self.hit(r, bookmark) { self.actions.push(Action::ToggleBookmark(key)); }
-        right = bookmark.x;
+        let more = Rect::new(review.x - 86.0, top.y, 78.0, 28.0);
+        r.frame(more, 4.0, t.bg, t.border2);
+        r.text(more.x + 10.0, r.center(more, UI, 12.0), "More ⋯", UI, 12.0, 500, t.text2, more.w - 16.0);
+        if self.hit(r, more) {
+            self.task_menu = Some((key, (more.x, more.y + more.h + 6.0)));
+            self.click = None;
+        }
         let tx = area.x + 20.0;
-        let title_rect = Rect::new(tx, top.y, (right - tx - 12.0).max(0.0), top.h);
+        let title_rect = Rect::new(tx, top.y, (more.x - tx - 12.0).max(0.0), top.h);
         r.text(tx, r.center(top, UI, 15.0), &title(&task), UI, 15.0, 600, t.text, title_rect.w);
         if self.hit(r, title_rect) { set_clipboard(&task.title); }
 
@@ -3548,7 +3573,7 @@ impl App {
         r.frame(b, 4.0, t.bg, if focused { t.work } else { t.border2 });
         let y = r.center(b, font, 12.5);
         if value.is_empty() && !focused {
-            r.text(b.x + 10.0, y, placeholder, font, 12.5, 400, t.faint, b.w - 20.0);
+            r.text(b.x + 10.0, y, placeholder, font, 12.5, 400, t.text3, b.w - 20.0);
         } else {
             self.field_text(r, t, b.x + 10.0, y, value, font, 12.5, b.w - 20.0, (focus, 0), focused, self.caret_for(focus, value), t.work);
         }
@@ -3659,6 +3684,43 @@ impl App {
         let dw = (w - 32.0).min(680.0);
         let pad = 22.0;
         let width = dw - 2.0 * pad;
+        let model = match clone.as_ref().and_then(|c| c.5.as_deref()) {
+            Some("") | None => models(agent)[model_i].0,
+            Some(kept) => models(agent).iter().find(|m| m.1 == kept).map_or(kept, |m| m.0),
+        };
+        let effort = match effort_kept.as_deref() {
+            Some("") => "default",
+            Some(kept) => efforts(agent).iter().find(|e| e.1 == kept).map_or(kept, |e| e.0),
+            None => efforts(agent)[effort_i].0,
+        };
+        let fixed = clone.is_some() || efforts(agent).len() == 1;
+        let pick = !branches.is_empty();
+        let base_focus = self.focus == Focus::Base && clone.is_none();
+        let shown = match &clone {
+            Some(c) => c.2.clone(),
+            None if base.is_empty() && !base_focus => "current branch".to_string(),
+            None => base.clone(),
+        };
+        let mut controls = vec![
+            ("agent", agent, Some(accent(agent)), 0.0, clone.is_some()),
+            ("model", model, None, 0.0, false),
+            ("effort", effort, None, 0.0, fixed),
+        ];
+        if hosts.len() > 1 {
+            controls.push(("on", self.hosts[host_i].name(), None, 0.0, clone.is_some()));
+        }
+        controls.push(("from", shown.as_str(), None, if pick { 22.0 } else { 10.0 }, clone.is_some()));
+        // Lay out every chip before sizing the editor, reserving room for wrapped rows.
+        let (mut cx, mut cy) = (0.0, 0.0);
+        let mut chips: Vec<Rect> = controls.iter().map(|(key, value, dot, extra, _)| {
+            let lead = if dot.is_some() { 16.0 } else { 0.0 };
+            let cw = (32.0 + lead + r.measure(UI, 13.0, 400, key) + r.measure(MONO, 13.0, 500, value) + extra).min(width);
+            if cx > 0.0 && cx + cw > width { cx = 0.0; cy += 40.0; }
+            let b = Rect::new(cx, cy, cw, 32.0);
+            cx += cw + 8.0;
+            b
+        }).collect();
+        let controls_h = cy + 32.0;
         let d = self.dialog.as_mut().unwrap();
         if !d.prompt_layout.matches(&prompt, width) {
             let lines = wrap(r, &prompt, UI, 16.0, width);
@@ -3689,7 +3751,7 @@ impl App {
         let clone_h = if clone.is_some() { 30.0 + quotes.iter().map(|q| 22.0 + q.1.len() as f32 * 20.0 + 12.0).sum::<f32>() + 24.0 } else { 0.0 };
         // Reserve space for the controls before letting the editor grow. Recent prompts
         // are optional when a short window needs the space for editing instead.
-        let fixed_h = 20.0 + clone_h + 16.0 + 32.0 + 18.0 + repo_h + 58.0;
+        let fixed_h = 20.0 + clone_h + 16.0 + controls_h + 18.0 + repo_h + 58.0;
         let available_h = (h - TITLE_H - 32.0).max(0.0);
         if fixed_h + recent_h + 78.0 > available_h {
             recent_h = 0.0;
@@ -3724,7 +3786,7 @@ impl App {
         let ty = dlg.y + 20.0 + clone_h;
         let prompt_focus = self.focus == Focus::Prompt;
         if prompt.is_empty() && clone.is_none() {
-            r.text(dlg.x + pad, ty, "What should the agent do? (@ to reference files)", UI, 16.0, 400, t.faint, dlg.w - 2.0 * pad);
+            r.text(dlg.x + pad, ty, "What should the agent do? (@ to reference files)", UI, 16.0, 400, t.text3, dlg.w - 2.0 * pad);
         }
         let caret = self.caret_for(Focus::Prompt, &prompt).map(|at| caret_line_at(&layout.lines, &layout.starts, at));
         let editor = Rect::new(dlg.x + pad, ty, dlg.w - 2.0 * pad, text_h);
@@ -3763,74 +3825,46 @@ impl App {
             self.actions.push(Action::Focus(Focus::Prompt));
         }
 
-        // What runs it: [● agent claude] [model opus] [on This Mac] [from main ⌄]
+        // What runs it: chips wrap inside the dialog, including long remote and branch names.
         let cy = ty + text_h + 16.0;
-        let mut cx = dlg.x + pad - 4.0;
-        // A disabled chip is drawn flat and dimmed: there, but not to be picked.
-        let mut chip = |r: &mut Renderer, key: &str, value: &str, dot: Option<Rgba>, wide: f32, disabled: bool| {
+        for (b, (key, value, dot, extra, disabled)) in chips.iter_mut().zip(&controls) {
+            b.x += dlg.x + pad;
+            b.y += cy;
             let kw = r.measure(UI, 13.0, 400, key) + 8.0;
             let lead = if dot.is_some() { 16.0 } else { 0.0 };
-            let vw = r.measure(MONO, 13.0, 500, value);
-            let b = Rect::new(cx, cy, 24.0 + lead + kw + vw + wide, 32.0);
-            let (fill, edge, kc, vc) = if disabled { (t.raised, t.border, t.faint, t.text3) } else { (t.dialog, t.border2, t.text3, t.text) };
-            r.frame(b, 0.0, fill, edge);
+            let (fill, edge, kc, vc) = if *disabled { (t.raised, t.border, t.faint, t.text3) } else { (t.dialog, t.border2, t.text3, t.text) };
+            r.frame(*b, 0.0, fill, edge);
             if let Some(c) = dot {
-                r.rect(Rect::new(b.x + 12.0, b.y + 13.0, 6.0, 6.0), 0.0, if disabled { alpha(c, 0x80) } else { c });
+                r.rect(Rect::new(b.x + 12.0, b.y + 13.0, 6.0, 6.0), 0.0, if *disabled { alpha(*c, 0x80) } else { *c });
             }
-            r.text(b.x + 12.0 + lead, r.center(b, UI, 13.0), key, UI, 13.0, 400, kc, kw);
-            r.text(b.x + 12.0 + lead + kw, r.center(b, MONO, 13.0), value, MONO, 13.0, 500, vc, vw + 2.0);
-            cx += b.w + 8.0;
-            b
-        };
+            r.text(b.x + 12.0 + lead, r.center(*b, UI, 13.0), key, UI, 13.0, 400, kc, kw);
+            r.text(b.x + 12.0 + lead + kw, r.center(*b, MONO, 13.0), value, MONO, 13.0, 500, vc, (b.w - 24.0 - lead - kw - extra).max(0.0));
+        }
         // A clone's agent, machine and branch are its source's: shown, not picked.
-        let b = chip(r, "agent", agent, Some(accent(agent)), 0.0, clone.is_some());
-        if clone.is_none() && self.hit(r, b) {
+        if clone.is_none() && self.hit(r, chips[0]) {
             self.actions.push(Action::PickAgent(usize::MAX));
         }
-        let model = match clone.as_ref().and_then(|c| c.5.as_deref()) {
-            Some("") | None => models(agent)[model_i].0,
-            Some(kept) => models(agent).iter().find(|m| m.1 == kept).map_or(kept, |m| m.0),
-        };
-        let b = chip(r, "model", model, None, 0.0, false);
-        if self.hit(r, b) {
+        if self.hit(r, chips[1]) {
             self.actions.push(Action::PickModel(usize::MAX));
         }
-        // A clone keeps its source's effort; gemini takes none.
-        let effort = match effort_kept.as_deref() {
-            Some("") => "default",
-            Some(kept) => efforts(agent).iter().find(|e| e.1 == kept).map_or(kept, |e| e.0),
-            None => efforts(agent)[effort_i].0,
-        };
-        let fixed = clone.is_some() || efforts(agent).len() == 1;
-        let b = chip(r, "effort", effort, None, 0.0, fixed);
-        if !fixed && self.hit(r, b) {
+        if !fixed && self.hit(r, chips[2]) {
             self.actions.push(Action::PickEffort);
         }
-        if hosts.len() > 1 {
-            let b = chip(r, "on", self.hosts[host_i].name(), None, 0.0, clone.is_some());
-            if clone.is_none() && self.hit(r, b) {
-                let at = hosts.iter().position(|h| h.0 == host_i).unwrap_or(0);
-                // The next machine that's up, after this one.
-                if let Some(next) = (1..hosts.len()).map(|k| &hosts[(at + k) % hosts.len()]).find(|h| h.2) {
-                    self.actions.push(Action::PickHost(next.0));
-                }
+        if hosts.len() > 1 && clone.is_none() && self.hit(r, chips[3]) {
+            let at = hosts.iter().position(|h| h.0 == host_i).unwrap_or(0);
+            // The next machine that's up, after this one.
+            if let Some(next) = (1..hosts.len()).map(|k| &hosts[(at + k) % hosts.len()]).find(|h| h.2) {
+                self.actions.push(Action::PickHost(next.0));
             }
         }
         // The base branch: a list of local branches, or typed in on another machine; a clone's is
         // the task's own branch, as it is now.
-        let base_focus = self.focus == Focus::Base && clone.is_none();
-        let pick = !branches.is_empty(); // none for a clone
-        let shown = match &clone {
-            Some(c) => c.2.clone(),
-            None if base.is_empty() && !base_focus => "current branch".to_string(),
-            None => base.clone(),
-        };
-        let bfield = chip(r, "from", &shown, None, if pick { 22.0 } else { 10.0 }, clone.is_some());
+        let bfield = *chips.last().unwrap();
         if base_focus {
             // Typed over the chip's value while it has focus.
             let vx = bfield.x + 12.0 + r.measure(UI, 13.0, 400, "from") + 8.0;
             r.rect(Rect::new(vx - 2.0, bfield.y + 1.0, bfield.x + bfield.w - vx + 1.0, bfield.h - 2.0), 0.0, t.dialog);
-            self.field_text(r, t, vx, r.center(bfield, MONO, 13.0), &base, MONO, 13.0, 160.0, (Focus::Base, 0), true, self.caret_for(Focus::Base, &base), t.work);
+            self.field_text(r, t, vx, r.center(bfield, MONO, 13.0), &base, MONO, 13.0, (bfield.x + bfield.w - vx - 12.0).max(0.0), (Focus::Base, 0), true, self.caret_for(Focus::Base, &base), t.work);
         }
         if pick {
             r.path(9, "M18 26L32 40L46 26", Some(6.0), bfield.x + bfield.w - 22.0, bfield.y + 10.0, 12.0, t.text3);
@@ -3843,7 +3877,7 @@ impl App {
         }
 
         // Repo on another machine.
-        let mut y = cy + 32.0 + 18.0;
+        let mut y = cy + controls_h + 18.0;
         if remote {
             let lw = r.text(dlg.x + pad, r.center(Rect::new(0.0, y, 0.0, 32.0), UI, 13.0), "repo", UI, 13.0, 400, t.text3, 60.0);
             let field = Rect::new(dlg.x + pad + lw + 10.0, y, dlg.w - 2.0 * pad - lw - 10.0, 32.0);
@@ -3958,6 +3992,9 @@ impl App {
             if list_click.is_some_and(|p| row.contains(p)) {
                 (d.base, d.list) = ((*b).clone(), None);
             }
+        }
+        if list_click.is_some() {
+            self.redraw();
         }
     }
 }

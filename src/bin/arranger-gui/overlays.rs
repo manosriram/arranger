@@ -37,21 +37,47 @@ impl App {
             if self.hit(r, cancel) { self.multi_select = None; self.actions.clear(); }
         }
         if let Some((key, (x, y))) = self.task_menu {
-            let menu = Rect::new(x.min(w - 192.0).max(0.0), y.min(h - 80.0).max(0.0), 192.0, 76.0);
+            let Some(task) = self.task(key) else { self.task_menu = None; return };
+            let name = title(task);
+            let can_clone = task.state != "queued" && !task.worktree.is_empty();
+            let width = 380.0_f32.min(w - 16.0);
+            let lines = wrap(r, &name, UI, 13.0, width - 60.0);
+            let title_h = 24.0 + lines.len() as f32 * 19.0;
+            let height = title_h + if can_clone { 114.0 } else { 76.0 };
+            let menu = Rect::new(x.min(w - width - 8.0).max(8.0), y.min(h - height - 8.0).max(8.0), width, height);
             r.frame(menu, 4.0, t.dialog, t.border2);
-            let save = Rect::new(menu.x, menu.y, menu.w, 38.0);
-            let select = Rect::new(menu.x, menu.y + 38.0, menu.w, 38.0);
+            r.target(menu, Cursor::Arrow);
+            for (i, line) in lines.iter().enumerate() {
+                r.text(menu.x + 12.0, menu.y + 12.0 + i as f32 * 19.0, line, UI, 13.0, 500, t.text, menu.w - 60.0);
+            }
+            let copy = Rect::new(menu.x + menu.w - 40.0, menu.y + 7.0, 28.0, 28.0);
+            r.frame(Rect::new(copy.x + 7.0, copy.y + 6.0, 10.0, 12.0), 1.0, t.dialog, t.text3);
+            r.frame(Rect::new(copy.x + 11.0, copy.y + 10.0, 10.0, 12.0), 1.0, t.dialog, t.text3);
+            if self.hit(r, copy) {
+                set_clipboard(&name);
+                self.task_menu = None;
+            }
+            r.rect(Rect::new(menu.x + 8.0, menu.y + title_h, menu.w - 16.0, 1.0), 0.0, t.border);
             let label = if self.is_bookmarked(key) { "Remove bookmark" } else { "Bookmark thread" };
-            r.text(save.x + 12.0, r.center(save, UI, 13.0), label, UI, 13.0, 500, t.text, 168.0);
-            r.text(select.x + 12.0, r.center(select, UI, 13.0), "Select task", UI, 13.0, 500, t.text, 168.0);
-            if self.hit(r, save) {
-                self.actions.push(Action::ToggleBookmark(key));
-                self.task_menu = None;
-            } else if self.hit(r, select) {
-                self.multi_select = Some(vec![key]);
-                self.answering = None;
-                self.task_menu = None;
-            } else if self.click.is_some() { self.task_menu = None; }
+            let mut labels = vec![label.to_string()];
+            if can_clone { labels.push(format!("Clone task · {}", mod_label("D"))); }
+            labels.push("Select task".to_string());
+            for (i, label) in labels.iter().enumerate() {
+                let row = Rect::new(menu.x, menu.y + title_h + i as f32 * 38.0, menu.w, 38.0);
+                r.text(row.x + 12.0, r.center(row, UI, 13.0), label, UI, 13.0, 400, t.text2, row.w - 24.0);
+                if self.hit(r, row) {
+                    match i {
+                        0 => self.actions.push(Action::ToggleBookmark(key)),
+                        1 if can_clone => self.actions.push(Action::Clone(key)),
+                        _ => {
+                            self.multi_select = Some(vec![key]);
+                            self.answering = None;
+                        }
+                    }
+                    self.task_menu = None;
+                }
+            }
+            if self.click.is_some_and(|p| !menu.contains(p)) { self.task_menu = None; }
         }
     }
 

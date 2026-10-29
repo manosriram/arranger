@@ -952,7 +952,7 @@ impl App {
         let tx = b.x + 12.0;
         if draft.is_empty() {
             let hint = format!("Message {}", adapter::kind(&task.agent));
-            r.text(tx, b.y + 9.0, &hint, UI, BODY, 400, t.faint, text_w);
+            r.text(tx, b.y + 9.0, &hint, UI, BODY, 400, t.text3, text_w);
             if focused && self.caret_on {
                 r.rect(Rect::new(tx, b.y + 9.0 - BODY * 0.15, 1.5, BODY * 1.35), 0.0, t.text);
             }
@@ -986,7 +986,7 @@ impl App {
         let esc = if self.vim { "Esc Esc" } else { "Esc" };
         for (k, what) in [("↵", "send"), ("⇧↵", "new line"), ("↑", "previous prompts"), (esc, "interrupt")] {
             hx += r.text(hx, fy, k, UI, 11.0, 500, t.text3, 80.0) + 6.0;
-            hx += r.text(hx, fy, what, UI, 11.0, 400, t.faint, 120.0) + 18.0;
+            hx += r.text(hx, fy, what, UI, 11.0, 400, t.text3, 120.0) + 18.0;
         }
         // Its permission mode at the right; ⇧⇥ or a click moves to the next.
         if !task.mode.is_empty() {
@@ -1000,7 +1000,7 @@ impl App {
             let (kw, lw) = (r.measure(UI, 11.0, 500, "⇧⇥"), r.measure(UI, 11.0, 500, label));
             let mx = b.x + b.w - 2.0 - lw - 6.0 - kw;
             if mx > hx {
-                r.text(mx, fy, "⇧⇥", UI, 11.0, 500, t.faint, kw + 2.0);
+                r.text(mx, fy, "⇧⇥", UI, 11.0, 500, t.text3, kw + 2.0);
                 r.text(mx + kw + 6.0, fy, label, UI, 11.0, 500, ink, lw + 2.0);
                 if self.hit(r, Rect::new(mx - 4.0, fy - 4.0, kw + lw + 14.0, 20.0)) {
                     self.cycle_mode();

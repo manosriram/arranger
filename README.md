@@ -9,7 +9,7 @@ Linux and macOS. Rust throughout; no webview.
   <img alt="arranger workspace with six agents on three machines, permission and question cards in the sidebar, and a completed Codex task selected" src="assets/screenshot.png">
 </picture>
 
-Threads can be saved with **Bookmark** in the thread header, or **Bookmark thread** in a thread's right-click menu. Open any saved thread from **Bookmarks** in the title bar. Saved threads remain available after restarting, including ended and merged threads; click **Bookmarked** or choose **Remove bookmark** to unsave one.
+Threads can be saved with **More → Bookmark thread** in the thread header, or **Bookmark thread** in a thread's right-click menu. Both menus reveal the full task title with a copy icon beside it. Open any saved thread from **Bookmarks** in the title bar. Saved threads remain available after restarting, including ended and merged threads; choose **Remove bookmark** to unsave one.
 
 ## Install
 
@@ -76,13 +76,13 @@ Merging brings the base branch into the task branch before fast-forwarding the b
 
 If merging hits a conflict, `main` is left alone: the conflict lands in the agent's worktree, and Review offers to have the agent resolve it (or take one side) before merging again.
 
-**Clone** in the task's header (⌘D, or `c` with Vim keys on) clones the selected task: a new task on its own worktree and branch, made from the task's current state (uncommitted edits too), whose agent carries on from a fork of the same chat. The new-task box opens showing what the task was asked so far and asks what the clone should do differently; leave it empty to just fork, and pick another model if you like. Cloning works for Claude Code and Codex, and for pi in a chat.
+**More → Clone task** in the task's header (⌘D, or `c` with Vim keys on) clones the selected task: a new task on its own worktree and branch, made from the task's current state (uncommitted edits too), whose agent carries on from a fork of the same chat. The new-task box opens showing what the task was asked so far and asks what the clone should do differently; leave it empty to just fork, and pick another model if you like. Cloning works for Claude Code and Codex, and for pi in a chat.
 
 In the clone dialog, the source agent, machine and branch are fixed and shown as disabled controls. Tab cycles models, ↑ recalls the source task's prompts, and Enter creates the clone.
 
 An agent that has ended can be revived: it resumes its last session in the same worktree, with a new prompt if you give one (also how Review hands a conflict to an agent that has already exited).
 
-The sidebar is one list across every machine: tasks that need you first, with Allow once and Deny (or Answer) right there, then running, queued and done. A task on another machine shows that machine next to its agent. ⌘F (or `/` with Vim keys on) shows a filter over the list; Esc clears it. Ended and merged tasks are left out: **N ended · see all** at the end of the list, or a machine in **Settings**, opens every task on that machine, grouped by state with one action per row: Approve, Answer, Review, Open or Revive.
+The sidebar keeps **+ New task** and **Search tasks** visible above one list across every machine: tasks that need you first, with Allow once and Deny (or Answer) right there, then running, queued and done. **Show full request** expands a request in place so long commands, questions and setup details can be read before answering. A task on another machine shows that machine next to its agent. ⌘F (or `/` with Vim keys on) focuses the search field; Esc clears it. Ended and merged tasks are left out: **N ended · see all** at the end of the list, or a machine in **Settings**, opens every task on that machine, grouped by state with one action per row: Approve, Answer, Review, Open or Revive.
 
 **Settings** at the top right holds the twelve colour schemes (Gruvbox, Ink, Moss, Ember, Ocean and Plum, dark; Gruvbox Light, Snow, Paper, Linen, Seafoam and Blossom, light), the Vim keys and Ding sound switches, and your machines with **Add machine**.
 

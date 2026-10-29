@@ -479,7 +479,9 @@ impl Renderer {
         let mut pen = x;
         for ch in s.chars() {
             let adv = self.advance(font_i, size, weight, ch);
-            if total > max_w && pen + adv > x + max_w - ellipsis {
+            // Subtracting an absolute pen position can lose a fraction of a pixel when
+            // callers allocate exactly the measured width (for example inline metadata).
+            if total > max_w + 0.01 && pen + adv > x + max_w - ellipsis {
                 self.glyph_char(font_i, '…', pen, baseline, size, weight, color);
                 return pen + ellipsis - x;
             }
