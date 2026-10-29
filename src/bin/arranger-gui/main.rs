@@ -4181,14 +4181,18 @@ fn last_size(log: &[u8]) -> Option<(u16, u16)> {
     Some(arranger::screen::bounded_size(cols.parse().ok()?, rows.parse().ok()?))
 }
 
-/// The arranger mark ("Seats"): the status icons' eight players as empty rings around the amber
-/// conductor, moved down 13 units so the arch sits in the middle of its `size` box. Small marks get
-/// a heavier ring so it doesn't thin out to a hairline.
+/// The arranger mark ("Seats"), matching assets/banner.svg: three semicircles of solid
+/// players around the amber conductor, centred vertically in its 64-unit box.
 fn logo(r: &mut Renderer, x: f32, y: f32, size: f32, ink: Rgba, amber: Rgba) {
-    let (id, stroke) = if size < 24.0 { (1, 3.4) } else { (3, 2.6) };
-    let rings: String = PLAYERS.iter().map(|&(px, py)| dot(px, py + 13.0, 3.8)).collect();
-    r.path(id, &rings, Some(stroke), x, y, size, ink);
-    r.path(2, &dot(31.8, 45.0, 5.2), None, x, y, size, amber);
+    let mut seats = String::new();
+    for (radius, intervals) in [(28.0, 10), (19.0, 7), (10.0, 4)] {
+        for i in 0..=intervals {
+            let angle = std::f32::consts::PI * i as f32 / intervals as f32;
+            seats.push_str(&dot(32.0 - radius * angle.cos(), 45.0 - radius * angle.sin(), 2.75));
+        }
+    }
+    r.path(1, &seats, None, x, y, size, ink);
+    r.path(2, &dot(32.0, 45.0, 4.5), None, x, y, size, amber);
 }
 
 /// Extract a half-open range, preserving terminal wraps and Unicode combining characters.
