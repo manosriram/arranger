@@ -2955,6 +2955,11 @@ impl App {
         if clicked && had_actions {
             self.redraw();
         }
+        // Views can invalidate the frame while drawing (for example, expanding a tool).
+        // Their redraw requests cannot reach the window while gfx is taken above.
+        if self.stale.get() {
+            self.request_frame();
+        }
     }
 
     fn draw_title(&mut self, r: &mut Renderer, t: &Theme, w: f32) {
