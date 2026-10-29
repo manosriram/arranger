@@ -990,11 +990,17 @@ impl App {
             ix += width + 6.0;
         }
         let send = Rect::new(b.x + b.w - send_w - 6.0, b.y + b.h - 34.0, send_w, 28.0);
-        let ready = !draft.trim().is_empty();
+        let stopping = task.headless && matches!(group(&task.state), 0 | 1);
+        let ready = stopping || !draft.trim().is_empty();
+        let label = if stopping { "■ Stop" } else { "Send ↵" };
         r.rect(send, 0.0, if ready { t.primary_bg } else { t.raised });
-        r.text(send.x + 12.0, r.center(send, UI, 12.0), "Send ↵", UI, 12.0, 600, if ready { t.primary_fg } else { t.text3 }, send_w);
+        r.text(send.x + 12.0, r.center(send, UI, 12.0), label, UI, 12.0, 600, if ready { t.primary_fg } else { t.text3 }, send_w);
         if ready && self.hit(r, send) {
-            self.actions.push(Action::SendChat);
+            if stopping {
+                self.interrupt_chat();
+            } else {
+                self.actions.push(Action::SendChat);
+            }
         }
         let mut hx = b.x + 2.0;
         let fy = b.y + b.h + 7.0;
