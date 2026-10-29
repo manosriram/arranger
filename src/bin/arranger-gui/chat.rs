@@ -20,6 +20,12 @@ const MAX_W: f32 = 860.0;
 const MAX_LINES: usize = 400;
 /// Lines of the message box before it scrolls.
 const COMPOSER_LINES: usize = 8;
+/// Height of a read window's always-visible header bar.
+const READ_BAR_H: f32 = 22.0;
+/// Largest scrollable viewport a run of back-to-back reads gets; the rest scrolls inside.
+const READ_VIEW_MAX: f32 = 320.0;
+/// Scrollbar gutter on the right of a read window.
+const READ_BAR_W: f32 = 8.0;
 
 #[derive(Default)]
 struct Slash {
@@ -79,6 +85,30 @@ struct Laid {
     h: f32,
 }
 
+/// One item drawn on its own, or a run of consecutive reads drawn as one scrollable window.
+#[derive(Clone, Copy)]
+enum View {
+    Item(usize),
+    Reads(usize, usize),
+}
+
+/// The scrollable content of a run of back-to-back reads, in window-local coordinates.
+struct ReadWin {
+    rows: Vec<Row>,
+    content_h: f32,
+}
+
+/// Where a read window was drawn, for wheel scrolling that hits it rather than the thread.
+#[derive(Clone, Copy)]
+struct ReadHit {
+    /// Conversation index of the first read in the run.
+    key: usize,
+    /// Whole window, header bar included.
+    rect: Rect,
+    content_h: f32,
+    viewport_h: f32,
+}
+
 pub struct ChatView {
     hist: Option<usize>,
     selection: Option<((usize, usize, usize), (usize, usize, usize))>,
@@ -90,6 +120,13 @@ pub struct ChatView {
     start: usize,
     items: Vec<ChatItem>,
     laid: Vec<Option<Laid>>,
+    /// Cached layout of a run of reads, at the run's first item; `None` elsewhere.
+    read_win: Vec<Option<ReadWin>>,
+    /// Internal scroll per read window by conversation index of the run's first item;
+    /// `None` follows the newest (the bottom).
+    read_scroll: HashMap<usize, Option<f32>>,
+    /// Read windows drawn in the last frame, for the wheel to scroll the one under the mouse.
+    read_bounds: Vec<ReadHit>,
     loaded: bool,
     /// An older page is on its way.
     loading: bool,
@@ -136,6 +173,40 @@ impl ChatView {
     pub fn scroll(&mut self, dy: f32) {
         let top = self.top.unwrap_or(self.max_top) - dy;
         self.top = (top < self.max_top).then_some(top.max(0.0));
+    }
+
+    /// A read item changed: drop the cached window of the run it belongs to, and the stale
+    /// single-item layouts of its reads.
+    fn invalidate_read(&mut self, i: usize) {
+        let mut s = i;
+        while s > 0 && matches!(self.items[s - 1], ChatItem::Tool { kind: ToolKind::Read, .. }) {
+            s -= 1;
+        }
+        let mut k = s;
+        while k < self.items.len() && matches!(self.items[k], ChatItem::Tool { kind: ToolKind::Read, .. }) {
+            if let Some(laid) = self.laid.get_mut(k) {
+                *laid = None;
+            }
+            k += 1;
+        }
+        if let Some(win) = self.read_win.get_mut(s) {
+            *win = None;
+        }
+    }
+
+    /// Scrolls the read window under the mouse; false means the wheel moves the thread instead.
+    pub fn scroll_read(&mut self, mouse: (f32, f32), dy: f32) -> bool {
+        let Some(hit) = self.read_bounds.iter().find(|h| h.rect.contains(mouse)).copied() else {
+            return false;
+        };
+        let max = (hit.content_h - hit.viewport_h).max(0.0);
+        if max <= 0.0 {
+            return false; // nothing to scroll inside: let the wheel move the thread
+        }
+        let cur = self.read_scroll.get(&hit.key).copied().flatten().unwrap_or(max);
+        let next = cur - dy; // dy is towards the top, like the thread's own scroll.
+        self.read_scroll.insert(hit.key, (next < max - 0.5).then_some(next.max(0.0)));
+        true
     }
 }
 
@@ -261,6 +332,146 @@ fn tool_verb(kind: ToolKind, name: &str) -> String {
         ToolKind::Other => name,
     }
     .to_string()
+}
+
+/// Consecutive reads become one scrollable window; anything else, and a lone read, stays as-is.
+fn views(items: &[ChatItem]) -> Vec<View> {
+    let mut views = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        if matches!(items[i], ChatItem::Tool { kind: ToolKind::Read, .. }) {
+            let mut j = i;
+            while j < items.len() && matches!(items[j], ChatItem::Tool { kind: ToolKind::Read, .. }) {
+                j += 1;
+            }
+            if j - i >= 2 {
+                views.push(View::Reads(i, j - i));
+                i = j;
+                continue;
+            }
+        }
+        views.push(View::Item(i));
+        i += 1;
+    }
+    views
+}
+
+fn read_window_h(content_h: f32) -> f32 {
+    READ_BAR_H + content_h.min(READ_VIEW_MAX)
+}
+
+/// Height the items an older page just put in front add above the old viewport. A read run that
+/// the join merged contributes only its growth, not its whole window again.
+fn prepended_added(r: &Renderer, c: &ChatView, views: &[View], heights: &[f32], prepended: usize, w: f32, local: bool) -> f32 {
+    let mut added = 0.0;
+    for (v, view) in views.iter().enumerate() {
+        match *view {
+            View::Item(i) => {
+                if i < prepended {
+                    added += heights[v] + GAP;
+                }
+            }
+            View::Reads(start, len) => {
+                let end = start + len;
+                if end <= prepended {
+                    added += heights[v] + GAP;
+                } else if start < prepended {
+                    // The run used to begin at `prepended`; the prepended reads only grew it.
+                    let old = &c.items[prepended..end];
+                    let old_h = if old.len() >= 2 {
+                        read_window_h(read_win_layout(r, old, w).content_h)
+                    } else {
+                        layout(r, &old[0], w, c.is_open(prepended), local).h
+                    };
+                    added += heights[v] - old_h;
+                }
+            }
+        }
+    }
+    added
+}
+
+fn intersect(a: Rect, b: Rect) -> Rect {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    let r = (a.x + a.w).min(b.x + b.w);
+    let btm = (a.y + a.h).min(b.y + b.h);
+    Rect::new(x, y, (r - x).max(0.0), (btm - y).max(0.0))
+}
+
+fn draw_row(r: &mut Renderer, t: &Theme, x: f32, ry: f32, w: f32, row: &Row) {
+    if let Some(f) = row.fill {
+        r.rect(Rect::new(x, ry, w, row.h), 0.0, fill(t, f));
+    }
+    for run in &row.runs {
+        let ty = r.center(Rect::new(0.0, ry, 0.0, row.h), run.font, run.size);
+        r.text(x + run.x, ty, &run.text, run.font, run.size, run.weight, ink(t, run.ink), run.max_w);
+    }
+}
+
+/// The lines a Read covered: `(first, count)`. `input` is the tool's args JSON; claude and pi
+/// carry `offset`/`limit` there, other agents don't, so we fall back on the output's own lines.
+fn read_range(input: &str, output: &str) -> (u32, u32) {
+    let parsed: serde_json::Value = serde_json::from_str(input).unwrap_or(serde_json::Value::Null);
+    let offset = ["offset", "start_line", "first_line"].iter().find_map(|k| parsed.get(*k).and_then(serde_json::Value::as_u64)).unwrap_or(0);
+    let limit = ["limit", "lines", "count"].iter().find_map(|k| parsed.get(*k).and_then(serde_json::Value::as_u64));
+    let n = limit.unwrap_or_else(|| output.lines().count() as u64).max(1);
+    (offset as u32 + 1, n as u32)
+}
+
+/// A collapsed read's summary line: "read lines x to y (n lines)".
+fn read_summary(input: &str, output: &str, ok: Option<bool>) -> String {
+    if ok.is_none() {
+        return "reading…".into();
+    }
+    if ok == Some(false) {
+        return "read failed".into();
+    }
+    let (first, n) = read_range(input, output);
+    let last = first + n - 1;
+    if n == 1 {
+        format!("read line {first}")
+    } else {
+        format!("read lines {first} to {last} ({n} lines)")
+    }
+}
+
+/// The content of one run of reads: a collapsed summary per read, latest below the earlier ones.
+fn read_win_layout(r: &Renderer, items: &[ChatItem], w: f32) -> ReadWin {
+    let mut rows = Vec::new();
+    let x0 = 12.0;
+    let right = 12.0 + READ_BAR_W; // right margin plus the scrollbar gutter
+    for item in items {
+        let ChatItem::Tool { name, target, input, output, ok, .. } = item else { continue };
+        let target = if target.is_empty() { name.as_str() } else { target.as_str() };
+        let target_w = r.measure(MONO, 12.5, 400, target);
+        rows.push(Row {
+            y: 0.0,
+            h: 22.0,
+            runs: vec![
+                one(12.0, "Read", UI, 12.5, 500, Ink::Kind(ToolKind::Read), 40.0),
+                one(52.0, target, MONO, 12.5, 400, Ink::Text, (w - 52.0 - right - 20.0).max(target_w.min(w - 52.0 - right))),
+            ],
+            fill: None,
+            toggle: false,
+        });
+        let summary = read_summary(input, output, *ok);
+        let ink = if *ok == Some(false) { Ink::Del } else { Ink::Dim };
+        rows.push(Row {
+            y: 0.0,
+            h: CODE_H,
+            runs: vec![one(x0 + 8.0, &summary, UI, CODE, 400, ink, (w - x0 - right - 8.0).max(40.0))],
+            fill: Some(Fill::Box),
+            toggle: false,
+        });
+        rows.push(spacer(8.0, Some(Fill::Box)));
+    }
+    let mut y = 0.0;
+    for row in &mut rows {
+        row.y = y;
+        y += row.h;
+    }
+    ReadWin { rows, content_h: y }
 }
 
 fn layout(r: &Renderer, item: &ChatItem, w: f32, open: bool, local: bool) -> Laid {
@@ -454,6 +665,9 @@ impl App {
             start: 0,
             items: Vec::new(),
             laid: Vec::new(),
+            read_win: Vec::new(),
+            read_scroll: HashMap::new(),
+            read_bounds: Vec::new(),
             loaded: false,
             loading: false,
             width: 0.0,
@@ -469,6 +683,7 @@ impl App {
         match reply {
             Reply::Chat { start, items, .. } if !c.loaded => {
                 c.laid = items.iter().map(|_| None).collect();
+                c.read_win = items.iter().map(|_| None).collect();
                 (c.start, c.items, c.loaded) = (start, items, true);
             }
             // An older page, just in front of what's here.
@@ -476,18 +691,26 @@ impl App {
                 c.loading = false;
                 c.prepended = items.len();
                 let mut laid: Vec<Option<Laid>> = items.iter().map(|_| None).collect();
+                let mut read_win: Vec<Option<ReadWin>> = items.iter().map(|_| None).collect();
                 laid.append(&mut c.laid);
+                read_win.append(&mut c.read_win);
                 items.append(&mut c.items);
                 (c.start, c.items, c.laid) = (start, items, laid);
+                c.read_win = read_win;
+                // A read at the join may have merged with the run that was first before.
+                c.invalidate_read(c.prepended);
             }
             Reply::Chat { .. } => c.loading = false,
             Reply::ChatPatch { index, item } if index >= c.start && c.loaded => {
                 let i = index - c.start;
                 if i < c.items.len() {
                     (c.items[i], c.laid[i]) = (item, None);
+                    c.invalidate_read(i);
                 } else if i == c.items.len() {
                     c.items.push(item);
                     c.laid.push(None);
+                    c.read_win.push(None);
+                    c.invalidate_read(i);
                 }
             }
             _ => {}
@@ -650,6 +873,7 @@ impl App {
 
         let area = Rect::new(sec.x, sec.y, sec.w, bottom - sec.y);
         let Some(c) = self.chat.as_mut().filter(|c| c.key == key) else { return };
+        c.read_bounds.clear();
         if !c.loaded {
             r.text(x, area.y + 18.0, "Loading the conversation…", UI, 12.0, 400, t.text3, w);
             return;
@@ -657,16 +881,29 @@ impl App {
         if c.width != w {
             c.width = w;
             c.laid.iter_mut().for_each(|l| *l = None);
+            c.read_win.iter_mut().for_each(|l| *l = None);
         }
-        for i in 0..c.items.len() {
-            if c.laid[i].is_none() {
-                let open = c.is_open(i);
-                c.laid[i] = Some(layout(r, &c.items[i], w, open, task.machine == 0));
+        let views = views(&c.items);
+        let mut heights: Vec<f32> = Vec::with_capacity(views.len());
+        for view in &views {
+            match *view {
+                View::Item(i) => {
+                    if c.laid[i].is_none() {
+                        let open = c.is_open(i);
+                        c.laid[i] = Some(layout(r, &c.items[i], w, open, task.machine == 0));
+                    }
+                    heights.push(c.laid[i].as_ref().unwrap().h);
+                }
+                View::Reads(start, len) => {
+                    if c.read_win[start].is_none() {
+                        c.read_win[start] = Some(read_win_layout(r, &c.items[start..start + len], w));
+                    }
+                    heights.push(read_window_h(c.read_win[start].as_ref().unwrap().content_h));
+                }
             }
         }
-        let heights: Vec<f32> = c.laid.iter().map(|l| l.as_ref().map_or(0.0, |l| l.h)).collect();
         if c.prepended > 0 {
-            let added: f32 = heights[..c.prepended].iter().map(|h| h + GAP).sum();
+            let added = prepended_added(r, c, &views, &heights, c.prepended, w, task.machine == 0);
             c.top = c.top.map(|top| top + added);
             c.prepended = 0;
         }
@@ -700,24 +937,27 @@ impl App {
             let mut distance = f32::INFINITY;
             let mut interactive_press = false;
             let mut row_y = area.y + 18.0 - top;
-            for (i, h) in heights.iter().enumerate() {
-                let laid = c.laid[i].as_ref().unwrap();
-                for (j, row) in laid.rows.iter().enumerate() {
-                    let ry = row_y + row.y;
-                    let text = row_text(row);
-                    if pressed && Rect::new(x, ry, w, row.h).contains(self.mouse)
-                        && (row.toggle || (task.machine == 0 && image_path(&text).is_some())) {
-                        interactive_press = true;
-                    }
-                    if ry + row.h < area.y || ry > area.y + area.h
-                        || row.toggle || text.is_empty()
-                        || (task.machine == 0 && image_path(&text).is_some()) {
-                        continue;
-                    }
-                    let dy = (self.mouse.1 - self.mouse.1.clamp(ry, ry + row.h)).abs();
-                    if dy < distance {
-                        distance = dy;
-                        nearest = Some((i, j));
+            for (v, view) in views.iter().enumerate() {
+                let h = heights[v];
+                if let View::Item(i) = *view {
+                    let laid = c.laid[i].as_ref().unwrap();
+                    for (j, row) in laid.rows.iter().enumerate() {
+                        let ry = row_y + row.y;
+                        let text = row_text(row);
+                        if pressed && Rect::new(x, ry, w, row.h).contains(self.mouse)
+                            && (row.toggle || (task.machine == 0 && image_path(&text).is_some())) {
+                            interactive_press = true;
+                        }
+                        if ry + row.h < area.y || ry > area.y + area.h
+                            || row.toggle || text.is_empty()
+                            || (task.machine == 0 && image_path(&text).is_some()) {
+                            continue;
+                        }
+                        let dy = (self.mouse.1 - self.mouse.1.clamp(ry, ry + row.h)).abs();
+                        if dy < distance {
+                            distance = dy;
+                            nearest = Some((i, j));
+                        }
                     }
                 }
                 row_y += h + GAP;
@@ -749,63 +989,118 @@ impl App {
         if c.start > 0 && y > area.y {
             r.text(x, y - 16.0, "Loading earlier messages…", UI, 11.5, 400, t.faint, w);
         }
-        for (i, h) in heights.iter().enumerate() {
+        for (v, view) in views.iter().enumerate() {
+            let h = heights[v];
             if y > area.y + area.h {
                 break;
             }
             if y + h >= area.y {
-                let laid = c.laid[i].as_ref().unwrap();
-                for (row_index, row) in laid.rows.iter().enumerate() {
-                    let ry = y + row.y;
-                    if ry + row.h < area.y || ry > area.y + area.h {
-                        continue;
-                    }
-                    let band = Rect::new(x, ry, w, row.h);
-                    if let Some(f) = row.fill {
-                        r.rect(band, 0.0, fill(t, f));
-                    }
-                    if row.toggle {
-                        r.target(band, Cursor::Pointer);
-                        if self.click.is_some_and(|p| band.contains(p) && area.contains(p)) {
-                            toggled = Some(i);
-                        }
-                    }
-                    let text = row_text(row);
-                    let linked_image = (task.machine == 0).then(|| image_path(&text)).flatten();
-                    if let Some(path) = linked_image.as_ref() {
-                        r.target(band, Cursor::Pointer);
-                        if pressed && band.contains(self.mouse) { image = Some(path.clone()); }
-                    }
-                    if !row.toggle && !text.is_empty() && linked_image.is_none() {
-                        r.target(band, Cursor::Text);
-                    }
-                    if let Some(path) = linked_image.as_ref() {
-                        let preview = Rect::new(x + 14.0, ry + 6.0, (w - 28.0).max(1.0), 232.0);
-                        if !r.image(path, preview) {
-                            r.text(preview.x, preview.y + 12.0, "Preview unavailable · click to open", UI, 12.0, 400, t.text3, preview.w);
-                        }
-                        let label = path.file_name().unwrap_or_default().to_string_lossy();
-                        r.text(preview.x, ry + 244.0, &label, UI, 11.0, 400, t.text3, preview.w);
-                        continue;
-                    }
-                    let mut run_start = 0;
-                    for run in &row.runs {
-                        let ty = r.center(Rect::new(0.0, ry, 0.0, row.h), run.font, run.size);
-                        if let Some((a, b)) = c.selection {
-                            let (a, b) = if a <= b { (a, b) } else { (b, a) };
-                            let point = (c.start + i, row_index);
-                            if point >= (a.0, a.1) && point <= (b.0, b.1) && a != b {
-                                let from = if point == (a.0, a.1) { a.2.saturating_sub(run_start).min(run.text.len()) } else { 0 };
-                                let to = if point == (b.0, b.1) { b.2.saturating_sub(run_start).min(run.text.len()) } else { run.text.len() };
-                                if from < to && run.text.is_char_boundary(from) && run.text.is_char_boundary(to) {
-                                    let left = r.measure(run.font, run.size, run.weight, &run.text[..from]);
-                                    let width = r.measure(run.font, run.size, run.weight, &run.text[from..to]);
-                                    r.rect(Rect::new(x + run.x + left, ry, width, row.h), 0.0, t.sel);
+                match *view {
+                    View::Item(i) => {
+                        let laid = c.laid[i].as_ref().unwrap();
+                        for (row_index, row) in laid.rows.iter().enumerate() {
+                            let ry = y + row.y;
+                            if ry + row.h < area.y || ry > area.y + area.h {
+                                continue;
+                            }
+                            let band = Rect::new(x, ry, w, row.h);
+                            if let Some(f) = row.fill {
+                                r.rect(band, 0.0, fill(t, f));
+                            }
+                            if row.toggle {
+                                r.target(band, Cursor::Pointer);
+                                if self.click.is_some_and(|p| band.contains(p) && area.contains(p)) {
+                                    toggled = Some(i);
                                 }
                             }
+                            let text = row_text(row);
+                            let linked_image = (task.machine == 0).then(|| image_path(&text)).flatten();
+                            if let Some(path) = linked_image.as_ref() {
+                                r.target(band, Cursor::Pointer);
+                                if pressed && band.contains(self.mouse) { image = Some(path.clone()); }
+                            }
+                            if !row.toggle && !text.is_empty() && linked_image.is_none() {
+                                r.target(band, Cursor::Text);
+                            }
+                            if let Some(path) = linked_image.as_ref() {
+                                let preview = Rect::new(x + 14.0, ry + 6.0, (w - 28.0).max(1.0), 232.0);
+                                if !r.image(path, preview) {
+                                    r.text(preview.x, preview.y + 12.0, "Preview unavailable · click to open", UI, 12.0, 400, t.text3, preview.w);
+                                }
+                                let label = path.file_name().unwrap_or_default().to_string_lossy();
+                                r.text(preview.x, ry + 244.0, &label, UI, 11.0, 400, t.text3, preview.w);
+                                continue;
+                            }
+                            let mut run_start = 0;
+                            for run in &row.runs {
+                                let ty = r.center(Rect::new(0.0, ry, 0.0, row.h), run.font, run.size);
+                                if let Some((a, b)) = c.selection {
+                                    let (a, b) = if a <= b { (a, b) } else { (b, a) };
+                                    let point = (c.start + i, row_index);
+                                    if point >= (a.0, a.1) && point <= (b.0, b.1) && a != b {
+                                        let from = if point == (a.0, a.1) { a.2.saturating_sub(run_start).min(run.text.len()) } else { 0 };
+                                        let to = if point == (b.0, b.1) { b.2.saturating_sub(run_start).min(run.text.len()) } else { run.text.len() };
+                                        if from < to && run.text.is_char_boundary(from) && run.text.is_char_boundary(to) {
+                                            let left = r.measure(run.font, run.size, run.weight, &run.text[..from]);
+                                            let width = r.measure(run.font, run.size, run.weight, &run.text[from..to]);
+                                            r.rect(Rect::new(x + run.x + left, ry, width, row.h), 0.0, t.sel);
+                                        }
+                                    }
+                                }
+                                r.text(x + run.x, ty, &run.text, run.font, run.size, run.weight, ink(t, run.ink), run.max_w);
+                                run_start += run.text.len() + 1;
+                            }
                         }
-                        r.text(x + run.x, ty, &run.text, run.font, run.size, run.weight, ink(t, run.ink), run.max_w);
-                        run_start += run.text.len() + 1;
+                    }
+                    View::Reads(start, len) => {
+                        let win = c.read_win[start].as_ref().unwrap();
+                        let content_h = win.content_h;
+                        let viewport_h = content_h.min(READ_VIEW_MAX);
+                        let window_h = READ_BAR_H + viewport_h;
+                        let key = c.start + start;
+                        let max = (content_h - viewport_h).max(0.0);
+                        let scroll = c.read_scroll.get(&key).copied().flatten().unwrap_or(max).min(max);
+                        c.read_bounds.push(ReadHit {
+                            key,
+                            rect: Rect::new(x, y, w, window_h),
+                            content_h,
+                            viewport_h,
+                        });
+
+                        let rect = Rect::new(x, y, w, window_h);
+                        r.rect(rect, 0.0, fill(t, Fill::Box));
+                        let bar = Rect::new(x + 1.0, y + 1.0, w - 2.0, READ_BAR_H - 1.0);
+                        r.rect(bar, 0.0, fill(t, Fill::User));
+                        let label = format!("{len} reads");
+                        let hint = "latest at the bottom";
+                        let hint_w = r.measure(UI, 11.0, 400, hint);
+                        r.text(x + 12.0, r.center(bar, UI, 11.5), &label, UI, 11.5, 600, t.text, (w - hint_w - 36.0).max(40.0));
+                        r.text(x + w - hint_w - 12.0, r.center(bar, UI, 11.0), hint, UI, 11.0, 400, t.faint, hint_w);
+
+                        let viewport = Rect::new(x, y + READ_BAR_H, w, viewport_h);
+                        let win_clip = r.clip();
+                        r.set_clip(Some(intersect(viewport, area)));
+                        for row in &win.rows {
+                            let ry = viewport.y + row.y - scroll;
+                            if ry + row.h < viewport.y || ry > viewport.y + viewport_h {
+                                continue;
+                            }
+                            draw_row(r, t, x, ry, w, row);
+                        }
+                        r.set_clip(win_clip);
+
+                        if max > 0.0 {
+                            let rail = (viewport_h - 4.0).max(1.0);
+                            let thumb_h = (rail * viewport_h / content_h).max(16.0).min(rail);
+                            let thumb_y = viewport.y + 2.0 + (rail - thumb_h) * scroll / max;
+                            r.rect(Rect::new(x + w - 6.0, viewport.y + 2.0, 3.0, rail), 1.5, t.border2);
+                            r.rect(Rect::new(x + w - 6.0, thumb_y, 3.0, thumb_h), 1.5, t.text3);
+                        }
+                        // The border goes on last so scrolled content can't cover it.
+                        r.rect(Rect::new(x, y, w, 1.0), 0.0, t.border2);
+                        r.rect(Rect::new(x, y + window_h - 1.0, w, 1.0), 0.0, t.border2);
+                        r.rect(Rect::new(x, y, 1.0, window_h), 0.0, t.border2);
+                        r.rect(Rect::new(x + w - 1.0, y, 1.0, window_h), 0.0, t.border2);
                     }
                 }
             }
@@ -1079,11 +1374,39 @@ mod tests {
     }
 
     #[test]
+    fn reads_group_back_to_back_only() {
+        let read = |id: &str| ChatItem::Tool { id: id.into(), name: "Read".into(), kind: ToolKind::Read, target: "f".into(), input: String::new(), output: String::new(), ok: Some(true), diff: vec![] };
+        let edit = || ChatItem::Tool { id: "e".into(), name: "Edit".into(), kind: ToolKind::Edit, target: "f".into(), input: String::new(), output: String::new(), ok: Some(true), diff: vec![] };
+        let v = views(&[read("a"), read("b"), edit(), read("c")]);
+        assert_eq!(v.len(), 3);
+        assert!(matches!(v[0], View::Reads(0, 2)));
+        assert!(matches!(v[1], View::Item(2)));
+        assert!(matches!(v[2], View::Item(3)));
+    }
+
+    #[test]
+    fn read_summaries_collapse_to_a_line_range() {
+        // claude: offset (0-based) + limit.
+        let input = r#"{"file_path": "/repo/src/a.rs", "offset": 10, "limit": 25}"#;
+        let output = (0..25).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        assert_eq!(read_range(input, output.as_str()).1, 25);
+        assert_eq!(read_summary(input, output.as_str(), Some(true)), "read lines 11 to 35 (25 lines)");
+        // No offset: the range starts at line 1 and counts the output's own lines.
+        let no_input = "";
+        let out3 = "a\nb\nc";
+        assert_eq!(read_summary(no_input, out3, Some(true)), "read lines 1 to 3 (3 lines)");
+        assert_eq!(read_summary(no_input, "only", Some(true)), "read line 1");
+        // While running and on failure.
+        assert_eq!(read_summary(input, output.as_str(), None), "reading…");
+        assert_eq!(read_summary(input, output.as_str(), Some(false)), "read failed");
+    }
+
+    #[test]
     fn tools_stay_collapsed_until_opened() {
         let line = |kind| arranger::proto::DiffLine { kind, old: 0, new: 0, text: "x\n".into() };
         let tool = |ok, diff| ChatItem::Tool { id: "t".into(), name: "Edit".into(), kind: ToolKind::Edit, target: "a".into(), input: String::new(), output: "out".into(), ok, diff };
         let (sock, _) = UnixStream::pair().unwrap();
-        let mut c = ChatView { hist: None, selection: None, slash: Slash::default(), key: (0, 1), seq: 0, writer: sock, start: 10, items: vec![tool(Some(true), vec![line('+')]), tool(Some(false), vec![]), tool(None, vec![])], laid: vec![None, None, None], loaded: true, loading: false, width: 0.0, open: HashMap::new(), top: None, max_top: 0.0, prepended: 0 };
+        let mut c = ChatView { hist: None, selection: None, slash: Slash::default(), key: (0, 1), seq: 0, writer: sock, start: 10, items: vec![tool(Some(true), vec![line('+')]), tool(Some(false), vec![]), tool(None, vec![])], laid: vec![None, None, None], read_win: vec![None, None, None], read_scroll: HashMap::new(), read_bounds: Vec::new(), loaded: true, loading: false, width: 0.0, open: HashMap::new(), top: None, max_top: 0.0, prepended: 0 };
         assert_eq!((c.is_open(0), c.is_open(1), c.is_open(2)), (false, false, false));
         c.max_top = 500.0;
         c.toggle(0);

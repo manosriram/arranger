@@ -1897,7 +1897,10 @@ impl App {
         } else if self.mouse.0 < self.sidebar_w {
             self.scroll = (self.scroll - dy).max(0.0);
         } else if let Some(c) = self.chat.as_mut().filter(|_| self.review.is_none() && !self.welcome) {
-            c.scroll(dy);
+            let mouse = self.mouse;
+            if !c.scroll_read(mouse, dy) {
+                c.scroll(dy);
+            }
         } else if self.review.is_none() && !self.welcome {
             let dy = dy * 2.0;
             let id = self.selected;
