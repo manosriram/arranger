@@ -292,6 +292,7 @@ enum Action {
     ToggleMenu,
     ToggleBookmarks,
     ToggleUsage,
+    RefreshUsage,
     ToggleVim,
     ToggleDing,
     /// Opens the global task popup, or closes it (None).
@@ -2690,6 +2691,14 @@ impl App {
                 Action::ToggleMenu => self.popup = self.popup.toggle(Popup::Settings),
                 Action::ToggleBookmarks => self.popup = self.popup.toggle(Popup::Bookmarks),
                 Action::ToggleUsage => self.popup = self.popup.toggle(Popup::Usage),
+                Action::RefreshUsage => {
+                    for host in self.hosts.iter().filter(|h| !h.removed && matches!(h.link, Link::Up(_))) {
+                        let sock = host.sock();
+                        thread::spawn(move || {
+                            let _ = request_at(sock.as_deref(), &Request::RefreshUsage);
+                        });
+                    }
+                }
                 Action::ToggleDing => {
                     self.ding_muted = !self.ding_muted;
                     self.save_settings();

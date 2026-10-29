@@ -159,6 +159,7 @@ struct Daemon {
     limits: Vec<PlanLimit>,
     /// `limits` changed since watchers last heard.
     limits_dirty: bool,
+    usage_refresh: std::sync::mpsc::SyncSender<()>,
 }
 
 struct SummaryRun {
@@ -274,6 +275,7 @@ pub fn run() -> io::Result<()> {
     poll.registry().register(&mut SourceFd(&sigchld.as_raw_fd()), CHILD, Interest::READABLE)?;
     poll.registry().register(&mut SourceFd(&stop.as_raw_fd()), STOP, Interest::READABLE)?;
 
+    let (usage, usage_refresh) = crate::usage::watch();
     let mut d = Daemon {
         poll,
         listener,
@@ -301,11 +303,11 @@ pub fn run() -> io::Result<()> {
         summaries: HashMap::new(),
         limits: Vec::new(),
         limits_dirty: false,
+        usage_refresh,
     };
     d.limits = d.db.query_row("SELECT value FROM settings WHERE key = 'plan_limits'", [], |r| r.get::<_, String>(0)).ok()
         .and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
     d.start_queued();
-    let usage = crate::usage::watch();
 
     let mut events = Events::with_capacity(256);
     loop {
@@ -583,6 +585,12 @@ impl Daemon {
                     Err(e) => Reply::Error(format!("git: {e}")),
                 }
             },
+            Request::RefreshUsage => {
+                let _ = self.usage_refresh.try_send(());
+                self.dirty = true;
+                self.limits_dirty = true;
+                Reply::Ok
+            }
             Request::Ping => Reply::Pong,
             Request::Shutdown => {
                 self.stopping = true;

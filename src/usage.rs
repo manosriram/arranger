@@ -12,17 +12,21 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub fn watch() -> mpsc::Receiver<Vec<PlanLimit>> {
+pub fn watch() -> (mpsc::Receiver<Vec<PlanLimit>>, mpsc::SyncSender<()>) {
     let (tx, rx) = mpsc::channel();
+    let (refresh, requests) = mpsc::sync_channel(1);
     thread::spawn(move || {
         loop {
             if tx.send(collect().unwrap_or_default()).is_err() {
                 break;
             }
-            thread::sleep(Duration::from_secs(300));
+            match requests.recv_timeout(Duration::from_secs(300)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
     });
-    rx
+    (rx, refresh)
 }
 
 fn collect() -> io::Result<Vec<PlanLimit>> {

@@ -469,6 +469,12 @@ impl App {
         let limits = self.plan_limits();
         let mut y = pop.y + 10.0;
         r.text(pop.x + 16.0, y + 6.0, "PLAN USAGE", UI, 10.5, 500, t.text3, 200.0);
+        let refresh = Rect::new(pop.x + pop.w - 76.0, pop.y + 8.0, 60.0, 22.0);
+        r.frame(refresh, 3.0, t.dialog, t.border2);
+        r.text(refresh.x + 8.0, r.center(refresh, UI, 11.0), "Refresh", UI, 11.0, 500, t.text, refresh.w - 16.0);
+        if self.hit(r, refresh) {
+            self.actions.push(Action::RefreshUsage);
+        }
         y += 22.0;
         let x = pop.x + 16.0;
         let bar_x = x + 110.0;

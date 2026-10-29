@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub const MAX_FRAME: usize = 16 << 20;
 /// Bump whenever Request/Reply change shape. A daemon left running from an older build
 /// can't decode newer messages, so clients check this before anything else.
-pub const VERSION: u32 = 29;
+pub const VERSION: u32 = 30;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -92,6 +92,8 @@ pub enum Request {
     GenerateSummary { id: u64 },
     /// Retired check setting, retained for wire compatibility.
     Setting { key: String, value: Option<String> },
+    /// Recollect plan usage and push the latest stats to watchers.
+    RefreshUsage,
 }
 
 /// A check to run: a shell command, and why it's worth running.
