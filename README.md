@@ -86,7 +86,7 @@ The sidebar keeps **+ New task** and **Search tasks** visible above one list acr
 
 **Settings** at the top right holds the twelve colour schemes (Gruvbox, Ink, Moss, Ember, Ocean and Plum, dark; Gruvbox Light, Snow, Paper, Linen, Seafoam and Blossom, light), the Vim keys and Ding sound switches, and your machines with **Add machine**.
 
-The **usage** chip in the status bar shows how much of each agent's plan is spent: for Claude and Codex, its tightest window (amber from 80%, red once it's used up). Click it for every window (the 5-hour session, the week) and when each resets, plus the tokens your tasks have used. Codex reports its limits in a chat and in a terminal (from its session log); Claude reports them only in a chat, so Claude tasks in a terminal don't update it. Until an agent reports, its part of the chip shows —; a task's own token count (and cost, when the agent gives one) is in its header under **Usage**.
+The **usage** chip in the status bar shows how much of each agent's plan is spent: for Claude and Codex, its tightest window (amber from 80%, red once it's used up). Click it for every window (the 5-hour session, the week) and when each resets, plus pi's connected models and the tokens your tasks have used. The popover keeps its size and scrolls when pi has more models than fit. Codex reports its limits in a chat and in a terminal (from its session log); Claude reports them only in a chat, so Claude tasks in a terminal don't update it. Until an agent reports, its part of the chip shows —; a task's own token count (and cost, when the agent gives one) is in its header under **Usage**.
 
 Prefer vim keys? Turn on **Vim keys** in **Settings** (top right). The bindings are in [vim.json](vim.json), and `?` shows them in the app.
 

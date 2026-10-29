@@ -541,22 +541,26 @@ impl App {
 
     pub fn usage_rect(&self, w: f32, h: f32) -> Rect {
         let limits = self.plan_limits();
-        let rows = usage_rows(&limits);
+        // Same height as before pi: the plan-usage rows set the window, pi's models scroll.
+        let rows = usage_height_rows(&limits);
         let ph = 14.0 + 22.0 + rows as f32 * 24.0 + 8.0 * USAGE_AGENTS.len() as f32 + 34.0;
         let pw = 470.0_f32.min(w - 20.0);
         let x = (self.usage_btn.x + self.usage_btn.w - pw).max(10.0);
         Rect::new(x, h - STATUS_H - 8.0 - ph, pw, ph)
     }
 
-    /// Plan usage above its status-bar chip: every window each agent reported, and when it resets.
+    /// Plan usage above its status-bar chip: every window each agent reported, pi's connected
+    /// models, and when each plan window resets. The window stays its old height; the rows scroll.
     pub fn draw_usage(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
         let pop = self.usage_rect(w, h);
+        self.usage_bounds = pop;
         r.rect(Rect::new(pop.x - 1.0, pop.y + 3.0, pop.w + 2.0, pop.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
         r.frame(pop, 0.0, t.dialog, t.border2);
         r.target(pop, Cursor::Arrow);
         let limits = self.plan_limits();
-        let mut y = pop.y + 10.0;
-        r.text(pop.x + 16.0, y + 6.0, "PLAN USAGE", UI, 10.5, 500, t.text3, 200.0);
+        let rows = usage_rows(&limits);
+
+        r.text(pop.x + 16.0, pop.y + 16.0, "PLAN USAGE", UI, 10.5, 500, t.text3, 200.0);
         let refresh = Rect::new(pop.x + pop.w - 38.0, pop.y + 8.0, 22.0, 22.0);
         r.frame(refresh, 3.0, t.dialog, t.border2);
         let symbol_w = r.measure(UI, 15.0, 500, "↻");
@@ -564,11 +568,18 @@ impl App {
         if self.hit(r, refresh) {
             self.actions.push(Action::RefreshUsage);
         }
-        y += 22.0;
+
+        let foot = Rect::new(pop.x, pop.y + pop.h - 32.0, pop.w, 32.0);
+        let list = Rect::new(pop.x + 1.0, pop.y + 32.0, pop.w - 2.0, foot.y - pop.y - 32.0);
+        let content_h = rows as f32 * 24.0 + 8.0 * USAGE_POPUP_AGENTS.len() as f32;
+        self.usage_scroll = self.usage_scroll.min((content_h + 6.0 - list.h).max(0.0));
+        r.set_clip(Some(list));
+
         let x = pop.x + 16.0;
         let bar_x = x + 110.0;
         let bar_w = pop.w - 16.0 - 110.0 - 170.0;
-        for agent in USAGE_AGENTS {
+        let mut y = pop.y + 32.0 - self.usage_scroll;
+        for agent in USAGE_POPUP_AGENTS {
             let row = Rect::new(x, y, pop.w - 32.0, 24.0);
             r.text(x, r.center(row, UI, 12.5), agent, UI, 12.5, 600, t.text, 100.0);
             let live = self.all_tasks().filter(|t| adapter::kind(&t.agent) == agent && matches!(group(&t.state), 0..=2)).count();
@@ -579,8 +590,11 @@ impl App {
             let mine: Vec<&PlanLimit> = limits.iter().filter(|l| l.agent == agent).collect();
             if mine.is_empty() {
                 let row = Rect::new(x, y, pop.w - 32.0, 24.0);
-                let note = if agent == "claude" { "Waiting for Claude /usage; needs a signed-in CLI".into() }
-                    else { format!("Nothing yet: it shows once a {agent} chat task runs") };
+                let note = match agent {
+                    "claude" => "Waiting for Claude /usage; needs a signed-in CLI".into(),
+                    "pi" => "No connected models; pi --list-models shows them".into(),
+                    _ => format!("Nothing yet: it shows once a {agent} chat task runs"),
+                };
                 r.text(x + 12.0, r.center(row, UI, 11.5), &note, UI, 11.5, 400, t.text3, row.w - 12.0);
                 y += 24.0;
             }
@@ -602,9 +616,10 @@ impl App {
             }
             y += 8.0;
         }
-        let foot = Rect::new(pop.x, pop.y + pop.h - 32.0, pop.w, 32.0);
+        r.set_clip(None);
+
         r.rect(Rect::new(pop.x + 12.0, foot.y, pop.w - 24.0, 1.0), 0.0, t.border);
-        let totals: Vec<String> = USAGE_AGENTS
+        let totals: Vec<String> = USAGE_POPUP_AGENTS
             .iter()
             .filter_map(|agent| {
                 let tasks: Vec<&TaskInfo> = self.all_tasks().filter(|t| adapter::kind(&t.agent) == *agent).collect();

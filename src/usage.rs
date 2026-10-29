@@ -1,4 +1,4 @@
-//! Read Claude's own /usage screen without sending a model prompt.
+//! Read Claude's own /usage screen and pi's connected models without sending a model prompt.
 use crate::{proto::PlanLimit, pty, screen::Screen};
 use alacritty_terminal::{
     grid::Dimensions,
@@ -17,7 +17,9 @@ pub fn watch() -> (mpsc::Receiver<Vec<PlanLimit>>, mpsc::SyncSender<()>) {
     let (refresh, requests) = mpsc::sync_channel(1);
     thread::spawn(move || {
         loop {
-            if tx.send(collect().unwrap_or_default()).is_err() {
+            let mut limits = collect().unwrap_or_default();
+            limits.extend(collect_pi().unwrap_or_default());
+            if tx.send(limits).is_err() {
                 break;
             }
             match requests.recv_timeout(Duration::from_secs(300)) {
@@ -124,6 +126,45 @@ fn collect() -> io::Result<Vec<PlanLimit>> {
     result
 }
 
+/// pi's `--list-models` table: one row per model whose provider has usable credentials.
+fn collect_pi() -> io::Result<Vec<PlanLimit>> {
+    let dir = std::env::temp_dir().join(format!("arranger-usage-{}", std::process::id()));
+    std::fs::create_dir(&dir)?;
+    let result = (|| {
+        let mut cmd = Command::new("pi");
+        for key in crate::adapter::PARENT_SESSION_ENV {
+            cmd.env_remove(key);
+        }
+        cmd.current_dir(&dir).arg("--list-models");
+        let out = cmd.output()?;
+        if !out.status.success() {
+            return Ok(Vec::new());
+        }
+        Ok(parse_pi(&String::from_utf8_lossy(&out.stdout)))
+    })();
+    let _ = std::fs::remove_dir(&dir);
+    result
+}
+
+fn parse_pi(text: &str) -> Vec<PlanLimit> {
+    text.lines()
+        .skip(1) // provider  model  context  max-out  thinking  images
+        .filter_map(|line| {
+            let mut cols = line.split_whitespace();
+            let provider = cols.next()?;
+            let model = cols.next()?;
+            Some(PlanLimit {
+                agent: "pi".into(),
+                window: format!("{provider}/{model}"),
+                used: None,
+                resets: 0,
+                status: "connected".into(),
+                seen: 0,
+            })
+        })
+        .collect()
+}
+
 fn parse(text: &str) -> Vec<PlanLimit> {
     let mut limits = Vec::new();
     let mut window = None;
@@ -186,6 +227,25 @@ mod tests {
         );
         eprintln!("{limits:?}");
     }
+    #[test]
+    fn reads_pi_connected_models() {
+        let limits = parse_pi(
+            "provider  model            context  max-out  thinking  images\n\
+             deepseek  deepseek-flash   1M       384K     yes       yes   \n\
+             deepseek  deepseek-v4-pro  1M       384K     yes       no    \n",
+        );
+        assert_eq!(
+            limits
+                .iter()
+                .map(|l| (l.agent.as_str(), l.window.as_str(), l.status.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("pi", "deepseek/deepseek-flash", "connected"),
+                ("pi", "deepseek/deepseek-v4-pro", "connected")
+            ]
+        );
+    }
+
     #[test]
     fn reads_windows_without_confusing_session_tokens_with_plan_usage() {
         let limits = parse(

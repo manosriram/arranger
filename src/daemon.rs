@@ -349,8 +349,14 @@ pub fn run() -> io::Result<()> {
         d.auto_summaries();
         d.reap_summaries();
         for limits in usage.try_iter().filter(|limits| !limits.is_empty()) {
-            // /usage is a complete account snapshot, including billing-mode changes.
-            d.limits.retain(|l| l.agent != "claude" || limits.iter().any(|new| new.window == l.window));
+            // /usage and --list-models are complete account snapshots, including billing-mode
+            // changes; drop an agent's old windows only when its snapshot came through.
+            for agent in ["claude", "pi"] {
+                if limits.iter().any(|new| new.agent == agent) {
+                    d.limits.retain(|l| l.agent != agent
+                        || limits.iter().any(|new| new.agent == agent && new.window == l.window));
+                }
+            }
             for limit in limits { d.set_limit(limit); }
         }
         let expired: Vec<Token> = d.conns.iter().filter(|(_, c)| (!c.received || !c.inbuf.is_empty()) && c.last_input.elapsed() > Duration::from_secs(30)).map(|(&t, _)| t).collect();

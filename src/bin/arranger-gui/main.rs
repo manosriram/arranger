@@ -353,6 +353,9 @@ struct App {
     scheme_btn: Rect,
     bookmarks_btn: Rect,
     usage_btn: Rect,
+    /// The usage popover's last frame, for wheel scrolling; its content's scroll offset.
+    usage_bounds: Rect,
+    usage_scroll: f32,
     /// The vim keybinding sheet.
     help: bool,
     /// `g` was pressed and waits for a second `g`.
@@ -517,6 +520,8 @@ fn run() -> io::Result<()> {
         scheme_btn: Rect::new(0.0, 0.0, 0.0, 0.0),
         bookmarks_btn: Rect::default(),
         usage_btn: Rect::default(),
+        usage_bounds: Rect::default(),
+        usage_scroll: 0.0,
         help: false,
         confirm_delete: None,
         multi_select: None,
@@ -1186,14 +1191,22 @@ fn merged_limits(hosts: &[Host]) -> Vec<PlanLimit> {
     out
 }
 
-/// Rows the usage popover lists: per agent, its name and each window it reported (or one line
-/// saying there's nothing yet).
+/// Rows the usage popover draws: per agent, its name and each window or model it reported (or one
+/// line saying there's nothing yet).
 fn usage_rows(limits: &[PlanLimit]) -> usize {
+    USAGE_POPUP_AGENTS.iter().map(|a| 1 + limits.iter().filter(|l| l.agent == *a).count().max(1)).sum()
+}
+
+/// Rows the popover's height accounts for: the plan-usage agents only, so pi's connected models
+/// add scrollable rows instead of making the window taller.
+fn usage_height_rows(limits: &[PlanLimit]) -> usize {
     USAGE_AGENTS.iter().map(|a| 1 + limits.iter().filter(|l| l.agent == *a).count().max(1)).sum()
 }
 
 /// Agents whose plan usage the status bar shows.
 const USAGE_AGENTS: [&str; 2] = ["claude", "codex"];
+/// Agents the usage popover lists: plan usage for the first two, pi's connected models after.
+const USAGE_POPUP_AGENTS: [&str; 3] = ["claude", "codex", "pi"];
 
 /// Red once the window is spent, amber near it, else the working colour.
 fn limit_color(t: &Theme, l: &PlanLimit) -> Rgba {
@@ -1214,6 +1227,7 @@ fn limit_label(l: &PlanLimit) -> String {
         (None, "rejected") => "limited".into(),
         (None, "allowed_warning") => "near".into(),
         (None, "api_billing") => "API".into(),
+        (None, "connected") => "connected".into(),
         (None, "allowed") => "ok".into(),
         _ => "—".into(),
     }
@@ -1871,6 +1885,8 @@ impl App {
         }
         if self.machine_tasks.is_some() {
             self.mt_scroll = (self.mt_scroll - dy).max(0.0);
+        } else if self.popup == Popup::Usage && self.usage_bounds.contains(self.mouse) {
+            self.usage_scroll = (self.usage_scroll - dy).max(0.0);
         } else if self.review.is_none() && !self.welcome && self.chat.is_some()
             && self.ask_identity.as_ref().is_some_and(|(key, since, _)| self.ask() == Some((*key, *since)))
             && self.ask_bounds.is_some_and(|b| b.contains(self.mouse)) {
@@ -2612,7 +2628,10 @@ impl App {
                 }
                 Action::ToggleMenu => self.popup = self.popup.toggle(Popup::Settings),
                 Action::ToggleBookmarks => self.popup = self.popup.toggle(Popup::Bookmarks),
-                Action::ToggleUsage => self.popup = self.popup.toggle(Popup::Usage),
+                Action::ToggleUsage => {
+                    self.popup = self.popup.toggle(Popup::Usage);
+                    self.usage_scroll = 0.0;
+                }
                 Action::RefreshUsage => {
                     for host in self.hosts.iter().filter(|h| !h.removed && matches!(h.link, Link::Up(_))) {
                         let sock = host.sock();
@@ -4487,6 +4506,7 @@ mod tests {
         assert_eq!(limit_label(&limit("claude", "5h", None, "rejected", 0)), "limited");
         assert_eq!(limit_label(&limit("claude", "5h", None, "allowed_warning", 0)), "near");
         assert_eq!(limit_label(&limit("claude", "5h", None, "allowed", 0)), "ok");
+        assert_eq!(limit_label(&limit("pi", "deepseek/deepseek-flash", None, "connected", 0)), "connected");
     }
 
     #[test]
@@ -4518,9 +4538,12 @@ mod tests {
         there.removed = true;
         let merged = merged_limits(&[host(None, Link::Up(0), vec![], vec![limit("codex", "5h", Some(50.0), "", 10)]), there]);
         assert_eq!(merged.iter().map(|l| l.used).collect::<Vec<_>>(), [Some(50.0)]);
-        // Each agent: its name row and a row per window, or one saying nothing came yet.
-        assert_eq!(usage_rows(&[]), 4);
-        assert_eq!(usage_rows(&[limit("codex", "5h", None, "", 0), limit("codex", "week", None, "", 0)]), 2 + 3);
+        // Each popover agent: its name row and a row per window, or one saying nothing came yet.
+        assert_eq!(usage_rows(&[]), 6);
+        assert_eq!(usage_rows(&[limit("codex", "5h", None, "", 0), limit("codex", "week", None, "", 0)]), 2 + 3 + 2);
+        // The window's height still counts only plan-usage agents, so pi's rows scroll.
+        assert_eq!(usage_height_rows(&[]), 4);
+        assert_eq!(usage_height_rows(&[limit("codex", "5h", None, "", 0), limit("codex", "week", None, "", 0)]), 2 + 3);
     }
 
     #[test]
