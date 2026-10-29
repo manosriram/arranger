@@ -59,11 +59,9 @@ const STATUS_H: f32 = 26.0;
 const SIDEBAR_W: f32 = 340.0;
 const HEADER_H: f32 = 72.0;
 const ROW_H: f32 = 28.0;
-/// A row with its second line (what the agent is doing / did).
-const ROW2_H: f32 = 48.0;
 /// A one-line row, when the sidebar is dense.
 const DENSE_ROW_H: f32 = 32.0;
-const NEEDS_CARD_H: f32 = 116.0;
+const NEEDS_CARD_H: f32 = 100.0;
 const TERM_SIZE: f32 = 12.0;
 const LINE_H: f32 = 18.0;
 
@@ -1419,14 +1417,14 @@ fn term_color(t: &Theme, c: Color, fg: bool) -> Option<Rgba> {
 }
 
 /// Splits `text` into lines no wider than `max_w`.
-fn wrap(r: &Renderer, text: &str, font: usize, size: f32, max_w: f32) -> Vec<String> {
+fn wrap(r: &Renderer, text: &str, font: usize, size: f32, weight: u16, max_w: f32) -> Vec<String> {
     let mut lines = Vec::new();
     for para in text.split('\n') {
         let mut line = String::new();
         let mut width = 0.0;
-        let space = r.advance(font, size, 400, ' ');
+        let space = r.advance(font, size, weight, ' ');
         for word in para.split(' ') {
-            let word_width = r.measure(font, size, 400, word);
+            let word_width = r.measure(font, size, weight, word);
             if !line.is_empty() && width + space + word_width > max_w {
                 lines.push(std::mem::take(&mut line));
                 width = 0.0;
@@ -1437,7 +1435,7 @@ fn wrap(r: &Renderer, text: &str, font: usize, size: f32, max_w: f32) -> Vec<Str
             }
             // Paths, URLs and other long tokens must remain readable in narrow request cards.
             for ch in word.chars() {
-                let advance = r.advance(font, size, 400, ch);
+                let advance = r.advance(font, size, weight, ch);
                 if !line.is_empty() && width + advance > max_w {
                     lines.push(std::mem::take(&mut line));
                     width = 0.0;
@@ -2911,6 +2909,7 @@ impl App {
             Popup::Usage if !self.welcome => self.draw_usage(r, t, w, h),
             _ => {}
         }
+        self.draw_task_hover(r, t, w, h);
         self.draw_task_selection(r, t, w, h);
         if self.confirm_delete.is_some() {
             self.draw_delete_confirmation(r, t, w, h);
@@ -2980,27 +2979,19 @@ impl App {
             self.actions.push(Action::Welcome);
         }
 
-        // Views: Workspace | Review.
+        // Review opens from the task header. Its tab is only a location indicator once open.
         let mut nx = x + 26.0 + rw;
         let review = self.review.is_some();
         let tabs = [("Workspace", !review && !self.shell), ("Review", review)];
-        for (label, on) in tabs.into_iter().filter(|_| !self.welcome) {
+        for (label, on) in tabs.into_iter().filter(|(label, _)| !self.welcome && (*label != "Review" || review)) {
             let tw = r.measure(UI, 13.0, 500, label) + 24.0;
             let tab = Rect::new(nx, (TITLE_H - 30.0) / 2.0, tw, 30.0);
             if on {
                 r.rect(tab, 0.0, t.raised);
             }
-            let off = !on && match label {
-                "Review" => !self.reviewable(),
-                _ => false,
-            };
-            r.text(tab.x + 12.0, r.center(tab, UI, 13.0), label, UI, 13.0, 500, if on { t.text } else if off { alpha(t.text3, 90) } else { t.text3 }, tw);
-            if self.hit(r, tab) && !on && !off {
-                self.actions.push(match label {
-                    "Review" => Action::OpenReview,
-                    _ if review => Action::Review(ReviewAction::Close),
-                    _ => Action::Shell(false),
-                });
+            r.text(tab.x + 12.0, r.center(tab, UI, 13.0), label, UI, 13.0, 500, if on { t.text } else { t.text3 }, tw);
+            if !on && self.hit(r, tab) {
+                self.actions.push(if review { Action::Review(ReviewAction::Close) } else { Action::Shell(false) });
             }
             nx += tw + 4.0;
         }
@@ -3010,9 +3001,9 @@ impl App {
         let label_w = r.measure(UI, 12.0, 400, label);
         let b = Rect::new(w - 10.0 - (label_w + 38.0), (TITLE_H - 28.0) / 2.0, label_w + 38.0, 28.0);
         self.scheme_btn = b;
-        r.frame(b, 0.0, if self.popup == Popup::Settings { t.raised } else { t.bg }, t.border);
+        r.frame(b, 4.0, if self.popup == Popup::Settings { t.raised } else { t.bg }, t.border);
         r.text(b.x + 10.0, r.center(b, UI, 12.0), label, UI, 12.0, 400, t.text2, label_w + 4.0);
-        r.path(5, "M16 24L48 24L32 42Z", None, b.x + b.w - 19.0, b.y + 8.0, 10.0, t.text3);
+        r.path(9, "M18 26L32 40L46 26", Some(6.0), b.x + b.w - 20.0, b.y + 8.0, 12.0, t.text3);
         if self.hit(r, b) {
             self.actions.push(Action::ToggleMenu);
         }
@@ -3022,7 +3013,7 @@ impl App {
             let lw = r.measure(UI, 12.0, 400, &label);
             let bb = Rect::new(b.x - 8.0 - (lw + 20.0), b.y, lw + 20.0, b.h);
             self.bookmarks_btn = bb;
-            r.frame(bb, 0.0, if self.popup == Popup::Bookmarks { t.raised } else { t.bg }, t.border);
+            r.frame(bb, 4.0, if self.popup == Popup::Bookmarks { t.raised } else { t.bg }, t.border);
             r.text(bb.x + 10.0, r.center(bb, UI, 12.0), &label, UI, 12.0, 400, t.text2, lw + 4.0);
             if self.hit(r, bb) {
                 self.actions.push(Action::ToggleBookmarks);
@@ -3038,19 +3029,20 @@ impl App {
         // Primary task controls stay visible; shortcuts still focus the same search field.
         let filtering = self.focus == Focus::Filter || !self.filter.is_empty();
         let new = Rect::new(8.0, TITLE_H + 8.0, self.sidebar_w - 16.0, 32.0);
-        r.rect(new, 4.0, t.primary_bg);
-        r.text(new.x + 12.0, r.center(new, UI, 13.0), "+ New task", UI, 13.0, 500, t.primary_fg, new.w - 90.0);
+        let needs = self.all_tasks().any(|task| group(&task.state) == 0);
+        let new_fg = if needs { t.text2 } else { t.primary_fg };
+        if needs { r.frame(new, 4.0, t.panel, t.border2); } else { r.rect(new, 4.0, t.primary_bg); }
+        r.path(12, "M32 8V56M8 32H56", Some(5.0), new.x + 12.0, new.y + 10.0, 12.0, new_fg);
+        r.text(new.x + 30.0, r.center(new, UI, 13.0), "New task", UI, 13.0, 500, new_fg, new.w - 108.0);
         let shortcut = mod_label("N");
         let sw = r.measure(MONO, 10.5, 400, &shortcut);
-        r.text(new.x + new.w - sw - 12.0, r.center(new, MONO, 10.5), &shortcut, MONO, 10.5, 400, t.primary_fg, sw + 2.0);
+        r.text(new.x + new.w - sw - 12.0, r.center(new, MONO, 10.5), &shortcut, MONO, 10.5, 400, if needs { t.text3 } else { new_fg }, sw + 2.0);
         if self.hit(r, new) { self.actions.push(Action::NewTask); }
         let top = {
             let f = Rect::new(8.0, new.y + new.h + 8.0, self.sidebar_w - 16.0, 28.0);
             let focused = self.focus == Focus::Filter;
-            r.frame(f, 0.0, t.bg, if focused { t.work } else { t.border2 });
-            for (i, lw) in [16.0, 10.0, 4.0].iter().enumerate() {
-                r.rect(Rect::new(f.x + 8.0 + (16.0 - lw) / 2.0 * 0.7, f.y + 8.0 + i as f32 * 4.0, lw * 0.7, 1.4), 0.0, t.text3);
-            }
+            r.frame(f, 4.0, t.bg, if focused { t.work } else { t.border2 });
+            r.path(11, "M44 44L56 56M48 28A20 20 0 1 1 8 28A20 20 0 1 1 48 28", Some(5.0), f.x + 8.0, f.y + 7.0, 14.0, t.text3);
             let filter = self.filter.clone();
             if filter.is_empty() && !focused {
                 r.text(f.x + 25.0, r.center(f, UI, 12.0), "Search tasks", UI, 12.0, 400, t.text3, f.w - 110.0);
@@ -3102,20 +3094,39 @@ impl App {
                 y += 1.0;
                 continue;
             }
+            if !sec.tasks.is_empty() {
+                let head = Rect::new(16.0, y + 4.0, self.sidebar_w - 32.0, 24.0);
+                let label = if sec.key == "needs" { "Needs you" } else { "Tasks" };
+                r.text(head.x, r.center(head, UI, 11.5), label, UI, 11.5, 600, t.text3, head.w - 32.0);
+                let count = sec.tasks.len().to_string();
+                let cw = r.measure(MONO, 10.5, 400, &count);
+                r.text(head.x + head.w - cw, r.center(head, MONO, 10.5), &count, MONO, 10.5, 400, t.text3, cw + 1.0);
+                y += 32.0;
+            }
             for task in &sec.tasks {
                 let chip = (multi && task.machine != 0).then(|| self.hosts[task.machine].name());
+                let badge_w = if task.shipped.is_empty() { 0.0 } else { r.measure(UI, 10.5, 500, &format!("✓ {}", task.shipped)) + 16.0 };
+                let mut titles = if dense && sec.key != "needs" { vec![title(task)] } else {
+                    wrap(r, &title(task), UI, 13.0, 500, self.sidebar_w - 51.0 - badge_w)
+                };
+                if titles.len() > 2 {
+                    titles[1] = titles[1..].join(" ");
+                    titles.truncate(2);
+                }
                 if sec.key == "needs" {
                     let expanded = self.expanded_request == Some((task.machine, task.id));
                     let detail = if is_setup(&task.state) { task.setup_detail.clone() } else { status_line(task, 0) };
-                    let lines = if expanded { wrap(r, &detail, UI, 12.5, self.sidebar_w - 51.0) } else { Vec::new() };
-                    let height = NEEDS_CARD_H + (lines.len() as f32 * 18.0 - 20.0).max(0.0);
+                    let detail_font = if is_setup(&task.state) || matches!(task.need, Some(Event::PermissionRequest { .. })) { MONO } else { UI };
+                    let lines = if expanded { wrap(r, &detail, detail_font, 12.5, 400, self.sidebar_w - 51.0) } else { Vec::new() };
+                    let height = NEEDS_CARD_H + (titles.len() - 1) as f32 * 18.0 + (lines.len() as f32 * 18.0 - 20.0).max(0.0)
+                        + if self.sidebar_w < 240.0 { 28.0 } else { 0.0 };
                     let card = Rect::new(6.0, y, self.sidebar_w - 13.0, height);
-                    picks.extend(self.draw_needs_card(r, t, task, card, chip, clicked(self.click), &lines));
+                    picks.extend(self.draw_needs_card(r, t, task, card, chip, clicked(self.click), &titles, &lines, detail_font));
                     y += height;
                 } else {
-                    let row_h = if dense { DENSE_ROW_H } else { ROW2_H };
+                    let row_h = if dense { DENSE_ROW_H } else { 28.0 + titles.len() as f32 * 18.0 };
                     let row = Rect::new(6.0, y, self.sidebar_w - 13.0, row_h);
-                    if self.draw_row(r, t, task, row, dense, chip) && clicked(self.click) {
+                    if self.draw_row(r, t, task, row, dense, chip, &titles) && clicked(self.click) {
                         picks.push(Action::Select((task.machine, task.id)));
                     }
                     y += row_h;
@@ -3154,16 +3165,15 @@ impl App {
         self.actions.extend(picks);
     }
 
-    /// One task row: state icon, title and agent (and `machine`, if it's another one), and under
-    /// them what it's doing. Dense, it's one line, with what it's doing on the right in place of
-    /// the agent. Returns whether it was clicked.
-    fn draw_row(&self, r: &mut Renderer, t: &Theme, task: &TaskInfo, row: Rect, dense: bool, machine: Option<&str>) -> bool {
+    /// Up to two title lines, with agent, machine and activity in a quieter metadata row.
+    /// Dense mode reserves only a short status label; hover reveals the full title and activity.
+    fn draw_row(&self, r: &mut Renderer, t: &Theme, task: &TaskInfo, row: Rect, dense: bool, machine: Option<&str>, titles: &[String]) -> bool {
         let hit_row = row;
-        self.register_task_region((task.machine, task.id), row);
+        self.register_task_region(r, (task.machine, task.id), row);
         let g = group(&task.state);
         let queue_pos = self.hosts[task.machine].tasks.iter().filter(|x| x.state == "queued" && x.id <= task.id).count();
         let line = status_line(task, queue_pos).replace('\n', " ");
-        let top = if dense { row } else { Rect::new(row.x, row.y + 4.0, row.w, 22.0) };
+        let top = if dense { row } else { Rect::new(row.x, row.y + 6.0, row.w, 18.0) };
         let on = self.task_is_selected((task.machine, task.id));
         if on {
             r.rect(row, 0.0, t.sel);
@@ -3176,17 +3186,27 @@ impl App {
             _ => t.text3,
         };
         let agent = machine.map_or_else(|| adapter::kind(&task.agent).to_string(), |m| format!("{} · {m}", adapter::kind(&task.agent)));
-        let (right, rc, most) = if dense { (line.clone(), sc, row.w * 0.34) } else { (agent, t.text3, 150.0) };
-        let rw = r.measure(MONO, 12.0, 400, &right).min(most);
-        r.text(row.x + row.w - 8.0 - rw, r.center(top, MONO, 12.0), &right, MONO, 12.0, 400, rc, rw);
+        let status = match g {
+            1 if is_setup(&task.state) => "setup".into(),
+            1 => "running".into(),
+            2 => format!("#{queue_pos}"),
+            3 => "done".into(),
+            _ => "ended".into(),
+        };
+        let rw = if dense && task.shipped.is_empty() { r.measure(UI, 10.5, 400, &status) + 10.0 } else { 0.0 };
+        if rw > 0.0 {
+            r.text(row.x + row.w - rw, r.center(top, UI, 10.5), &status, UI, 10.5, 400, sc, rw - 10.0);
+        }
         let tc = if g == 4 { t.text3 } else if on { t.tc_on } else { t.tc };
-        let room = row.w - 30.0 - rw - 18.0;
+        let room = row.w - 38.0 - rw;
         let bw = if task.shipped.is_empty() { 0.0 } else { r.measure(UI, 10.5, 500, &format!("✓ {}", task.shipped)) + 16.0 };
-        let tw = r.text(text_x, r.center(top, UI, 13.0), &title(task), UI, 13.0, 500, tc, room - bw);
-        ship_badge(r, t, &task.shipped, text_x + tw + 6.0, top.y + top.h / 2.0);
+        for (i, title) in titles.iter().enumerate() {
+            r.text(text_x, r.center(top, UI, 13.0) + i as f32 * 18.0, title, UI, 13.0, 500, tc, room - bw);
+        }
+        ship_badge(r, t, &task.shipped, text_x + room - bw + 6.0, top.y + top.h / 2.0);
         if !dense {
-            let sub = Rect::new(text_x, top.y + top.h, row.w - 38.0, 18.0);
-            r.text(sub.x, r.center(sub, UI, 12.0), &line, UI, 12.0, 400, sc, sub.w);
+            let sub = Rect::new(text_x, top.y + titles.len() as f32 * 18.0 + 2.0, row.w - 38.0, 16.0);
+            r.text(sub.x, r.center(sub, UI, 11.5), &format!("{agent} · {line}"), UI, 11.5, 400, sc, sub.w);
         }
         self.hit(r, hit_row)
     }
@@ -3194,10 +3214,10 @@ impl App {
     /// A needs-you card: what the agent is waiting on, with the answer right there. A permission
     /// ask the daemon is holding (`asking`) gets Allow once and Deny; anything else (a question, or
     /// an ask showing in the agent's own terminal) gets Answer, which opens that terminal on its menu.
-    fn draw_needs_card(&self, r: &mut Renderer, t: &Theme, task: &TaskInfo, card: Rect, machine: Option<&str>, live: bool, lines: &[String]) -> Vec<Action> {
+    fn draw_needs_card(&self, r: &mut Renderer, t: &Theme, task: &TaskInfo, card: Rect, machine: Option<&str>, live: bool, titles: &[String], lines: &[String], detail_font: usize) -> Vec<Action> {
         let key = (task.machine, task.id);
         let hit_card = card;
-        self.register_task_region(key, card);
+        self.register_task_region(r, key, card);
         let mut acts = Vec::new();
         let on = self.task_is_selected(key);
         if on {
@@ -3206,29 +3226,24 @@ impl App {
         if self.hit(r, hit_card) && live {
             acts.push(Action::Select(key));
         }
-        let top = Rect::new(card.x, card.y + 8.0, card.w, 22.0);
+        let top = Rect::new(card.x, card.y + 6.0, card.w, 18.0);
         self.icon(r, t, task, card.x + 8.0, top.y + top.h / 2.0);
         let text_x = card.x + 30.0;
-        let right = machine.map_or_else(|| adapter::kind(&task.agent).to_string(), |m| format!("{} · {m}", adapter::kind(&task.agent)));
-        let rw = r.measure(MONO, 12.0, 400, &right).min(150.0);
-        r.text(card.x + card.w - 8.0 - rw, r.center(top, MONO, 12.0), &right, MONO, 12.0, 400, t.text3, rw);
-        r.text(text_x, r.center(top, UI, 13.0), &title(task), UI, 13.0, 500, t.text, card.w - 30.0 - rw - 18.0);
-        let ask = Rect::new(text_x, top.y + top.h, card.w - 38.0, 20.0);
+        for (i, title) in titles.iter().enumerate() {
+            r.text(text_x, r.center(top, UI, 13.0) + i as f32 * 18.0, title, UI, 13.0, 500, t.text, card.w - 38.0);
+        }
+        let meta = Rect::new(text_x, top.y + titles.len() as f32 * 18.0, card.w - 38.0, 16.0);
+        let agent = machine.map_or_else(|| adapter::kind(&task.agent).to_string(), |m| format!("{} · {m}", adapter::kind(&task.agent)));
+        r.text(meta.x, r.center(meta, UI, 11.5), &agent, UI, 11.5, 400, t.text3, meta.w);
+        let ask = Rect::new(text_x, meta.y + meta.h, card.w - 38.0, 20.0);
         let expanded = self.expanded_request == Some(key);
         if expanded {
             for (i, line) in lines.iter().enumerate() {
-                r.text(ask.x, ask.y + i as f32 * 18.0, line, UI, 12.5, 400, t.needs, ask.w);
+                r.text(ask.x, ask.y + i as f32 * 18.0, line, detail_font, 12.5, 400, t.needs, ask.w);
             }
         } else {
-            r.text(ask.x, r.center(ask, UI, 12.5), &status_line(task, 0).replace('\n', " "), UI, 12.5, 400, t.needs, ask.w);
+            r.text(ask.x, r.center(ask, detail_font, 12.5), &status_line(task, 0).replace('\n', " "), detail_font, 12.5, 400, t.needs, ask.w);
         }
-        let details = Rect::new(text_x, card.y + card.h - 64.0, card.w - 38.0, 22.0);
-        r.text(details.x, r.center(details, UI, 11.5), if expanded { "Hide details ↑" } else { "Show full request ↓" }, UI, 11.5, 500, t.text2, details.w);
-        if self.hit(r, details) && live {
-            acts.clear();
-            acts.push(Action::ToggleRequest(key));
-        }
-
         let buttons: Vec<(&str, bool, Vec<Action>)> = if self.multi_select.is_some() { vec![]
         } else if task.state == "setup-needs-you" {
             let first = if task.setup == "failed" { ("Retry", SetupAction::Retry) } else { ("Approve", SetupAction::Approve) };
@@ -3238,21 +3253,38 @@ impl App {
         } else {
             vec![("Answer", true, vec![Action::Select(key), Action::Answering])]
         };
+        // At the narrowest sidebar widths, keep Details below the explicit approval actions.
+        let stacked_details = self.sidebar_w < 240.0;
         let mut bx = text_x;
         for (label, filled, then) in buttons {
-            let bw = r.measure(UI, 12.5, 500, label) + 24.0;
-            let b = Rect::new(bx, card.y + card.h - 10.0 - 26.0, bw, 26.0);
+            let bw = r.measure(UI, 12.0, 500, label) + 16.0;
+            let b = Rect::new(bx, card.y + card.h - 34.0 - if stacked_details { 28.0 } else { 0.0 }, bw, 28.0);
             if filled {
-                r.rect(b, 0.0, t.needs);
+                r.rect(b, 4.0, t.needs);
             } else {
-                r.frame(b, 0.0, t.needs_bg, t.needs_line);
+                r.frame(b, 4.0, t.needs_bg, t.needs_line);
             }
-            r.text(b.x + 12.0, r.center(b, UI, 12.5), label, UI, 12.5, 500, if filled { t.on_accent } else { t.text }, bw);
+            r.text(b.x + 8.0, r.center(b, UI, 12.0), label, UI, 12.0, 500, if filled { t.on_accent } else { t.text }, bw);
             if self.hit(r, b) && live {
                 acts.retain(|a| !matches!(a, Action::Select(_)));
                 acts.extend(then);
             }
             bx += bw + 8.0;
+        }
+        let label = if expanded { "Hide" } else { "Details" };
+        let lw = r.measure(UI, 11.0, 400, label);
+        if stacked_details { bx = text_x; }
+        let available = card.x + card.w - 8.0 - bx;
+        let dw = if available >= lw + 24.0 { lw + 24.0 } else { 24.0 };
+        let details = Rect::new(card.x + card.w - 8.0 - dw, card.y + card.h - 34.0, dw, 28.0);
+        if dw > 24.0 {
+            r.text(details.x + 4.0, r.center(details, UI, 11.0), label, UI, 11.0, 400, t.text3, lw);
+        }
+        let (id, path) = if expanded { (14, "M18 38L32 24L46 38") } else { (9, "M18 26L32 40L46 26") };
+        r.path(id, path, Some(6.0), details.x + dw - 16.0, details.y + 8.0, 12.0, t.text3);
+        if self.hit(r, details) && live {
+            acts.clear();
+            acts.push(Action::ToggleRequest(key));
         }
         acts
     }
@@ -3279,14 +3311,13 @@ impl App {
         r.rect(Rect::new(area.x, area.y + HEADER_H - 1.0, area.w, 1.0), 0.0, t.border);
         let top = Rect::new(area.x, area.y + 8.0, area.w, 28.0);
         let kind = adapter::kind(&task.agent);
-        let host = &self.hosts[task.machine];
         let review_label = "Review";
         let review_key = mod_label("R");
         let bw = r.measure(UI, 12.0, 500, review_label) + r.measure(MONO, 10.5, 400, &review_key) + 30.0;
         let review = Rect::new(head.x + head.w - 16.0 - bw, top.y, bw, 28.0);
         let can = self.reviewable();
-        let (bg, fg) = if can { (t.primary_bg, t.primary_fg) } else { (t.raised, alpha(t.text3, 120)) };
-        r.rect(review, 4.0, bg);
+        let fg = if can { t.text2 } else { alpha(t.text3, 120) };
+        r.frame(review, 4.0, t.bg, if can { t.border2 } else { t.border });
         let rlw = r.text(review.x + 12.0, r.center(review, UI, 12.0), review_label, UI, 12.0, 500, fg, bw);
         r.text(review.x + 18.0 + rlw, r.center(review, MONO, 10.5), &review_key, MONO, 10.5, 400, alpha(fg, 160), 60.0);
         if can && self.hit(r, review) {
@@ -3295,8 +3326,12 @@ impl App {
         // Secondary actions live in the same menu as a task's right-click actions.
         let key = (task.machine, task.id);
         let more = Rect::new(review.x - 86.0, top.y, 78.0, 28.0);
-        r.frame(more, 4.0, t.bg, t.border2);
-        r.text(more.x + 10.0, r.center(more, UI, 12.0), "More ⋯", UI, 12.0, 500, t.text2, more.w - 16.0);
+        let open = self.task_menu.is_some_and(|(k, _)| k == key);
+        r.frame(more, 4.0, if open { t.raised } else { t.bg }, t.border2);
+        r.text(more.x + 10.0, r.center(more, UI, 12.0), "More", UI, 12.0, 500, t.text2, 38.0);
+        for i in 0..3 {
+            r.rect(Rect::new(more.x + 51.0 + i as f32 * 5.0, more.y + 13.0, 2.0, 2.0), 1.0, t.text2);
+        }
         if self.hit(r, more) {
             self.task_menu = Some((key, (more.x, more.y + more.h + 6.0)));
             self.click = None;
@@ -3333,6 +3368,7 @@ impl App {
             ],
             None => vec![("—".into(), t.text3)],
         };
+        let changes_w = changes.iter().map(|(s, _)| r.measure(MONO, 11.5, 400, s)).sum::<f32>();
         let details: Vec<(&str, Vec<(String, Rgba)>)> = if self.shell {
             let home = std::env::var("HOME").unwrap_or_default();
             let wt = task.worktree.strip_prefix(&home).filter(|_| task.machine == 0 && !home.is_empty()).map_or(task.worktree.clone(), |rest| format!("~{rest}"));
@@ -3343,47 +3379,38 @@ impl App {
                 ("Worktree", vec![(wt, t.text)]),
             ]
         } else {
-            let mut details = vec![
-                ("Agent", vec![(if task.headless { format!("{kind} · headless") } else { kind.to_string() }, accent(kind))]),
+            vec![
+                ("Agent", vec![(kind.to_string(), accent(kind))]),
                 ("Branch", vec![(branch, t.text)]),
-                ("Machine", vec![(host.name().to_string(), t.text)]),
                 ("Changes", changes),
-                ("Elapsed", vec![(age(&task), t.text)]),
-            ];
-            if task.tokens > 0 {
-                let mut usage = vec![(format!("{} tokens", short_count(task.tokens)), t.text)];
-                usage.extend(task.cost.map(|c| (format!(" · ${c:.2}"), t.text3)));
-                details.push(("Usage", usage));
-            }
-            if let Some(source) = task.cloned_from {
-                details.push(("Cloned from", vec![(format!("#{source}"), t.text)]));
-            }
-            details
+            ]
         };
         let meta = Rect::new(area.x + 20.0, area.y + 42.0, area.w - 36.0, 20.0);
         let mut dx = meta.x;
         for (label, parts) in details {
             let prefix = match label {
-                "Agent" | "Branch" | "Machine" | "Changes" | "Elapsed" | "Usage" => String::new(),
+                "Agent" | "Branch" | "Changes" => String::new(),
                 _ => format!("{label} "),
             };
             let pw = r.measure(UI, 11.5, 400, &prefix);
-            let w = pw + parts.iter().map(|(s, _)| r.measure(UI, 11.5, 400, s)).sum::<f32>();
+            let font = if matches!(label, "Branch" | "Worktree" | "Changes") { MONO } else { UI };
+            let w = pw + parts.iter().map(|(s, _)| r.measure(font, 11.5, 400, s)).sum::<f32>();
             let remaining = meta.x + meta.w - dx;
             if remaining < 40.0 { break; }
-            let available = w.min(remaining);
+            let budget = if label == "Branch" && !self.shell { (remaining - changes_w - 20.0).max(40.0) } else { remaining };
+            let available = w.min(budget).min(remaining);
+            if dx > meta.x {
+                r.text(dx - 12.0, r.center(meta, UI, 11.5), "·", UI, 11.5, 400, t.text3, 8.0);
+            }
             let mut px = dx;
             if !prefix.is_empty() {
                 px += r.text(px, r.center(meta, UI, 11.5), &prefix, UI, 11.5, 400, t.text3, available);
             }
             for (s, c) in &parts {
                 let room = (dx + available - px).max(0.0);
-                px += r.text(px, r.center(meta, UI, 11.5), s, UI, 11.5, 400, *c, room);
+                px += r.text(px, r.center(meta, font, 11.5), s, font, 11.5, 400, *c, room);
             }
-            dx += w + 20.0;
-            if dx + 20.0 < meta.x + meta.w {
-                r.text(dx - 12.0, r.center(meta, UI, 11.5), "·", UI, 11.5, 400, t.text3, 8.0);
-            }
+            dx += available + 20.0;
         }
 
         // The agent's own terminal, sized to the pane; once the agent has ended, a bar to bring it back below.
@@ -3517,8 +3544,9 @@ impl App {
             }
         }
         for (i, (sym, label)) in [("■", "need you"), ("●", "running"), ("○", "queued"), ("✓", "done")].iter().enumerate() {
-            let c = [t.needs, t.work, t.text3, t.done][i];
-            x += r.text(x, y, &format!("{sym} {} {label}", counts[i]), MONO, 11.5, 400, c, 200.0) + 14.0;
+            let c = if counts[i] == 0 { t.faint } else if i == 0 { t.needs } else if i == 1 { t.text2 } else { t.text3 };
+            let weight = if i == 0 && counts[i] > 0 { 600 } else { 400 };
+            x += r.text(x, r.center(bar, UI, 11.0), &format!("{sym} {} {label}", counts[i]), UI, 11.0, weight, c, 200.0) + 14.0;
         }
         let lost = matches!(self.hosts[0].link, Link::Down(_));
         let remotes: Vec<&Host> = self.hosts.iter().filter(|h| h.cfg.is_some() && !h.removed).collect();
@@ -3528,7 +3556,7 @@ impl App {
             let up = 1 + remotes.iter().filter(|h| matches!(h.link, Link::Up(_))).count();
             format!("{up}/{} machines connected", remotes.len() + 1)
         } else {
-            format!("{} new · {} theme", mod_label("N"), mod_label("T"))
+            String::new()
         };
         let mut right_x = w - 12.0;
         let version = concat!("v", env!("CARGO_PKG_VERSION"));
@@ -3548,18 +3576,20 @@ impl App {
                 right_x -= 22.0;
             }
         }
-        let rw = r.measure(MONO, 11.5, 400, &right);
-        r.text(right_x - rw, y, &right, MONO, 10.5, 400, if lost { t.del } else { t.text3 }, rw + 2.0);
-        right_x -= rw + 14.0;
+        if !right.is_empty() {
+            let rw = r.measure(UI, 10.5, 400, &right);
+            r.text(right_x - rw, r.center(bar, UI, 10.5), &right, UI, 10.5, 400, if lost { t.del } else { t.text3 }, rw + 2.0);
+            right_x -= rw + 14.0;
+        }
 
         // Plan usage, both agents in one chip: each one's tightest window. Click for the rest.
         let limits = self.plan_limits();
         let parts: Vec<(&str, Option<&PlanLimit>)> = USAGE_AGENTS.iter().map(|a| (*a, tightest(&limits, a))).collect();
         let (bar_w, gap) = (34.0, 8.0);
         let part_w = |r: &Renderer, (agent, l): &(&str, Option<&PlanLimit>)| {
-            r.measure(MONO, 11.5, 400, agent) + gap + bar_w + gap + r.measure(MONO, 11.5, 500, &l.map_or("—".into(), limit_label))
+            r.measure(MONO, 10.5, 400, agent) + gap + bar_w + gap + r.measure(MONO, 10.5, 400, &l.map_or("—".into(), limit_label))
         };
-        let lead = r.measure(MONO, 11.5, 400, "usage");
+        let lead = r.measure(MONO, 10.5, 400, "usage");
         let sep = 22.0;
         let inner = lead + 12.0 + parts.iter().map(|p| part_w(r, p)).sum::<f32>() + sep * (parts.len() - 1) as f32;
         let chip = Rect::new(right_x - inner - 16.0, bar.y + 4.0, inner + 16.0, STATUS_H - 8.0);
@@ -3567,14 +3597,15 @@ impl App {
             self.usage_btn = chip;
             r.rect(chip, 0.0, if self.popup == Popup::Usage { t.border2 } else { t.raised });
             let mut cx = chip.x + 8.0;
-            cx += r.text(cx, y, "usage", MONO, 11.5, 400, t.text3, lead + 2.0) + 12.0;
+            let uy = r.center(bar, MONO, 10.5);
+            cx += r.text(cx, uy, "usage", MONO, 10.5, 400, t.text3, lead + 2.0) + 12.0;
             for (k, part) in parts.iter().enumerate() {
                 if k > 0 {
                     r.rect(Rect::new(cx + sep / 2.0 - 6.0, chip.y + 4.0, 1.0, chip.h - 8.0), 0.0, t.border2);
                     cx += sep;
                 }
                 let (agent, l) = part;
-                cx += r.text(cx, y, agent, MONO, 11.5, 400, t.text2, 80.0) + gap;
+                cx += r.text(cx, uy, agent, MONO, 10.5, 400, t.text3, 80.0) + gap;
                 let track = Rect::new(cx, chip.y + chip.h / 2.0 - 2.0, bar_w, 4.0);
                 r.rect(track, 0.0, t.border2);
                 let color = l.map_or(t.text3, |l| limit_color(t, l));
@@ -3582,7 +3613,7 @@ impl App {
                 r.rect(Rect::new(track.x, track.y, bar_w * fill, track.h), 0.0, color);
                 cx += bar_w + gap;
                 let label = l.map_or("—".into(), limit_label);
-                cx += r.text(cx, y, &label, MONO, 11.5, 500, if color == t.work { t.text2 } else { color }, 80.0);
+                cx += r.text(cx, uy, &label, MONO, 10.5, 400, if color == t.work { t.text3 } else { color }, 80.0);
             }
             if self.hit(r, chip) {
                 self.actions.push(Action::ToggleUsage);
@@ -3746,7 +3777,7 @@ impl App {
         let controls_h = cy + 32.0;
         let d = self.dialog.as_mut().unwrap();
         if !d.prompt_layout.matches(&prompt, width) {
-            let lines = wrap(r, &prompt, UI, 16.0, width);
+            let lines = wrap(r, &prompt, UI, 16.0, 400, width);
             let starts = line_starts(&prompt, &lines);
             let references = completion::reference_ranges(&prompt);
             d.prompt_layout = std::rc::Rc::new(PromptLayout { text: prompt.clone(), width, lines, starts, references });
@@ -3762,7 +3793,7 @@ impl App {
                 .into_iter()
                 .filter(|(_, p)| !p.trim().is_empty())
                 .map(|(label, p)| {
-                    let mut lines = wrap(r, p.trim(), UI, 13.0, dw - 2.0 * pad - 14.0);
+                    let mut lines = wrap(r, p.trim(), UI, 13.0, 400, dw - 2.0 * pad - 14.0);
                     if lines.len() > 2 {
                         lines.truncate(2);
                         lines[1].push('…');
@@ -3856,7 +3887,7 @@ impl App {
             let kw = r.measure(UI, 13.0, 400, key) + 8.0;
             let lead = if dot.is_some() { 16.0 } else { 0.0 };
             let (fill, edge, kc, vc) = if *disabled { (t.raised, t.border, t.faint, t.text3) } else { (t.dialog, t.border2, t.text3, t.text) };
-            r.frame(*b, 0.0, fill, edge);
+            r.frame(*b, 4.0, fill, edge);
             if let Some(c) = dot {
                 r.rect(Rect::new(b.x + 12.0, b.y + 13.0, 6.0, 6.0), 0.0, if *disabled { alpha(*c, 0x80) } else { *c });
             }

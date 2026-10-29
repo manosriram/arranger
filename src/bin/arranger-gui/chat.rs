@@ -856,7 +856,7 @@ impl App {
         let question = matches!(task.need, Some(Event::Question { .. }));
         // The text runs from 90 to the card's right edge, or to the Deny button (at w - 180).
         let text_w = if question { w - 104.0 } else { w - 36.0 }.max(80.0);
-        let lines = wrap(r, &text, UI, 12.5, text_w);
+        let lines = wrap(r, &text, UI, 12.5, 400, text_w);
         // A question's options as buttons, as many rows as they take, the hint after the last.
         let hint = "or type an answer below";
         let hint_w = r.measure(UI, 11.5, 400, hint) + 4.0;
@@ -947,7 +947,7 @@ impl App {
         let draft = self.drafts.get(&key).cloned().unwrap_or_default();
         let send_w = 76.0;
         let text_w = sec.w - 32.0 - 24.0 - send_w - 8.0;
-        let lines = wrap(r, &draft, UI, BODY, text_w);
+        let lines = wrap(r, &draft, UI, BODY, 400, text_w);
         let starts = line_starts(&draft, &lines);
         let caret = self.caret_for(Focus::Message, &draft).map(|at| caret_line_at(&lines, &starts, at));
         let shown = lines.len().clamp(2, COMPOSER_LINES);
@@ -993,7 +993,7 @@ impl App {
         let stopping = task.headless && matches!(group(&task.state), 0 | 1);
         let ready = stopping || !draft.trim().is_empty();
         let label = if stopping { "■ Stop" } else { "Send ↵" };
-        r.rect(send, 0.0, if ready { t.primary_bg } else { t.raised });
+        r.rect(send, 4.0, if ready { t.primary_bg } else { t.raised });
         r.text(send.x + 12.0, r.center(send, UI, 12.0), label, UI, 12.0, 600, if ready { t.primary_fg } else { t.text3 }, send_w);
         if ready && self.hit(r, send) {
             if stopping {
@@ -1005,8 +1005,9 @@ impl App {
         let mut hx = b.x + 2.0;
         let fy = b.y + b.h + 7.0;
         let esc = if self.vim { "Esc Esc" } else { "Esc" };
-        for (k, what) in [("↵", "send"), ("⇧↵", "new line"), ("↑", "previous prompts"), (esc, "interrupt")] {
-            hx += r.text(hx, fy, k, UI, 11.0, 500, t.text3, 80.0) + 6.0;
+        let hints = if group(&task.state) <= 1 { 2 } else { 1 };
+        for (k, what) in [("⇧↵", "new line"), (esc, "interrupt")].into_iter().take(hints) {
+            hx += r.text(hx, fy, k, MONO, 10.5, 400, t.text3, 80.0) + 6.0;
             hx += r.text(hx, fy, what, UI, 11.0, 400, t.text3, 120.0) + 18.0;
         }
         // Its permission mode at the right; ⇧⇥ or a click moves to the next.

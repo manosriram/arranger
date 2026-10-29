@@ -743,7 +743,7 @@ impl App {
             let at = |n: &Note| n.path == file.path && n.header == h.header && n.line == line && n.new_side == new_side;
             (0..rv.notes.len()).filter(|&i| at(&rv.notes[i])).collect()
         };
-        let note_h = |r: &Renderer, n: &Note| 24.0 + 18.0 + 8.0 + wrap(r, &n.text, UI, 13.0, note_w - 28.0).len().max(1) as f32 * 20.0 + 12.0 + 28.0 + 12.0 + 8.0;
+        let note_h = |r: &Renderer, n: &Note| 24.0 + 18.0 + 8.0 + wrap(r, &n.text, UI, 13.0, 400, note_w - 28.0).len().max(1) as f32 * 20.0 + 12.0 + 28.0 + 12.0 + 8.0;
 
         // Rows: unified lines, or split pairs (old, new).
         let rows = |h: &Hunk| -> Vec<(Option<usize>, Option<usize>)> {
@@ -921,7 +921,7 @@ impl App {
         let side = if note.new_side { "" } else { " (removed)" };
         let state = if editing { "draft" } else { "saved" };
         r.text(hx + 32.0 + yw, r.center(badge, UI, 12.0), &format!("· line {}{side} · {state}", note.line), UI, 12.0, 400, t.text3, b.w - 90.0);
-        let lines = wrap(r, &note.text, UI, 13.0, b.w - 28.0);
+        let lines = wrap(r, &note.text, UI, 13.0, 400, b.w - 28.0);
         let starts = line_starts(&note.text, &lines);
         let caret = self.caret_for(Focus::Note, &note.text).filter(|_| editing).map(|at| caret_line_at(&lines, &starts, at));
         let mut y = b.y + 38.0;

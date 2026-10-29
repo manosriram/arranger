@@ -9,7 +9,7 @@ Linux and macOS. Rust throughout; no webview.
   <img alt="arranger workspace with six agents on three machines, permission and question cards in the sidebar, and a completed Codex task selected" src="assets/screenshot.png">
 </picture>
 
-Threads can be saved with **More → Bookmark thread** in the thread header, or **Bookmark thread** in a thread's right-click menu. Both menus reveal the full task title with a copy icon beside it. Open any saved thread from **Bookmarks** in the title bar. Saved threads remain available after restarting, including ended and merged threads; choose **Remove bookmark** to unsave one.
+Threads can be saved with **More → Bookmark thread** in the thread header, or **Bookmark thread** in a thread's right-click menu. Both menus reveal the full task title with a copy icon beside it, plus the branch, machine, elapsed time and available token/cost details. The task header keeps the agent, branch and change summary visible; **Review** opens its diff. Open any saved thread from **Bookmarks** in the title bar. Saved threads remain available after restarting, including ended and merged threads; choose **Remove bookmark** to unsave one.
 
 ## Install
 
