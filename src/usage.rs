@@ -92,7 +92,7 @@ fn trust_keys(text: &str) -> Option<&'static [u8]> {
 fn collect() -> io::Result<Vec<PlanLimit>> {
     // Outside any repository, with project settings and MCP servers disabled.
     let dir = ProbeDir::new()?;
-    let result = (|| {
+    (|| {
         let mut cmd = Command::new("claude");
         for key in crate::adapter::PARENT_SESSION_ENV {
             cmd.env_remove(key);
@@ -176,14 +176,13 @@ fn collect() -> io::Result<Vec<PlanLimit>> {
             }
         }
         Ok(limits)
-    })();
-    result
+    })()
 }
 
 /// pi's `--list-models` table: one row per model whose provider has usable credentials.
 fn collect_pi() -> io::Result<Vec<PlanLimit>> {
     let dir = ProbeDir::new()?;
-    let result = (|| {
+    (|| {
         let mut cmd = Command::new("pi");
         for key in crate::adapter::PARENT_SESSION_ENV {
             cmd.env_remove(key);
@@ -194,8 +193,7 @@ fn collect_pi() -> io::Result<Vec<PlanLimit>> {
             return Ok(Vec::new());
         }
         Ok(parse_pi(&String::from_utf8_lossy(&out.stdout)))
-    })();
-    result
+    })()
 }
 
 fn parse_pi(text: &str) -> Vec<PlanLimit> {
