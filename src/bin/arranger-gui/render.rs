@@ -6,7 +6,7 @@ use glow::HasContext;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use swash::scale::{Render, ScaleContext, Source};
-use swash::zeno::{Angle, Cap, Fill, Format, Mask, Point, Stroke, Transform, Vector};
+use swash::zeno::{Angle, Cap, Fill, Format, Mask, Stroke, Transform, Vector};
 use swash::{FontRef, NormalizedCoord};
 
 pub const UI: usize = 0;
@@ -593,7 +593,11 @@ impl Renderer {
             None => {
                 let scale = size * d / 64.0;
                 let mut mask = Mask::new(data);
-                let turn = Transform::rotation_about(Point::new(32.0, 32.0), Angle::from_degrees(angle))
+                // Not Transform::rotation_about: zeno 0.3 applies its translations in the wrong
+                // order, so the icon orbits the origin instead of turning in place.
+                let turn = Transform::translation(-32.0, -32.0)
+                    .then_rotate(Angle::from_degrees(angle))
+                    .then_translate(32.0, 32.0)
                     .then(&Transform::scale(scale, scale));
                 mask.transform(Some(turn));
                 match stroke {
