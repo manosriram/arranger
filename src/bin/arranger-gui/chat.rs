@@ -1764,13 +1764,18 @@ impl App {
             if self.hit(r, button) { open_image(path); }
             ix += width + 6.0;
         }
-        let send = Rect::new(b.x + b.w - send_w - 6.0, b.y + (b.h - 28.0) / 2.0, send_w, 28.0);
         let stopping = task.headless && matches!(group(&task.state), 0 | 1);
+        let button_w = if stopping { 28.0 } else { send_w };
+        let send = Rect::new(b.x + b.w - 6.0 - (send_w + button_w) / 2.0, b.y + (b.h - 28.0) / 2.0, button_w, 28.0);
         let ready = stopping || !draft.trim().is_empty();
-        let label = if stopping { "■ Stop" } else { "Send ↵" };
         r.rect(send, 4.0, if ready { t.primary_bg } else { t.raised });
-        let label_w = r.measure(UI, 12.0, 600, label);
-        r.text(send.x + (send.w - label_w) / 2.0, r.center(send, UI, 12.0), label, UI, 12.0, 600, if ready { t.primary_fg } else { t.text3 }, send_w);
+        if stopping {
+            r.rect(Rect::new(send.x + (send.w - 10.0) / 2.0, send.y + (send.h - 10.0) / 2.0, 10.0, 10.0), 0.0, t.primary_fg);
+        } else {
+            let label = "Send ↵";
+            let label_w = r.measure(UI, 12.0, 600, label);
+            r.text(send.x + (send.w - label_w) / 2.0, r.center(send, UI, 12.0), label, UI, 12.0, 600, if ready { t.primary_fg } else { t.text3 }, send_w);
+        }
         if ready && self.hit(r, send) {
             if stopping {
                 self.interrupt_chat();
