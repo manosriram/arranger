@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use review::{ReviewAction, ReviewView, Tag};
-use theme::{AGENTS, Rgba, THEMES, Theme, accent, alpha, blend, efforts, models, readable};
+use theme::{AGENTS, Rgba, THEMES, Theme, accent, agent_logo, alpha, blend, efforts, models, readable};
 #[cfg(test)]
 use theme::{INK, PAPER};
 use winit::application::ApplicationHandler;
@@ -3216,7 +3216,6 @@ impl App {
             4 => t.faint,
             _ => t.text3,
         };
-        let agent = machine.map_or_else(|| adapter::kind(&task.agent).to_string(), |m| format!("{} · {m}", adapter::kind(&task.agent)));
         let status = match g {
             1 if is_setup(&task.state) => "setup".into(),
             1 => "running".into(),
@@ -3237,7 +3236,10 @@ impl App {
         ship_badge(r, t, &task.shipped, text_x + room - bw + 6.0, top.y + top.h / 2.0);
         if !dense {
             let sub = Rect::new(text_x, top.y + titles.len() as f32 * 18.0 + 2.0, row.w - 38.0, 16.0);
-            r.text(sub.x, r.center(sub, UI, 11.5), &format!("{agent} · {line}"), UI, 11.5, 400, sc, sub.w);
+            let cy = r.center(sub, UI, 11.5);
+            let bw = agent_badge(r, &task.agent, sub.x, cy, 12.0);
+            let txt = machine.map_or_else(|| line.clone(), |m| format!("{m} · {line}"));
+            r.text(sub.x + bw + 5.0, cy, &txt, UI, 11.5, 400, sc, sub.w - bw - 5.0);
         }
         self.hit(r, hit_row)
     }
@@ -3264,8 +3266,10 @@ impl App {
             r.text(text_x, r.center(top, UI, 13.0) + i as f32 * 18.0, title, UI, 13.0, 500, t.text, card.w - 38.0);
         }
         let meta = Rect::new(text_x, top.y + titles.len() as f32 * 18.0, card.w - 38.0, 16.0);
-        let agent = machine.map_or_else(|| adapter::kind(&task.agent).to_string(), |m| format!("{} · {m}", adapter::kind(&task.agent)));
-        r.text(meta.x, r.center(meta, UI, 11.5), &agent, UI, 11.5, 400, t.text3, meta.w);
+        let cy = r.center(meta, UI, 11.5);
+        let bw = agent_badge(r, &task.agent, meta.x, cy, 12.0);
+        let host = machine.unwrap_or("");
+        r.text(meta.x + bw + 5.0, cy, host, UI, 11.5, 400, t.text3, meta.w - bw - 5.0);
         let ask = Rect::new(text_x, meta.y + meta.h, card.w - 38.0, 20.0);
         let expanded = self.expanded_request == Some(key);
         if expanded {
@@ -4247,6 +4251,22 @@ fn logo(r: &mut Renderer, x: f32, y: f32, size: f32, ink: Rgba, amber: Rgba) {
     }
     r.path(1, &seats, None, x, y, size, ink);
     r.path(2, &dot(32.0, 45.0, 4.5), None, x, y, size, amber);
+}
+
+/// The agent's coloured glyph centred on `cy`, `size` px square at `x`; returns its width (== size).
+/// Path ids sit in a private range so the atlas never reuses another shape's cached glyph.
+fn agent_badge(r: &mut Renderer, agent: &str, x: f32, cy: f32, size: f32) -> f32 {
+    let kind = adapter::kind(agent);
+    let id = 60 + match kind {
+        "claude" => 0,
+        "codex" => 1,
+        "pi" => 2,
+        "gemini" => 3,
+        _ => 4,
+    };
+    let data = agent_logo(kind);
+    r.path(id, &data, None, x, cy - size / 2.0, size, accent(kind));
+    size
 }
 
 /// Extract a half-open range, preserving terminal wraps and Unicode combining characters.

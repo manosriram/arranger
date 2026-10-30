@@ -523,6 +523,32 @@ pub fn accent(agent: &str) -> Rgba {
     }
 }
 
+/// The agent's brand glyph as a filled SVG path in a 64-unit box, drawn in `accent`'s colour.
+/// Simplified marks that stay legible at the sidebar's 12px: pi's π, claude's burst, codex's
+/// knot, gemini's star, and a plain dot for anything unknown.
+pub fn agent_logo(agent: &str) -> String {
+    match agent {
+        "claude" => star(32.0, 32.0, 26.0, 12.0, 8),
+        "codex" => "M32 6 L54 19 L54 45 L32 58 L10 45 L10 19 Z".into(),
+        "pi" => "M16 18 H48 V26 H40 V48 H32 V26 H24 V48 H16 Z".into(),
+        "gemini" => "M32 4 L39 25 L60 32 L39 39 L32 60 L25 39 L4 32 L25 25 Z".into(),
+        _ => "M32 8 A24 24 0 1 0 32 56 A24 24 0 1 0 32 8 Z".into(),
+    }
+}
+
+/// A `n`-point star between `outer` and `inner` radii, centred on (cx, cy).
+fn star(cx: f32, cy: f32, outer: f32, inner: f32, n: usize) -> String {
+    let mut s = String::new();
+    for i in 0..=n * 2 {
+        let r = if i % 2 == 0 { outer } else { inner };
+        let a = std::f32::consts::PI * i as f32 / n as f32 - std::f32::consts::FRAC_PI_2;
+        s.push_str(if i == 0 { "M" } else { "L" });
+        s.push_str(&format!("{:.1} {:.1} ", cx + r * a.cos(), cy + r * a.sin()));
+    }
+    s.push('Z');
+    s
+}
+
 impl Theme {
     /// GitHub's diff palette: (add sign, add row, del sign, del row), keyed on light/dark.
     pub fn diff(&self) -> (Rgba, Rgba, Rgba, Rgba) {
