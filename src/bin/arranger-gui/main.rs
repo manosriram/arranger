@@ -191,7 +191,7 @@ struct Dialog {
     prompt_bounds: Option<Rect>,
     prompt_position: Option<(usize, usize)>,
     agent: usize,
-    /// Index into the agent's `models`; 0 is its default.
+    /// Index into the selected machine's model choices; 0 is its default.
     model: usize,
     /// Index into the agent's `efforts`; 0 is its default.
     effort: usize,
@@ -757,7 +757,14 @@ impl ApplicationHandler<Msg> for App {
                     d.completion.files = paths;
                 }
             }
-            Msg::Limits(m, limits) => set_limits(&mut self.hosts, m, limits),
+            Msg::Limits(m, limits) => {
+                if let Some(d) = self.dialog.as_mut().filter(|d| d.host == m) {
+                    let old = connected_models(d.agent(), &self.hosts[m].limits);
+                    let new = connected_models(d.agent(), &limits);
+                    d.model = old.get(d.model).and_then(|choice| new.iter().position(|c| c.1 == choice.1)).unwrap_or(0);
+                }
+                set_limits(&mut self.hosts, m, limits);
+            },
             Msg::Tasks(m, tasks) => {
                 self.user_event_tasks(m, tasks);
                 if self.selected.is_none_or(|k| self.task(k).is_none()) {
@@ -1174,6 +1181,20 @@ fn set_limits(hosts: &mut [Host], m: usize, limits: Vec<PlanLimit>) {
     if let Some(h) = hosts.get_mut(m) {
         h.limits = limits;
     }
+}
+
+/// Model choices belong to the selected machine, whose provider credentials may differ.
+fn connected_models(agent: &str, limits: &[PlanLimit]) -> Vec<(String, String)> {
+    if agent != "pi" {
+        return models(agent).iter().map(|(label, value)| (label.to_string(), value.to_string())).collect();
+    }
+    let mut choices = vec![("default".into(), String::new())];
+    for limit in limits.iter().filter(|l| l.agent == agent && l.status == "connected") {
+        if !limit.window.is_empty() && !choices.iter().any(|(_, value)| value == &limit.window) {
+            choices.push((limit.window.clone(), limit.window.clone()));
+        }
+    }
+    choices
 }
 
 /// Every machine's plan usage merged: the newest report per agent and window, the hour windows
@@ -2090,7 +2111,7 @@ impl App {
     fn open_clone(&mut self, key: TaskKey) {
         let Some(t) = self.task(key).filter(|t| t.state != "queued" && !t.worktree.is_empty()) else { return };
         let agent = adapter::kind(&t.agent).to_string();
-        let model = models(&agent).iter().position(|m| m.1 == t.model).unwrap_or(0);
+        let model = connected_models(&agent, &self.hosts[key.0].limits).iter().position(|m| m.1 == t.model).unwrap_or(0);
         let clone = CloneFrom { key, agent, branch: t.branch.clone(), first: t.title.clone(), last: String::new(), model: Some(t.model.clone()), effort: t.effort.clone(), headless: t.headless };
         self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_layout: Default::default(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model, effort: 0, chat: None, host: key.0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: Some(clone) });
         self.focus = Focus::Prompt;
@@ -2124,6 +2145,7 @@ impl App {
             }
         };
         if let Some(d) = &mut self.dialog {
+            if d.host != m { d.model = 0; }
             (d.host, d.repo, d.base, d.branches, d.list) = (m, repo, base, branches, None);
         }
     }
@@ -2133,12 +2155,14 @@ impl App {
         let sock = self.dialog.as_ref().and_then(|d| self.sock(d.host));
         let Some(d) = &mut self.dialog else { return };
         let m = d.host;
+        let choices = connected_models(d.agent(), &self.hosts[m].limits);
+        let selected_model = choices.get(d.model).unwrap_or(&choices[0]).1.clone();
         let req = match &d.clone {
             // An empty prompt is a plain fork, carrying on where it left off.
             Some(c) => Request::Clone {
                 id: c.key.1,
                 prompt: d.prompt.trim().to_string(),
-                model: c.model.is_none().then(|| models(&c.agent)[d.model].1.to_string()),
+                model: c.model.is_none().then(|| selected_model.clone()),
             },
             None if d.repo.trim().is_empty() => {
                 d.error = "Which repo on that machine? Type its path.".into();
@@ -2149,7 +2173,7 @@ impl App {
                 repo: d.repo.trim().into(),
                 base: Some(d.base.trim().to_string()).filter(|b| !b.is_empty()),
                 prompt: Some(d.prompt.trim().to_string()).filter(|p| !p.is_empty()),
-                model: Some(models(AGENTS[d.agent])[d.model].1.to_string()).filter(|m| !m.is_empty()),
+                model: Some(selected_model.clone()).filter(|m| !m.is_empty()),
                 effort: efforts(AGENTS[d.agent])[d.effort].1.to_string(),
                 headless: d.chat_view(),
             },
@@ -2727,8 +2751,8 @@ impl App {
                 }
                 Action::PickModel(i) => {
                     if let Some(d) = &mut self.dialog {
-                        let n = models(d.agent()).len();
-                        d.model = if i == usize::MAX { (d.model + 1) % n } else { i };
+                        let n = connected_models(d.agent(), &self.hosts[d.host].limits).len();
+                        d.model = if i == usize::MAX { (d.model + 1) % n } else { i.min(n - 1) };
                         if let Some(c) = &mut d.clone {
                             c.model = None; // the picked one, from now on
                         }
@@ -3760,9 +3784,10 @@ impl App {
         let dw = (w - 32.0).min(680.0);
         let pad = 22.0;
         let width = dw - 2.0 * pad;
+        let choices = connected_models(agent, &self.hosts[host_i].limits);
         let model = match clone.as_ref().and_then(|c| c.5.as_deref()) {
-            Some("") | None => models(agent)[model_i].0,
-            Some(kept) => models(agent).iter().find(|m| m.1 == kept).map_or(kept, |m| m.0),
+            Some("") | None => choices.get(model_i).unwrap_or(&choices[0]).0.as_str(),
+            Some(kept) => choices.iter().find(|m| m.1 == kept).map_or(kept, |m| m.0.as_str()),
         };
         let effort = match effort_kept.as_deref() {
             Some("") => "default",
@@ -4493,6 +4518,22 @@ mod tests {
         let mut t = task_in(state, "ok");
         (t.id, t.machine, t.updated, t.title) = (id, machine, updated, format!("task {id}"));
         t
+    }
+
+    #[test]
+    fn spawn_models_use_only_the_selected_agents_connected_models() {
+        let limits = vec![
+            limit("pi", "deepseek/flash", None, "connected", 0),
+            limit("pi", "deepseek/flash", None, "connected", 1),
+            limit("pi", "other/offline", None, "disconnected", 0),
+            limit("codex", "5h", Some(20.0), "allowed", 0),
+        ];
+        assert_eq!(connected_models("pi", &limits), vec![
+            ("default".into(), "".into()),
+            ("deepseek/flash".into(), "deepseek/flash".into()),
+        ]);
+        assert_eq!(connected_models("pi", &[]), vec![("default".into(), "".into())]);
+        assert_eq!(connected_models("codex", &limits), connected_models("codex", &[]));
     }
 
     #[test]

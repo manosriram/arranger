@@ -497,13 +497,6 @@ pub fn models(agent: &str) -> &'static [(&'static str, &'static str)] {
             ("gpt-6-sol", "gpt-6-sol"),
             ("gpt-6-luna", "gpt-6-luna"),
         ],
-        // pi takes a pattern, matched against whichever providers it's logged in to.
-        "pi" => &[
-            ("default", ""),
-            ("opus 5.5", "claude-opus-5-5"),
-            ("sonnet 5.5", "claude-sonnet-5-5"),
-            ("gpt-6.1-sol", "gpt-6.1-sol"),
-        ],
         // gemini's own aliases, so they follow its releases.
         "gemini" => &[("default", ""), ("pro", "pro"), ("flash", "flash"), ("flash-lite", "flash-lite")],
         _ => &[("default", "")],
