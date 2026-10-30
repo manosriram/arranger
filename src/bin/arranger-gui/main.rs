@@ -4283,7 +4283,8 @@ fn agent_badge(r: &mut Renderer, agent: &str, x: f32, cy: f32, size: f32) -> f32
         "gemini" => 3,
         _ => 4,
     };
-    r.path(id, agent_logo(kind), None, x, cy - size / 2.0, size * 64.0 / 24.0, accent(kind));
+    let ink = if kind == "codex" { [0, 0, 0, 255] } else { accent(kind) };
+    r.path(id, agent_logo(kind), None, x, cy - size / 2.0, size * 64.0 / 24.0, ink);
     size
 }
 
