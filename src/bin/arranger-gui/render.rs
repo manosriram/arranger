@@ -6,7 +6,7 @@ use glow::HasContext;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use swash::scale::{Render, ScaleContext, Source};
-use swash::zeno::{Cap, Fill, Format, Mask, Stroke, Transform, Vector};
+use swash::zeno::{Angle, Cap, Fill, Format, Mask, Point, Stroke, Transform, Vector};
 use swash::{FontRef, NormalizedCoord};
 
 pub const UI: usize = 0;
@@ -89,6 +89,7 @@ struct GlyphKey {
     px: u32, // physical size * 64
     weight: u16,
     sub: u8, // x offset in quarter pixels, so glyph spacing stays even
+    rot: u16, // path icons only: rotation in whole degrees
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -561,7 +562,7 @@ impl Renderer {
         if sub == 4 {
             (col, sub) = (col + 1.0, 0);
         }
-        let key = GlyphKey { font: font_i, id, px: (size * d * 64.0) as u32, weight, sub };
+        let key = GlyphKey { font: font_i, id, px: (size * d * 64.0) as u32, weight, sub, rot: 0 };
         let g = match self.glyphs.get(&key) {
             Some(g) => *g,
             None => {
@@ -579,14 +580,22 @@ impl Renderer {
     /// Draws an SVG path laid out in a 64-unit box, `size` logical px square at (x, y): filled, or
     /// stroked `stroke` units wide with round caps. Rasterised once per (id, size) into the atlas.
     pub fn path(&mut self, id: u16, data: &str, stroke: Option<f32>, x: f32, y: f32, size: f32, color: Rgba) {
+        self.path_rot(id, data, 0.0, stroke, x, y, size, color);
+    }
+
+    /// Like `path`, but rotates the icon (drawn in a 64-unit box centred on 32,32) clockwise by `angle` degrees.
+    pub fn path_rot(&mut self, id: u16, data: &str, angle: f32, stroke: Option<f32>, x: f32, y: f32, size: f32, color: Rgba) {
         let d = self.dpi;
-        let key = GlyphKey { font: usize::MAX, id, px: (size * d * 64.0) as u32, weight: 0, sub: 0 };
+        let rot = angle.rem_euclid(360.0).round() as u16;
+        let key = GlyphKey { font: usize::MAX, id, px: (size * d * 64.0) as u32, weight: 0, rot, sub: 0 };
         let g = match self.glyphs.get(&key) {
             Some(g) => *g,
             None => {
                 let scale = size * d / 64.0;
                 let mut mask = Mask::new(data);
-                mask.transform(Some(Transform::scale(scale, scale)));
+                let turn = Transform::rotation_about(Point::new(32.0, 32.0), Angle::from_degrees(angle))
+                    .then(&Transform::scale(scale, scale));
+                mask.transform(Some(turn));
                 match stroke {
                     Some(w) => mask.style(*Stroke::new(w).cap(Cap::Round)),
                     None => mask.style(Fill::NonZero),

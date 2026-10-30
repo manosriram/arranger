@@ -563,8 +563,9 @@ impl App {
         r.text(pop.x + 16.0, pop.y + 16.0, "PLAN USAGE", UI, 10.5, 500, t.text3, 200.0);
         let refresh = Rect::new(pop.x + pop.w - 38.0, pop.y + 8.0, 22.0, 22.0);
         r.frame(refresh, 3.0, t.dialog, t.border2);
-        let symbol_w = r.measure(UI, 15.0, 500, "↻");
-        r.text(refresh.x + (refresh.w - symbol_w) / 2.0, r.center(refresh, UI, 15.0), "↻", UI, 15.0, 500, t.text, symbol_w + 2.0);
+        let icon = 14.0;
+        let angle = self.usage_angle().unwrap_or(0.0);
+        r.path_rot(40, "M42 14.7 A20 20 0 1 1 22 14.7 M22 14.7 L28.5 9 L31 15", angle, Some(4.5), refresh.x + (refresh.w - icon) / 2.0, refresh.y + (refresh.h - icon) / 2.0, icon, t.text);
         if self.hit(r, refresh) {
             self.actions.push(Action::RefreshUsage);
         }

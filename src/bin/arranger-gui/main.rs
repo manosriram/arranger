@@ -352,6 +352,8 @@ struct App {
     /// The usage popover's last frame, for wheel scrolling; its content's scroll offset.
     usage_bounds: Rect,
     usage_scroll: f32,
+    /// When the usage popover's refresh button was clicked; it spins once while this is recent.
+    usage_spin: Option<Instant>,
     /// The vim keybinding sheet.
     help: bool,
     /// `g` was pressed and waits for a second `g`.
@@ -518,6 +520,7 @@ fn run() -> io::Result<()> {
         usage_btn: Rect::default(),
         usage_bounds: Rect::default(),
         usage_scroll: 0.0,
+        usage_spin: None,
         help: false,
         confirm_delete: None,
         multi_select: None,
@@ -688,6 +691,8 @@ fn init_gfx(el: &ActiveEventLoop) -> Result<Gfx, String> {
 }
 
 const BLINK: Duration = Duration::from_millis(530);
+/// One full turn of the usage refresh button.
+const USAGE_SPIN: Duration = Duration::from_millis(600);
 
 impl ApplicationHandler<Msg> for App {
     fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
@@ -707,6 +712,9 @@ impl ApplicationHandler<Msg> for App {
                 self.glide_step();
                 self.stale.set(true);
             }
+            if self.usage_angle().is_some() {
+                self.stale.set(true);
+            }
             if self.review.as_ref().is_some_and(|rv| rv.animating()) {
                 self.stale.set(true);
             }
@@ -719,7 +727,7 @@ impl ApplicationHandler<Msg> for App {
     /// glide a wheel notch, or to play running icons.
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let blink = (!matches!(self.focus, Focus::Term | Focus::Normal)).then_some(self.blink_at);
-        let moving = self.glide != 0.0 || self.review.as_ref().is_some_and(|rv| rv.animating());
+        let moving = self.glide != 0.0 || self.review.as_ref().is_some_and(|rv| rv.animating()) || self.usage_angle().is_some();
         // A glide asks for frames at 120Hz; vsync holds that to a 60Hz display's own rate.
         let ms = if self.glide != 0.0 { 8 } else if moving { 33 } else { 80 };
         let frame = (moving || self.sweep().is_some()).then(|| Instant::now() + Duration::from_millis(ms));
@@ -1491,6 +1499,13 @@ impl App {
 
     fn current(&self) -> Option<&TaskInfo> {
         self.selected.and_then(|k| self.task(k))
+    }
+
+    /// Angle of the usage refresh button's one-turn spin: None once it has finished.
+    fn usage_angle(&self) -> Option<f32> {
+        let at = self.usage_spin?;
+        let k = (at.elapsed().as_secs_f32() / USAGE_SPIN.as_secs_f32()).min(1.0);
+        (k < 1.0).then_some(360.0 * ease(k))
     }
 
     /// Seconds on the status icons' clock, while one that moves is on screen (running, needs you,
@@ -2650,6 +2665,7 @@ impl App {
                     self.usage_scroll = 0.0;
                 }
                 Action::RefreshUsage => {
+                    self.usage_spin = Some(Instant::now());
                     for host in self.hosts.iter().filter(|h| !h.removed && matches!(h.link, Link::Up(_))) {
                         let sock = host.sock();
                         thread::spawn(move || {
