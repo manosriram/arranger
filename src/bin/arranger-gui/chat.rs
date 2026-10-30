@@ -40,6 +40,19 @@ const MIN_CODE: f32 = 9.0;
 const CELL_PAD: f32 = 10.0;
 /// Column lines a table draws; columns past these still lay out, unruled.
 const TABLE_COLS: usize = 15;
+/// Largest an image preview gets; smaller images keep their own size.
+const SHOT_MAX_W: f32 = 720.0;
+const SHOT_MAX_H: f32 = 420.0;
+/// Narrowest an image card gets, so a tiny image still has room for its caption.
+const SHOT_MIN_W: f32 = 260.0;
+/// The caption bar under an image: its name, size and "Open".
+const SHOT_CAP: f32 = 30.0;
+/// Room above and below an image card.
+const SHOT_PAD: f32 = 8.0;
+/// A picture area when there is nothing to draw: undecodable files.
+const SHOT_EMPTY_H: f32 = 64.0;
+/// Images previewed per message at most.
+const SHOT_MAX: usize = 6;
 
 #[derive(Default)]
 struct Slash {
@@ -118,6 +131,19 @@ struct Row {
     toggle: bool,
     /// A stripe down the left edge, in this ink.
     bar: Option<Ink>,
+    /// A local image drawn as a card in this row, in place of runs.
+    shot: Option<Shot>,
+}
+
+/// A local image's card: where it sits in its row and how big the picture is on screen.
+struct Shot {
+    path: std::path::PathBuf,
+    x: f32,
+    /// The file's own pixel size, if its header reads.
+    px: Option<(u32, u32)>,
+    /// The picture inside the card, in logical px.
+    w: f32,
+    h: f32,
 }
 
 struct Laid {
@@ -220,12 +246,15 @@ impl ChatView {
     /// A read item changed: drop the cached window of the run it belongs to, and the stale
     /// single-item layouts of its reads.
     fn invalidate_read(&mut self, i: usize) {
+        if !self.items.get(i).is_some_and(text_read) {
+            return;
+        }
         let mut s = i;
-        while s > 0 && matches!(self.items[s - 1], ChatItem::Tool { kind: ToolKind::Read, .. }) {
+        while s > 0 && text_read(&self.items[s - 1]) {
             s -= 1;
         }
         let mut k = s;
-        while k < self.items.len() && matches!(self.items[k], ChatItem::Tool { kind: ToolKind::Read, .. }) {
+        while k < self.items.len() && text_read(&self.items[k]) {
             if let Some(laid) = self.laid.get_mut(k) {
                 *laid = None;
             }
@@ -257,7 +286,7 @@ impl ChatView {
 /// inline code chip covers its spaces too. Inline code (code ink on an unfilled row) goes on a chip,
 /// with room kept clear on both sides of it.
 fn wrap_runs(r: &Renderer, runs: &[(String, usize, f32, u16, Ink)], x0: f32, w: f32, line_h: f32, fill: Option<Fill>) -> Vec<Row> {
-    let mut rows = vec![Row { y: 0.0, h: line_h, runs: Vec::new(), fill, toggle: false, bar: None }];
+    let mut rows = vec![Row { y: 0.0, h: line_h, runs: Vec::new(), fill, toggle: false, bar: None, shot: None }];
     let mut x = x0;
     // The run (by index into `runs`) and word the current row's last piece came from.
     let mut from: Option<(usize, usize)> = None;
@@ -287,7 +316,7 @@ fn wrap_runs(r: &Renderer, runs: &[(String, usize, f32, u16, Ink)], x0: f32, w: 
                     break;
                 }
                 if x > x0 {
-                    rows.push(Row { y: 0.0, h: line_h, runs: Vec::new(), fill, toggle: false, bar: None });
+                    rows.push(Row { y: 0.0, h: line_h, runs: Vec::new(), fill, toggle: false, bar: None, shot: None });
                     (x, from) = (x0, None);
                     continue;
                 }
@@ -305,7 +334,7 @@ fn wrap_runs(r: &Renderer, runs: &[(String, usize, f32, u16, Ink)], x0: f32, w: 
                 let rest = word.split_off(cut);
                 x += pad;
                 rows.last_mut().unwrap().runs.push(Run { x, text: word, font: *font, size: *size, weight: *weight, ink: *ink, max_w: w, chip });
-                rows.push(Row { y: 0.0, h: line_h, runs: Vec::new(), fill, toggle: false, bar: None });
+                rows.push(Row { y: 0.0, h: line_h, runs: Vec::new(), fill, toggle: false, bar: None, shot: None });
                 (x, word, from) = (x0, rest, None);
             }
             if !word.is_empty() {
@@ -330,7 +359,7 @@ fn wrap_runs(r: &Renderer, runs: &[(String, usize, f32, u16, Ink)], x0: f32, w: 
 }
 
 fn spacer(h: f32, fill: Option<Fill>) -> Row {
-    Row { y: 0.0, h, runs: Vec::new(), fill, toggle: false, bar: None }
+    Row { y: 0.0, h, runs: Vec::new(), fill, toggle: false, bar: None, shot: None }
 }
 
 fn one(x: f32, text: &str, font: usize, size: f32, weight: u16, ink: Ink, max_w: f32) -> Run {
@@ -339,9 +368,11 @@ fn one(x: f32, text: &str, font: usize, size: f32, weight: u16, ink: Ink, max_w:
 
 /// An agent's markdown: paragraphs, headings, bullets, quotes, rules, fenced code, pipe tables,
 /// ASCII art, and bold and `code` runs.
-fn markdown(r: &Renderer, text: &str, w: f32) -> Vec<Row> {
+/// Images a line points at get a card under it, when `root` (a local task's worktree) is given.
+fn markdown(r: &Renderer, text: &str, w: f32, root: Option<&std::path::Path>) -> Vec<Row> {
     let lines: Vec<&str> = text.lines().collect();
     let mut rows: Vec<Row> = Vec::new();
+    let mut shown: Vec<std::path::PathBuf> = Vec::new();
     let mut i = 0;
     while let Some(&line) = lines.get(i) {
         let trimmed = line.trim_start();
@@ -367,8 +398,12 @@ fn markdown(r: &Renderer, text: &str, w: f32) -> Vec<Row> {
             rows.push(spacer(8.0, None));
             continue;
         }
-        if image_path(trimmed).is_some() {
-            rows.push(Row { y: 0.0, h: 26.0, runs: vec![one(0.0, trimmed, UI, BODY, 400, Ink::Text, w)], fill: Some(Fill::Box), toggle: false, bar: None });
+        let shots: Vec<_> = root.map(|root| image_refs(trimmed, root)).unwrap_or_default().into_iter().filter(|p| !shown.contains(p)).collect();
+        if !shots.is_empty() && sole_image(trimmed) {
+            for path in shots {
+                shown.push(path.clone());
+                rows.push(shot_row(r, path, 0.0, w, None));
+            }
             continue;
         }
         if trimmed.trim_end().len() >= 3 && ['-', '*', '_'].iter().any(|&c| trimmed.trim_end().chars().all(|ch| ch == c)) {
@@ -422,6 +457,10 @@ fn markdown(r: &Renderer, text: &str, w: f32) -> Vec<Row> {
             wrapped.last_mut().unwrap().h += 4.0;
         }
         rows.extend(wrapped);
+        for path in shots.into_iter().take(SHOT_MAX.saturating_sub(shown.len())) {
+            shown.push(path.clone());
+            rows.push(shot_row(r, path, indent, w - indent, None));
+        }
     }
     rows
 }
@@ -617,7 +656,7 @@ fn table(r: &Renderer, lines: &[&str], w: f32) -> Vec<Row> {
         let cell = |top: bool, bottom: bool| Some(Fill::Table { head, top, bottom, w: total, cols: col_mask(&cols, total) });
         rows.push(spacer(5.0, cell(true, false)));
         for runs in lines {
-            rows.push(Row { y: 0.0, h: BODY_H, runs, fill: cell(false, false), toggle: false, bar: None });
+            rows.push(Row { y: 0.0, h: BODY_H, runs, fill: cell(false, false), toggle: false, bar: None, shot: None });
         }
         rows.push(spacer(5.0, cell(false, j + 1 == grid.len())));
     }
@@ -648,9 +687,9 @@ fn views(items: &[ChatItem], at_start: bool) -> Vec<View> {
         if turn_starts(items, i, at_start) {
             views.push(View::Turn(i));
         }
-        if matches!(items[i], ChatItem::Tool { kind: ToolKind::Read, .. }) {
+        if text_read(&items[i]) {
             let mut j = i;
-            while j < items.len() && matches!(items[j], ChatItem::Tool { kind: ToolKind::Read, .. }) {
+            while j < items.len() && text_read(&items[j]) {
                 j += 1;
             }
             if j - i >= 2 {
@@ -671,7 +710,7 @@ fn read_window_h(content_h: f32) -> f32 {
 
 /// Height the items an older page just put in front add above the old viewport. A read run that
 /// the join merged contributes only its growth, not its whole window again.
-fn prepended_added(r: &Renderer, c: &ChatView, views: &[View], heights: &[f32], gaps: &[f32], prepended: usize, w: f32, local: bool) -> f32 {
+fn prepended_added(r: &Renderer, c: &ChatView, views: &[View], heights: &[f32], gaps: &[f32], prepended: usize, w: f32, root: Option<&std::path::Path>) -> f32 {
     let mut added = 0.0;
     for (v, view) in views.iter().enumerate() {
         match *view {
@@ -696,7 +735,7 @@ fn prepended_added(r: &Renderer, c: &ChatView, views: &[View], heights: &[f32], 
                     let old_h = if old.len() >= 2 {
                         read_window_h(read_win_layout(r, old, w).content_h)
                     } else {
-                        layout(r, &old[0], w, c.is_open(prepended), local).h
+                        layout(r, &old[0], w, c.is_open(prepended), root).h
                     };
                     added += heights[v] - old_h;
                 }
@@ -768,6 +807,7 @@ fn read_win_layout(r: &Renderer, items: &[ChatItem], w: f32) -> ReadWin {
             fill: None,
             toggle: false,
             bar: None,
+            shot: None,
         });
         let summary = read_summary(input, output, *ok);
         let ink = if *ok == Some(false) { Ink::Del } else { Ink::Dim };
@@ -778,6 +818,7 @@ fn read_win_layout(r: &Renderer, items: &[ChatItem], w: f32) -> ReadWin {
             fill: Some(Fill::Box),
             toggle: false,
             bar: None,
+            shot: None,
         });
         rows.push(spacer(8.0, Some(Fill::Box)));
     }
@@ -789,23 +830,28 @@ fn read_win_layout(r: &Renderer, items: &[ChatItem], w: f32) -> ReadWin {
     ReadWin { rows, content_h: y }
 }
 
-fn layout(r: &Renderer, item: &ChatItem, w: f32, open: bool, local: bool) -> Laid {
+/// `root`: a local task's worktree, where the images its messages point at are looked for.
+fn layout(r: &Renderer, item: &ChatItem, w: f32, open: bool, root: Option<&std::path::Path>) -> Laid {
     let mut rows = Vec::new();
     match item {
         ChatItem::User { text } => {
             rows.push(spacer(10.0, Some(Fill::User)));
-            rows.push(Row { y: 0.0, h: 20.0, runs: vec![one(16.0, "You", UI, 11.5, 600, Ink::Dim, 60.0)], fill: Some(Fill::User), toggle: false, bar: None });
+            rows.push(Row { y: 0.0, h: 20.0, runs: vec![one(16.0, "You", UI, 11.5, 600, Ink::Dim, 60.0)], fill: Some(Fill::User), toggle: false, bar: None, shot: None });
+            let mut shown: Vec<std::path::PathBuf> = Vec::new();
             for para in text.lines() {
-                if image_path(para).is_some() {
-                    rows.push(Row { y: 0.0, h: 26.0, runs: vec![one(16.0, para, UI, BODY, 400, Ink::Text, w - 32.0)], fill: Some(Fill::User), toggle: false, bar: None });
-                } else {
+                let shots: Vec<_> = root.map(|root| image_refs(para, root)).unwrap_or_default().into_iter().filter(|p| !shown.contains(p)).collect();
+                if shots.is_empty() || !sole_image(para) {
                     rows.extend(wrap_runs(r, &[(para.to_string(), UI, BODY, 400, Ink::Text)], 16.0, w - 32.0, BODY_H, Some(Fill::User)));
+                }
+                for path in shots.into_iter().take(SHOT_MAX.saturating_sub(shown.len())) {
+                    shown.push(path.clone());
+                    rows.push(shot_row(r, path, 16.0, w - 32.0, Some(Fill::User)));
                 }
             }
             rows.push(spacer(10.0, Some(Fill::User)));
             rows.iter_mut().for_each(|row| row.bar = Some(Ink::Primary));
         }
-        ChatItem::Assistant { text } => rows = markdown(r, text, w),
+        ChatItem::Assistant { text } => rows = markdown(r, text, w, root),
         ChatItem::Thinking { text } => {
             let n = text.lines().filter(|l| !l.trim().is_empty()).count();
             let count = format!("{n} line{}", if n == 1 { "" } else { "s" });
@@ -821,7 +867,7 @@ fn layout(r: &Renderer, item: &ChatItem, w: f32, open: bool, local: bool) -> Lai
                 let px = 30.0 + tw + 12.0;
                 head.insert(2, one(px, first, UI, 12.0, 400, Ink::Faint, (w - cw - 28.0 - px).max(0.0)));
             }
-            rows.push(Row { y: 0.0, h: 28.0, runs: head, fill: None, toggle: true, bar: Some(Ink::Faint) });
+            rows.push(Row { y: 0.0, h: 28.0, runs: head, fill: None, toggle: true, bar: Some(Ink::Faint), shot: None });
             if open {
                 for para in text.lines() {
                     rows.extend(wrap_runs(r, &[(para.to_string(), UI, 12.0, 400, Ink::Dim)], 30.0, w - 44.0, 19.0, None));
@@ -830,7 +876,7 @@ fn layout(r: &Renderer, item: &ChatItem, w: f32, open: bool, local: bool) -> Lai
                 rows.iter_mut().for_each(|row| row.bar = Some(Ink::Faint));
             }
         }
-        ChatItem::Tool { name, kind, target, output, ok, diff, .. } => {
+        ChatItem::Tool { name, kind, target, input, output, ok, diff, .. } => {
             let (mark, mark_ink) = match ok {
                 Some(true) => ("✓", Ink::Add),
                 Some(false) => ("✗", Ink::Bad),
@@ -873,14 +919,20 @@ fn layout(r: &Renderer, item: &ChatItem, w: f32, open: bool, local: bool) -> Lai
             if more {
                 head.push(one(w - 22.0, if open { "▾" } else { "▸" }, UI, 11.0, 400, Ink::Dim, 12.0));
             }
-            rows.push(Row { y: 0.0, h: 32.0, runs: head, fill: Some(Fill::Box), toggle: more, bar: Some(stripe) });
+            rows.push(Row { y: 0.0, h: 32.0, runs: head, fill: Some(Fill::Box), toggle: more, bar: Some(stripe), shot: None });
             // Closed, the first line of what came back, under the target.
             let preview = output.lines().map(str::trim).find(|l| !l.is_empty()).filter(|_| !open && diff.is_empty() && *kind != ToolKind::Read);
             if let Some(first) = preview {
                 let ink = if *ok == Some(false) { Ink::Del } else { Ink::Dim };
                 rows[0].h = 26.0;
-                rows.push(Row { y: 0.0, h: 18.0, runs: vec![one(tx, first, MONO, 11.5, 400, ink, (right - tx).max(40.0))], fill: Some(Fill::Box), toggle: more, bar: Some(stripe) });
-                rows.push(Row { y: 0.0, h: 8.0, runs: Vec::new(), fill: Some(Fill::Box), toggle: more, bar: Some(stripe) });
+                rows.push(Row { y: 0.0, h: 18.0, runs: vec![one(tx, first, MONO, 11.5, 400, ink, (right - tx).max(40.0))], fill: Some(Fill::Box), toggle: more, bar: Some(stripe), shot: None });
+                rows.push(Row { y: 0.0, h: 8.0, runs: Vec::new(), fill: Some(Fill::Box), toggle: more, bar: Some(stripe), shot: None });
+            }
+            // An image the agent looked at (a screenshot it took), shown whether or not it's open.
+            if let Some(path) = root.and_then(|root| read_image(input, target, root)) {
+                let mut row = shot_row(r, path, 34.0, w - 34.0 - 14.0, Some(Fill::Box));
+                row.bar = Some(stripe);
+                rows.push(row);
             }
             if open && more {
                 let x0 = 34.0;
@@ -923,6 +975,7 @@ fn layout(r: &Renderer, item: &ChatItem, w: f32, open: bool, local: bool) -> Lai
                 fill: Some(Fill::Box),
                 toggle: false,
                 bar: None,
+                shot: None,
             });
             rows.push(spacer(12.0, Some(Fill::Progress(done as f32 / items.len().max(1) as f32))));
             for (step, state) in items {
@@ -955,9 +1008,6 @@ fn layout(r: &Renderer, item: &ChatItem, w: f32, open: bool, local: bool) -> Lai
     }
     let mut y = 0.0;
     for row in &mut rows {
-        if local && image_path(&row_text(row)).is_some() {
-            row.h = 266.0;
-        }
         row.y = y;
         y += row.h;
     }
@@ -1337,6 +1387,9 @@ impl App {
             r.text(x, area.y + 18.0, "Loading the conversation…", UI, 12.0, 400, t.text3, w);
             return;
         }
+        let worktree = std::path::PathBuf::from(&task.worktree);
+        // A remote task's images are on its machine, out of reach.
+        let root = (task.machine == 0 && !task.worktree.is_empty()).then_some(worktree.as_path());
         if c.width != w {
             c.width = w;
             c.laid.iter_mut().for_each(|l| *l = None);
@@ -1350,7 +1403,7 @@ impl App {
                 View::Item(i) => {
                     if c.laid[i].is_none() {
                         let open = c.is_open(i);
-                        c.laid[i] = Some(layout(r, &c.items[i], w, open, task.machine == 0));
+                        c.laid[i] = Some(layout(r, &c.items[i], w, open, root));
                     }
                     heights.push(c.laid[i].as_ref().unwrap().h);
                 }
@@ -1364,7 +1417,7 @@ impl App {
             }
         }
         if c.prepended > 0 {
-            let added = prepended_added(r, c, &views, &heights, &gaps, c.prepended, w, task.machine == 0);
+            let added = prepended_added(r, c, &views, &heights, &gaps, c.prepended, w, root);
             c.top = c.top.map(|top| top + added);
             c.prepended = 0;
         }
@@ -1406,12 +1459,12 @@ impl App {
                         let ry = row_y + row.y;
                         let text = row_text(row);
                         if pressed && Rect::new(x, ry, w, row.h).contains(self.mouse)
-                            && (row.toggle || (task.machine == 0 && image_path(&text).is_some())) {
+                            && (row.toggle || row.shot.is_some()) {
                             interactive_press = true;
                         }
                         if ry + row.h < area.y || ry > area.y + area.h
                             || row.toggle || text.is_empty()
-                            || (task.machine == 0 && image_path(&text).is_some()) {
+                            || row.shot.is_some() {
                             continue;
                         }
                         let dy = (self.mouse.1 - self.mouse.1.clamp(ry, ry + row.h)).abs();
@@ -1472,23 +1525,17 @@ impl App {
                                     toggled = Some(i);
                                 }
                             }
-                            let text = row_text(row);
-                            let linked_image = (task.machine == 0).then(|| image_path(&text)).flatten();
-                            if let Some(path) = linked_image.as_ref() {
-                                r.target(band, Cursor::Pointer);
-                                if pressed && band.contains(self.mouse) { image = Some(path.clone()); }
-                            }
-                            if !row.toggle && !text.is_empty() && linked_image.is_none() {
-                                r.target(band, Cursor::Text);
-                            }
-                            if let Some(path) = linked_image.as_ref() {
-                                let preview = Rect::new(x + 14.0, ry + 6.0, (w - 28.0).max(1.0), 232.0);
-                                if !r.image(path, preview) {
-                                    r.text(preview.x, preview.y + 12.0, "Preview unavailable · click to open", UI, 12.0, 400, t.text3, preview.w);
-                                }
-                                let label = path.file_name().unwrap_or_default().to_string_lossy();
-                                r.text(preview.x, ry + 244.0, &label, UI, 11.0, 400, t.text3, preview.w);
+                            if let Some(shot) = &row.shot {
+                                let card = shot_card(row, shot, x, ry, w);
+                                let hover = card.contains(self.mouse) && area.contains(self.mouse) && self.dialog.is_none();
+                                draw_shot(r, t, card, shot, hover);
+                                r.target(card, Cursor::Pointer);
+                                if pressed && card.contains(self.mouse) { image = Some(shot.path.clone()); }
                                 continue;
+                            }
+                            let text = row_text(row);
+                            if !row.toggle && !text.is_empty() {
+                                r.target(band, Cursor::Text);
                             }
                             let mut run_start = 0;
                             for run in &row.runs {
@@ -1828,6 +1875,120 @@ fn image_path(text: &str) -> Option<std::path::PathBuf> {
     (is_image(&path) && path.is_file()).then_some(path)
 }
 
+/// The local images a line of a message points at: markdown image and link targets, code spans
+/// and bare paths, relative ones under `root`. Only files that exist, each once. Link targets and
+/// code spans go whole, as paths like `Application Support/…` have spaces.
+fn image_refs(line: &str, root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found: Vec<std::path::PathBuf> = Vec::new();
+    let mut add = |s: &str| {
+        let s = s.trim().trim_start_matches(['(', '<', '"', '\'']).trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '>', '"', '\'']);
+        let s = s.strip_prefix("file://").unwrap_or(s);
+        if s.is_empty() || !is_image(std::path::Path::new(s)) {
+            return;
+        }
+        let path = match s.strip_prefix("~/") {
+            Some(rest) => std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest),
+            None => root.join(s),
+        };
+        if found.len() < SHOT_MAX && !found.contains(&path) && path.is_file() {
+            found.push(path);
+        }
+    };
+    let mut plain = String::new();
+    let mut rest = line;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("](") {
+            let end = after.find(')').unwrap_or(after.len());
+            // A title after the target: ![alt](path "title").
+            add(after[..end].split(" \"").next().unwrap_or(""));
+            rest = &after[end.min(after.len())..];
+        } else if let Some(after) = rest.strip_prefix('`') {
+            let end = after.find('`').unwrap_or(after.len());
+            add(&after[..end]);
+            rest = after.get(end + 1..).unwrap_or("");
+        } else {
+            let ch = rest.chars().next().unwrap();
+            plain.push(ch);
+            rest = &rest[ch.len_utf8()..];
+            continue;
+        }
+        plain.push(' ');
+    }
+    plain.split_whitespace().for_each(add);
+    found
+}
+
+/// The image file a Read opened, if it opened one: claude's `file_path`, pi's `path`, else the target.
+fn read_image(input: &str, target: &str, root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let parsed: serde_json::Value = serde_json::from_str(input).unwrap_or(serde_json::Value::Null);
+    let path = ["file_path", "path"].iter().find_map(|k| parsed.get(*k).and_then(serde_json::Value::as_str)).unwrap_or(target);
+    let path = root.join(path);
+    (is_image(&path) && path.is_file()).then_some(path)
+}
+
+/// A read of anything but an image: these group into one scrollable window. An image read stands
+/// alone, with its picture.
+fn text_read(item: &ChatItem) -> bool {
+    matches!(item, ChatItem::Tool { kind: ToolKind::Read, target, .. } if !is_image(std::path::Path::new(target)))
+}
+
+/// A line that is nothing but an image, `![alt](path)`: its card stands in for the text.
+fn sole_image(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("![") && line.ends_with(')') && line.matches("](").count() == 1
+}
+
+/// A row holding the card for the image at `path`, from `x`, at most `avail` wide.
+fn shot_row(r: &Renderer, path: std::path::PathBuf, x: f32, avail: f32, fill: Option<Fill>) -> Row {
+    let px = image::image_dimensions(&path).ok().filter(|&(pw, ph)| pw > 0 && ph > 0);
+    let card_max = avail.clamp(1.0, SHOT_MAX_W);
+    let (w, h) = match px {
+        Some((pw, ph)) => {
+            // A retina screenshot shows at its real size, not doubled.
+            let (nw, nh) = (pw as f32 / r.dpi.max(1.0), ph as f32 / r.dpi.max(1.0));
+            let scale = ((card_max - 2.0) / nw).min(SHOT_MAX_H / nh).min(1.0);
+            ((nw * scale).max(1.0).floor(), (nh * scale).max(1.0).floor())
+        }
+        None => (card_max - 2.0, SHOT_EMPTY_H),
+    };
+    let h_row = SHOT_PAD + 1.0 + h + SHOT_CAP + 1.0 + SHOT_PAD;
+    Row { y: 0.0, h: h_row, runs: Vec::new(), fill, toggle: false, bar: None, shot: Some(Shot { path, x, px, w, h }) }
+}
+
+/// The card around a shot, at `(x, ry)` for its row: as wide as the picture, or its caption's least.
+fn shot_card(row: &Row, shot: &Shot, x: f32, ry: f32, w: f32) -> Rect {
+    let cw = (shot.w + 2.0).max(SHOT_MIN_W).min(w - shot.x);
+    Rect::new(x + shot.x, ry + SHOT_PAD, cw, row.h - 2.0 * SHOT_PAD)
+}
+
+/// An image card: the picture on the terminal's ground, with its name, pixel size and "Open"
+/// along a caption bar. Hovered, the frame and "Open" brighten.
+fn draw_shot(r: &mut Renderer, t: &Theme, card: Rect, shot: &Shot, hover: bool) {
+    r.frame(card, 0.0, t.term, if hover { t.text3 } else { t.border2 });
+    let pic = Rect::new(card.x + 1.0 + ((card.w - 2.0 - shot.w) / 2.0).max(0.0).floor(), card.y + 1.0, shot.w, shot.h);
+    if shot.px.is_none() || !r.image(&shot.path, pic) {
+        let msg = "Preview unavailable · click to open";
+        let mw = r.measure(UI, 12.0, 400, msg);
+        r.text(card.x + ((card.w - mw) / 2.0).max(12.0), r.center(Rect::new(0.0, card.y + 1.0, 0.0, shot.h), UI, 12.0), msg, UI, 12.0, 400, t.text3, card.w - 24.0);
+    }
+    let cap = Rect::new(card.x + 1.0, card.y + 1.0 + shot.h, card.w - 2.0, SHOT_CAP);
+    r.rect(cap, 0.0, t.raised);
+    r.rect(Rect::new(cap.x, cap.y, cap.w, 1.0), 0.0, t.border2);
+    let open = "Open ↗";
+    let ow = r.measure(UI, 11.5, 500, open);
+    let right = cap.x + cap.w - 12.0;
+    r.text(right - ow, r.center(cap, UI, 11.5), open, UI, 11.5, 500, if hover { t.text } else { t.text3 }, ow + 2.0);
+    let mut cx = cap.x + 12.0;
+    let room = (right - ow - 16.0 - cx).max(0.0);
+    let name = shot.path.file_name().unwrap_or_default().to_string_lossy();
+    let size = shot.px.map(|(pw, ph)| format!("{pw} × {ph}")).unwrap_or_default();
+    let sw = if size.is_empty() { 0.0 } else { r.measure(UI, 11.5, 400, &size) + 10.0 };
+    cx += r.text(cx, r.center(cap, UI, 12.0), &name, UI, 12.0, 500, t.text, (room - sw).max(room.min(40.0)));
+    if !size.is_empty() && cx + sw <= right - ow - 16.0 {
+        r.text(cx + 10.0, r.center(cap, UI, 11.5), &size, UI, 11.5, 400, t.text3, sw);
+    }
+}
+
 fn open_image(path: &std::path::Path) {
     let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
     let _ = Command::new(program).arg(path).spawn();
@@ -1846,6 +2007,33 @@ mod tests {
         assert!(!is_image(std::path::Path::new("script.sh")));
         std::fs::remove_file(&path).unwrap();
         assert!(image_path(&format!("![image]({})", path.display())).is_none());
+    }
+
+    #[test]
+    fn image_refs_find_links_code_spans_and_bare_paths() {
+        let root = std::env::temp_dir().join(format!("arranger shots {}", std::process::id()));
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let (a, b) = (root.join("assets/after.png"), root.join("before shot.png"));
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+        let abs = b.display().to_string();
+        // Relative paths resolve under the worktree; spaces survive inside links and code spans.
+        assert_eq!(image_refs("Saved to `assets/after.png`.", &root), [a.clone()]);
+        assert_eq!(image_refs(&format!("![shot]({abs})"), &root), [b.clone()]);
+        assert_eq!(image_refs(&format!("before `{abs}`, after assets/after.png."), &root), [b.clone(), a.clone()]);
+        assert_eq!(image_refs("see (assets/after.png) and assets/after.png", &root), [a.clone()]);
+        // Missing files and other kinds are left as text.
+        assert!(image_refs("`assets/missing.png` and `src/main.rs`", &root).is_empty());
+        assert!(sole_image(&format!("  ![shot]({abs})")));
+        assert!(!sole_image(&format!("here: ![shot]({abs})")));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn image_reads_stand_alone_with_their_picture() {
+        let read = |target: &str| ChatItem::Tool { id: "r".into(), name: "Read".into(), kind: ToolKind::Read, target: target.into(), input: String::new(), output: String::new(), ok: Some(true), diff: vec![] };
+        let v = views(&[read("a.rs"), read("shot.png"), read("b.rs"), read("c.rs")], false);
+        assert!(matches!(v[..], [View::Item(0), View::Item(1), View::Reads(2, 2)]));
     }
 
     #[test]
