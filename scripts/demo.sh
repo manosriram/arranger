@@ -21,6 +21,8 @@ cleanup() {
     rm -rf "$demo"
 }
 
+# The fake agents can't plan a worktree setup, so each task skips it. claude runs in a chat (the fake
+# speaks its stream-json); codex in its terminal.
 # shot <theme> <file>: a fresh demo home each time, so both themes show the same screen.
 shot() {
     demo=${DEMO_HOME:-$(mktemp -d)}
@@ -47,18 +49,23 @@ EOF
 
     (repo "$demo/api" src/cache.rs src/http.rs tests/server.rs README.md
      "$bin" new claude "add retry with backoff to the http client" >/dev/null
-     "$bin" new codex "fix the flaky serves_health test" >/dev/null
+     "$bin" new claude "fix the flaky serves_health test" >/dev/null
      "$bin" new gemini "document the config options in the README" >/dev/null
-     "$bin" new claude "shard the cache to cut lock contention" >/dev/null)
+     "$bin" new --terminal codex "shard the cache to cut lock contention" >/dev/null
+     for id in 1 2 3 4; do "$bin" setup $id skip; done)
     (repo "$demo/ml" train.py
-     ARRANGER_HOME=$demo/hosts/gpu-box "$bin" new claude "retrain the ranking model on last week's clicks" >/dev/null)
+     export ARRANGER_HOME=$demo/hosts/gpu-box
+     "$bin" new claude "retrain the ranking model on last week's clicks" >/dev/null
+     "$bin" setup 1 skip)
     (repo "$demo/infra" Dockerfile
-     ARRANGER_HOME=$demo/hosts/staging "$bin" new codex "bump the base image and redeploy staging" >/dev/null)
+     export ARRANGER_HOME=$demo/hosts/staging
+     "$bin" new --terminal codex "bump the base image and redeploy staging" >/dev/null
+     "$bin" setup 1 skip)
     echo '[{"name": "gpu-box", "ssh": "gpu-box", "repo": "~/ml"}, {"name": "staging", "ssh": "staging", "repo": "~/infra"}]' > "$demo/machines.json"
     printf '{"theme": "%s"}' "$1" > "$demo/gui.json"
     sleep 4
 
-    (cd "$demo/api" && ARRANGER_SELECT=2 ARRANGER_SNAPSHOT=$demo/shot.ppm exec "$bin" 2>/dev/null) & local gui=$!
+    (cd "$demo/api" && ARRANGER_SELECT=2 ARRANGER_OPEN_EDIT=1 ARRANGER_SNAPSHOT=$demo/shot.ppm exec "$bin" 2>/dev/null) & local gui=$!
     sleep 6
     kill $gui 2>/dev/null || true
     wait $gui 2>/dev/null || true

@@ -225,7 +225,13 @@ impl ChatView {
     }
 
     fn is_open(&self, i: usize) -> bool {
-        self.open.get(&(self.start + i)).copied().unwrap_or(false)
+        // Dev aid for screenshots (`ARRANGER_OPEN_EDIT` with `ARRANGER_SNAPSHOT`): the latest edit starts open, showing its diff.
+        let latest_edit = || {
+            std::env::var_os("ARRANGER_SNAPSHOT").is_some()
+                && std::env::var_os("ARRANGER_OPEN_EDIT").is_some()
+                && self.items.iter().rposition(|item| matches!(item, ChatItem::Tool { diff, .. } if !diff.is_empty())) == Some(i)
+        };
+        self.open.get(&(self.start + i)).copied().unwrap_or_else(latest_edit)
     }
 
     fn toggle(&mut self, i: usize) {
