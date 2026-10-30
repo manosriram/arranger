@@ -2018,10 +2018,10 @@ mod tests {
         std::fs::write(&b, b"x").unwrap();
         let abs = b.display().to_string();
         // Relative paths resolve under the worktree; spaces survive inside links and code spans.
-        assert_eq!(image_refs("Saved to `assets/after.png`.", &root), [a.clone()]);
-        assert_eq!(image_refs(&format!("![shot]({abs})"), &root), [b.clone()]);
+        assert_eq!(image_refs("Saved to `assets/after.png`.", &root), std::slice::from_ref(&a));
+        assert_eq!(image_refs(&format!("![shot]({abs})"), &root), std::slice::from_ref(&b));
         assert_eq!(image_refs(&format!("before `{abs}`, after assets/after.png."), &root), [b.clone(), a.clone()]);
-        assert_eq!(image_refs("see (assets/after.png) and assets/after.png", &root), [a.clone()]);
+        assert_eq!(image_refs("see (assets/after.png) and assets/after.png", &root), std::slice::from_ref(&a));
         // Missing files and other kinds are left as text.
         assert!(image_refs("`assets/missing.png` and `src/main.rs`", &root).is_empty());
         assert!(sole_image(&format!("  ![shot]({abs})")));
