@@ -4253,8 +4253,10 @@ fn logo(r: &mut Renderer, x: f32, y: f32, size: f32, ink: Rgba, amber: Rgba) {
     r.path(2, &dot(32.0, 45.0, 4.5), None, x, y, size, amber);
 }
 
-/// The agent's coloured glyph centred on `cy`, `size` px square at `x`; returns its width (== size).
-/// Path ids sit in a private range so the atlas never reuses another shape's cached glyph.
+/// The agent's official logo glyph, `size` px tall and vertically centred on `cy`; returns its
+/// width (== size). `r.path` lays a path in a 64-unit box, so the size passed is scaled up to
+/// make the logo's 24-unit viewBox fill `size`. Path ids sit in a private range so the atlas
+/// never reuses another shape's cached glyph.
 fn agent_badge(r: &mut Renderer, agent: &str, x: f32, cy: f32, size: f32) -> f32 {
     let kind = adapter::kind(agent);
     let id = 60 + match kind {
@@ -4264,8 +4266,7 @@ fn agent_badge(r: &mut Renderer, agent: &str, x: f32, cy: f32, size: f32) -> f32
         "gemini" => 3,
         _ => 4,
     };
-    let data = agent_logo(kind);
-    r.path(id, &data, None, x, cy - size / 2.0, size, accent(kind));
+    r.path(id, agent_logo(kind), None, x, cy - size / 2.0, size * 64.0 / 24.0, accent(kind));
     size
 }
 
