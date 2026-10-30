@@ -34,6 +34,12 @@ const STEP_GAP: f32 = 6.0;
 const CHIP_PAD: f32 = 4.0;
 /// Width of the coloured stripe at the left of a card.
 const STRIPE: f32 = 2.0;
+/// Smallest a diagram's monospace shrinks to fit the panel.
+const MIN_CODE: f32 = 9.0;
+/// Room a table cell keeps at each side of its text.
+const CELL_PAD: f32 = 10.0;
+/// Column lines a table draws; columns past these still lay out, unruled.
+const TABLE_COLS: usize = 15;
 
 #[derive(Default)]
 struct Slash {
@@ -77,6 +83,18 @@ enum Fill {
     Rule,
     /// A plan's progress bar, this far done (0 to 1).
     Progress(f32),
+    /// A slice of a table `w` wide: framed at the sides, ruled between columns at `cols` (0 ends
+    /// the list), and at its top or bottom edge if asked. The header sits on a raised band.
+    Table { head: bool, top: bool, bottom: bool, w: f32, cols: [u16; TABLE_COLS] },
+}
+
+/// The inner column lines of a table `total` wide, for `Fill::Table`.
+fn col_mask(cols: &[f32], total: f32) -> [u16; TABLE_COLS] {
+    let mut mask = [0; TABLE_COLS];
+    for (m, &x) in mask.iter_mut().zip(cols.iter().skip(1).filter(|&&x| x < total)) {
+        *m = x as u16;
+    }
+    mask
 }
 
 struct Run {
@@ -319,32 +337,32 @@ fn one(x: f32, text: &str, font: usize, size: f32, weight: u16, ink: Ink, max_w:
     Run { x, text: text.into(), font, size, weight, ink, max_w, chip: false }
 }
 
-/// An agent's markdown: paragraphs, headings, bullets, quotes, rules, fenced code, and bold and
-/// `code` runs.
+/// An agent's markdown: paragraphs, headings, bullets, quotes, rules, fenced code, pipe tables,
+/// ASCII art, and bold and `code` runs.
 fn markdown(r: &Renderer, text: &str, w: f32) -> Vec<Row> {
+    let lines: Vec<&str> = text.lines().collect();
     let mut rows: Vec<Row> = Vec::new();
-    let mut fenced = false;
-    for line in text.lines() {
+    let mut i = 0;
+    while let Some(&line) = lines.get(i) {
         let trimmed = line.trim_start();
         if let Some(lang) = trimmed.strip_prefix("```") {
-            fenced = !fenced;
-            let lang = lang.trim();
-            // The opening fence names the block's language, if it has one.
-            let mut row = spacer(if fenced && !lang.is_empty() { 24.0 } else { 8.0 }, Some(Fill::Code));
-            if fenced && !lang.is_empty() {
-                row.runs.push(one(14.0, lang, UI, 10.5, 600, Ink::Faint, w - 28.0));
-            }
-            row.bar = Some(Ink::Line);
-            rows.push(row);
+            // Still streaming, a block runs to the end of what's come so far.
+            let end = lines[i + 1..].iter().position(|l| l.trim_start().starts_with("```")).map_or(lines.len(), |p| i + 1 + p);
+            rows.extend(code_block(r, Some(lang.trim()).filter(|l| !l.is_empty()), &lines[i + 1..end], w));
+            i = end + 1;
             continue;
         }
-        if fenced {
-            let runs = [(line.replace('\t', "    "), MONO, CODE, 400, Ink::Code)];
-            let mut wrapped = wrap_runs(r, &runs, 14.0, w - 28.0, CODE_H, Some(Fill::Code));
-            wrapped.iter_mut().for_each(|row| row.bar = Some(Ink::Line));
-            rows.extend(wrapped);
+        if let Some(n) = table_len(&lines[i..]) {
+            rows.extend(table(r, &lines[i..i + n], w));
+            i += n;
             continue;
         }
+        if let Some(n) = art_len(&lines[i..]) {
+            rows.extend(code_block(r, None, &lines[i..i + n], w));
+            i += n;
+            continue;
+        }
+        i += 1;
         if trimmed.is_empty() {
             rows.push(spacer(8.0, None));
             continue;
@@ -405,6 +423,207 @@ fn markdown(r: &Renderer, text: &str, w: f32) -> Vec<Row> {
         }
         rows.extend(wrapped);
     }
+    rows
+}
+
+/// A fenced block, or ASCII art outside one, in monospace on its own panel. A diagram too wide
+/// for the panel shrinks to fit rather than wrap, as wrapping would shear its columns; plain code
+/// wraps at the normal size.
+fn code_block(r: &Renderer, lang: Option<&str>, lines: &[&str], w: f32) -> Vec<Row> {
+    let mut head = spacer(if lang.is_some() { 24.0 } else { 8.0 }, Some(Fill::Code));
+    if let Some(lang) = lang {
+        head.runs.push(one(14.0, lang, UI, 10.5, 600, Ink::Faint, w - 28.0));
+    }
+    let mut rows = vec![head];
+    let lines: Vec<String> = lines.iter().map(|l| l.trim_end().replace('\t', "    ")).collect();
+    let avail = w - 28.0;
+    let widest = lines.iter().map(|l| r.measure(MONO, CODE, 400, l)).fold(0.0, f32::max);
+    let size = if widest > avail && lines.iter().any(|l| art_start(l) || ascii_border(l)) {
+        // In half-pixel steps, so resizing the window doesn't rasterize a size per pixel.
+        ((CODE * avail / widest * 2.0).floor() / 2.0).max(MIN_CODE)
+    } else {
+        CODE
+    };
+    let line_h = (CODE_H * size / CODE).round();
+    for line in lines {
+        rows.extend(wrap_runs(r, &[(line, MONO, size, 400, Ink::Code)], 14.0, avail, line_h, Some(Fill::Code)));
+    }
+    rows.push(spacer(8.0, Some(Fill::Code)));
+    rows.iter_mut().for_each(|row| row.bar = Some(Ink::Line));
+    rows
+}
+
+/// Box drawing and block elements, the stuff of diagrams, trees and terminal tables.
+fn is_box(c: char) -> bool {
+    ('\u{2500}'..='\u{259F}').contains(&c)
+}
+
+/// A line that opens ASCII art: two or more box-drawing characters (one could be prose), or an
+/// ASCII table's border.
+fn art_start(line: &str) -> bool {
+    line.chars().filter(|&c| is_box(c)).count() >= 2 || ascii_border(line)
+}
+
+/// `+-----+------+`, `+=====+`: the border of a table drawn in plain ASCII.
+fn ascii_border(line: &str) -> bool {
+    let t = line.trim();
+    t.len() >= 3 && t.starts_with('+') && t.ends_with('+') && t.contains(['-', '=']) && t.chars().all(|c| matches!(c, '+' | '-' | '=' | ':' | ' '))
+}
+
+/// Lines of ASCII art starting at `lines[0]`, if it opens some: on to the last line still drawn
+/// with box characters, arrows or shapes, or between `|` walls.
+fn art_len(lines: &[&str]) -> Option<usize> {
+    if !lines.first().is_some_and(|l| art_start(l)) {
+        return None;
+    }
+    let art = |l: &str| {
+        let t = l.trim();
+        !t.is_empty() && (art_start(l) || t.starts_with(['|', '│', '┃', '║']) || t.chars().any(|c| is_box(c) || ('\u{2190}'..='\u{21FF}').contains(&c) || ('\u{25A0}'..='\u{25FF}').contains(&c)))
+    };
+    Some(1 + lines[1..].iter().take_while(|l| art(l)).count())
+}
+
+/// A pipe table row's cells, outer pipes dropped; `\|` is a pipe inside a cell.
+fn cells(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = if t.ends_with('|') && !t.ends_with("\\|") { &t[..t.len() - 1] } else { t };
+    let mut out = vec![String::new()];
+    let mut chars = t.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'|') => out.last_mut().unwrap().push(chars.next().unwrap()),
+            '|' => out.push(String::new()),
+            _ => out.last_mut().unwrap().push(c),
+        }
+    }
+    out.iter().map(|c| c.trim().to_string()).collect()
+}
+
+/// `| --- | :---: | ---: |`: a pipe table's rule, under its header.
+fn table_rule(line: &str) -> bool {
+    line.contains('|') && line.contains('-') && cells(line).iter().all(|c| {
+        let c = c.strip_prefix(':').unwrap_or(c);
+        let c = c.strip_suffix(':').unwrap_or(c);
+        !c.is_empty() && c.chars().all(|ch| ch == '-')
+    })
+}
+
+/// Lines of the pipe table starting at `lines[0]`, if one does: header, rule, then its rows.
+fn table_len(lines: &[&str]) -> Option<usize> {
+    let [head, rule, ..] = lines else { return None };
+    if !head.contains('|') || !table_rule(rule) || cells(head).len() != cells(rule).len() {
+        return None;
+    }
+    Some(2 + lines[2..].iter().take_while(|l| l.contains('|') && !l.trim().is_empty()).count())
+}
+
+/// Text, font, size, weight and ink: a piece of a line before it wraps.
+type Styled = (String, usize, f32, u16, Ink);
+
+/// A cell's styled runs, as `markdown` styles a paragraph's.
+fn cell_runs(text: &str, head: bool) -> Vec<Styled> {
+    review::spans(text)
+        .into_iter()
+        .filter(|(s, ..)| !s.is_empty())
+        .map(|(s, bold, code)| (s, if code { MONO } else { UI }, if code { BODY - 1.0 } else { BODY }, if bold || head { 600 } else { 400 }, if code { Ink::Code } else { Ink::Text }))
+        .collect()
+}
+
+/// Column widths within `avail`: what each asks for if they all fit; otherwise columns under a
+/// fair share keep theirs and the rest split what's left evenly, wrapping inside.
+fn fit(natural: &[f32], avail: f32) -> Vec<f32> {
+    if natural.iter().sum::<f32>() <= avail {
+        return natural.to_vec();
+    }
+    let mut kept = vec![false; natural.len()];
+    loop {
+        let open = kept.iter().filter(|k| !**k).count();
+        if open == 0 {
+            return natural.to_vec();
+        }
+        let left = avail - natural.iter().zip(&kept).filter(|(_, k)| **k).map(|(w, _)| w).sum::<f32>();
+        let share = left / open as f32;
+        let mut changed = false;
+        for (k, &nw) in natural.iter().enumerate() {
+            if !kept[k] && nw <= share {
+                (kept[k], changed) = (true, true);
+            }
+        }
+        if !changed {
+            return natural.iter().zip(&kept).map(|(&nw, &k)| if k { nw } else { share }).collect();
+        }
+    }
+}
+
+/// A markdown pipe table: a framed grid, its header on a raised band, a hairline between rows and
+/// columns, cells aligned as the rule's colons say.
+fn table(r: &Renderer, lines: &[&str], w: f32) -> Vec<Row> {
+    let align: Vec<char> = cells(lines[1])
+        .iter()
+        .map(|c| match (c.starts_with(':'), c.ends_with(':')) {
+            (true, true) => 'c',
+            (false, true) => 'r',
+            _ => 'l',
+        })
+        .collect();
+    let n = align.len();
+    let grid: Vec<Vec<Vec<Styled>>> = std::iter::once(lines[0])
+        .chain(lines[2..].iter().copied())
+        .enumerate()
+        .map(|(j, line)| {
+            let mut row = cells(line);
+            row.resize(n, String::new());
+            row.iter().map(|c| cell_runs(c, j == 0)).collect()
+        })
+        .collect();
+    let runs_w = |runs: &[Styled]| {
+        runs.iter().map(|(s, f, size, weight, ink)| r.measure(*f, *size, *weight, s) + if *ink == Ink::Code { 2.0 * CHIP_PAD } else { 0.0 }).sum::<f32>()
+    };
+    let natural: Vec<f32> = (0..n).map(|k| grid.iter().map(|row| runs_w(&row[k]).ceil() + 1.0).fold(0.0, f32::max)).collect();
+    let widths = fit(&natural, (w - n as f32 * 2.0 * CELL_PAD).max(n as f32 * 24.0));
+    let mut cols = Vec::with_capacity(n + 1);
+    let mut x = 0.0;
+    for cw in &widths {
+        cols.push(x);
+        x += cw + 2.0 * CELL_PAD;
+    }
+    let total = x.min(w);
+    let mut rows = Vec::new();
+    for (j, cells) in grid.iter().enumerate() {
+        let mut lines: Vec<Vec<Run>> = Vec::new();
+        for (k, runs) in cells.iter().enumerate() {
+            let x0 = cols[k] + CELL_PAD;
+            for (li, mut row) in wrap_runs(r, runs, x0, widths[k], BODY_H, None).into_iter().enumerate() {
+                let used = row.runs.last().map_or(0.0, |run| run.x + r.measure(run.font, run.size, run.weight, &run.text) + if run.chip { CHIP_PAD } else { 0.0 } - x0);
+                let shift = match align[k] {
+                    'r' => widths[k] - used,
+                    'c' => (widths[k] - used) / 2.0,
+                    _ => 0.0,
+                }
+                .max(0.0)
+                .floor();
+                for run in &mut row.runs {
+                    run.x += shift;
+                    run.max_w = run.max_w.min(cols[k] + widths[k] + CELL_PAD - run.x);
+                }
+                if lines.len() <= li {
+                    lines.push(Vec::new());
+                }
+                lines[li].extend(row.runs);
+            }
+        }
+        let head = j == 0;
+        let cell = |top: bool, bottom: bool| Some(Fill::Table { head, top, bottom, w: total, cols: col_mask(&cols, total) });
+        rows.push(spacer(5.0, cell(true, false)));
+        for runs in lines {
+            rows.push(Row { y: 0.0, h: BODY_H, runs, fill: cell(false, false), toggle: false, bar: None });
+        }
+        rows.push(spacer(5.0, cell(false, j + 1 == grid.len())));
+    }
+    // Room between the table and the text around it.
+    rows.insert(0, spacer(6.0, None));
+    rows.push(spacer(6.0, None));
     rows
 }
 
@@ -767,8 +986,8 @@ fn ink(t: &Theme, ink: Ink) -> Rgba {
 fn fill(t: &Theme, f: Fill) -> Rgba {
     let (_, add, _, del) = t.diff();
     match f {
-        Fill::User => t.raised,
-        Fill::Code | Fill::Box | Fill::Rule | Fill::Progress(_) => t.bg,
+        Fill::User | Fill::Table { head: true, .. } => t.raised,
+        Fill::Code | Fill::Box | Fill::Rule | Fill::Progress(_) | Fill::Table { .. } => t.bg,
         Fill::Well => t.term,
         Fill::Add => add,
         Fill::Del => del,
@@ -785,6 +1004,21 @@ fn paint_row(r: &mut Renderer, t: &Theme, x: f32, ry: f32, w: f32, row: &Row) {
             let track = Rect::new(x + 14.0, ry + (row.h - 3.0) / 2.0, w - 28.0, 3.0);
             r.rect(track, 0.0, t.border2);
             r.rect(Rect::new(track.x, track.y, track.w * done.clamp(0.0, 1.0), track.h), 0.0, t.done);
+        }
+        Some(f @ Fill::Table { head, top, bottom, w: tw, cols }) => {
+            let tw = tw.min(w);
+            if head {
+                r.rect(Rect::new(x, ry, tw, row.h), 0.0, fill(t, f));
+            }
+            for cx in std::iter::once(0.0).chain(cols.iter().take_while(|&&c| c > 0).map(|&c| c as f32)).chain([tw - 1.0]) {
+                r.rect(Rect::new(x + cx, ry, 1.0, row.h), 0.0, t.border2);
+            }
+            if top {
+                r.rect(Rect::new(x, ry, tw, 1.0), 0.0, t.border2);
+            }
+            if bottom {
+                r.rect(Rect::new(x, ry + row.h - 1.0, tw, 1.0), 0.0, t.border2);
+            }
         }
         Some(f) => r.rect(Rect::new(x, ry, w, row.h), 0.0, fill(t, f)),
         None => {}
@@ -1606,6 +1840,42 @@ mod tests {
         assert!(!is_image(std::path::Path::new("script.sh")));
         std::fs::remove_file(&path).unwrap();
         assert!(image_path(&format!("![image]({})", path.display())).is_none());
+    }
+
+    #[test]
+    fn pipe_tables_need_a_matching_rule() {
+        assert_eq!(cells("| a | `b\\|c` |  |"), ["a", "`b|c`", ""]);
+        assert_eq!(cells("a | b"), ["a", "b"]);
+        assert!(table_rule("|:---|---:|:-:|"));
+        assert!(!table_rule("| a | b |"));
+        assert!(!table_rule("---"));
+        let doc = ["| Name | Size |", "|------|-----:|", "| a | 1 |", "| b | 2 |", "", "after"];
+        assert_eq!(table_len(&doc), Some(4));
+        assert_eq!(table_len(&["| a | b |", "|---|"]), None);
+        assert_eq!(table_len(&["a | b", "--- | ---", "1 | 2"]), Some(3));
+        assert_eq!(table_len(&["just text", "---"]), None);
+    }
+
+    #[test]
+    fn ascii_art_runs_while_drawn() {
+        let boxed = ["┌──────┐", "│ api  │", "└──┬───┘", "   │", "   ▼", " db", "prose"];
+        assert_eq!(art_len(&boxed), Some(5));
+        let ascii = ["+----+-----+", "| id | name |", "+====+=====+", "| 1  | x    |", "+----+-----+", "Done."];
+        assert_eq!(art_len(&ascii), Some(5));
+        assert_eq!(art_len(&["src/", "├── main.rs", "└── lib.rs"]), None);
+        assert_eq!(art_len(&["├── main.rs", "└── lib.rs", "", "x"]), Some(2));
+        // One stray box character, or a bullet, is prose.
+        assert_eq!(art_len(&["Results ─ all good"]), None);
+        assert_eq!(art_len(&["→ next step"]), None);
+        assert!(!ascii_border("+"));
+        assert!(!ascii_border("+ 1 + 2 +"));
+    }
+
+    #[test]
+    fn columns_fit_narrow_first() {
+        assert_eq!(fit(&[10.0, 20.0], 100.0), [10.0, 20.0]);
+        assert_eq!(fit(&[10.0, 200.0, 300.0], 110.0), [10.0, 50.0, 50.0]);
+        assert_eq!(fit(&[100.0, 100.0], 100.0), [50.0, 50.0]);
     }
 
     #[test]
