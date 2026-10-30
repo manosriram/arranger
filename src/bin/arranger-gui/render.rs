@@ -128,7 +128,8 @@ pub struct Renderer {
     vao: glow::VertexArray,
     vbo: glow::Buffer,
     atlas: glow::Texture,
-    images: HashMap<std::path::PathBuf, Option<(glow::Texture, u32, u32)>>,
+    /// Decoded images by path, with the file stamp they were decoded from.
+    images: HashMap<std::path::PathBuf, (Option<FileStamp>, Option<(glow::Texture, u32, u32)>)>,
     screen_loc: Option<glow::UniformLocation>,
     verts: Vec<Vertex>,
     scaler: ScaleContext,
@@ -436,13 +437,23 @@ impl Renderer {
     }
 
     /// Draw a local image inside a bounding box, preserving its aspect ratio.
-    /// Failed decodes are cached too, so invalid attachments do not retry every frame.
+    /// Failed decodes are cached too, so invalid attachments do not retry every frame. A file
+    /// rewritten in place (a re-rendered screenshot) is decoded again.
     pub fn image(&mut self, path: &std::path::Path, bounds: Rect) -> bool {
+        let stamp = file_stamp(path);
+        if let Some((old, entry)) = self.images.get(path)
+            && *old != stamp {
+            if let Some((texture, _, _)) = *entry {
+                self.flush();
+                unsafe { self.gl.delete_texture(texture); }
+            }
+            self.images.remove(path);
+        }
         if !self.images.contains_key(path) {
             // Bound GPU memory when browsing long conversations.
             if self.images.len() >= 64 {
                 self.flush();
-                for (_, entry) in self.images.drain() {
+                for (_, (_, entry)) in self.images.drain() {
                     if let Some((texture, _, _)) = entry {
                         unsafe { self.gl.delete_texture(texture); }
                     }
@@ -470,9 +481,9 @@ impl Renderer {
                     Some((texture, w, h))
                 }
             })();
-            self.images.insert(path.to_path_buf(), loaded);
+            self.images.insert(path.to_path_buf(), (stamp, loaded));
         }
-        let Some((texture, w, h)) = self.images[path] else { return false };
+        let Some((texture, w, h)) = self.images[path].1 else { return false };
         let scale = (bounds.w / w as f32).min(bounds.h / h as f32).min(1.0);
         self.flush();
         let atlas = self.atlas;
@@ -666,6 +677,14 @@ impl Renderer {
     }
 }
 
+/// When a file was last written and how big it is: what says a cached decode is stale.
+type FileStamp = (std::time::SystemTime, u64);
+
+fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,5 +694,19 @@ mod tests {
         for ch in ['■', '●', '○', '✓', '›', '↵', '→', '─', '│', '❯', '⏺', '✳', '⎿', '…', '⌘', '⇧'] {
             println!("{ch} ui={} mono={}", Renderer::has_glyph(UI, ch), Renderer::has_glyph(MONO, ch));
         }
+    }
+
+    #[test]
+    fn rewriting_an_image_changes_its_stamp() {
+        let dir = std::env::temp_dir().join(format!("arranger-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shot.png");
+        assert_eq!(file_stamp(&path), None, "a missing file has no stamp");
+        std::fs::write(&path, b"first").unwrap();
+        let first = file_stamp(&path).unwrap();
+        assert_eq!(file_stamp(&path), Some(first), "unchanged, the cached decode stays");
+        std::fs::write(&path, b"second, longer").unwrap();
+        assert_ne!(file_stamp(&path), Some(first), "rewritten in place, it's decoded again");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
