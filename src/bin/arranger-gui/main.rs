@@ -195,8 +195,6 @@ struct Dialog {
     model: usize,
     /// Index into the agent's `efforts`; 0 is its default.
     effort: usize,
-    /// Runs in a chat (headless) or a terminal; None is the agent's default.
-    chat: Option<bool>,
     host: usize,
     /// Repo on the chosen machine.
     repo: String,
@@ -221,7 +219,7 @@ impl Dialog {
     fn chat_view(&self) -> bool {
         match &self.clone {
             Some(c) => c.headless,
-            None => headless::supported(self.agent()) && self.chat.unwrap_or_else(|| headless::default_on(self.agent())),
+            None => headless::supported(self.agent()),
         }
     }
 }
@@ -273,8 +271,6 @@ enum Action {
     PickModel(usize),
     /// The next of the dialog agent's reasoning efforts.
     PickEffort,
-    /// The new task in a chat (true) or a terminal.
-    PickView(bool),
     Start,
     CloseDialog,
     OpenReview,
@@ -2100,7 +2096,7 @@ impl App {
     fn open_dialog(&mut self) {
         // Starts on the selected task's machine.
         let host = self.current().map_or(0, |t| t.machine);
-        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_layout: Default::default(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model: 0, effort: 0, chat: None, host: 0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: None });
+        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_layout: Default::default(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model: 0, effort: 0, host: 0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: None });
         self.pick_host(host);
         self.focus = Focus::Prompt;
         self.anchor = None;
@@ -2113,7 +2109,7 @@ impl App {
         let agent = adapter::kind(&t.agent).to_string();
         let model = connected_models(&agent, &self.hosts[key.0].limits).iter().position(|m| m.1 == t.model).unwrap_or(0);
         let clone = CloneFrom { key, agent, branch: t.branch.clone(), first: t.title.clone(), last: String::new(), model: Some(t.model.clone()), effort: t.effort.clone(), headless: t.headless };
-        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_layout: Default::default(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model, effort: 0, chat: None, host: key.0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: Some(clone) });
+        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_layout: Default::default(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model, effort: 0, host: key.0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: Some(clone) });
         self.focus = Focus::Prompt;
         self.anchor = None;
         self.spawn_request(key.0, Tag::LastPrompt(key), Request::Events { id: key.1 });
@@ -2270,12 +2266,6 @@ impl App {
             } else {
                 Action::PickAgent(usize::MAX)
             });
-            return;
-        }
-        // Ctrl+T: the new task in a chat or a terminal.
-        if let (Some(d), true, Key::Character(c)) = (self.dialog.as_ref(), m.control_key() && !app_mod(m), &ev.logical_key)
-            && c.eq_ignore_ascii_case("t") && d.clone.is_none() {
-            self.actions.push(Action::PickView(!d.chat_view()));
             return;
         }
         if app_mod(m) {
@@ -2761,11 +2751,6 @@ impl App {
                 Action::PickEffort => {
                     if let Some(d) = self.dialog.as_mut().filter(|d| d.clone.is_none()) {
                         d.effort = (d.effort + 1) % efforts(d.agent()).len();
-                    }
-                }
-                Action::PickView(chat) => {
-                    if let Some(d) = self.dialog.as_mut().filter(|d| d.clone.is_none() && headless::supported(d.agent())) {
-                        d.chat = Some(chat);
                     }
                 }
                 Action::Start => self.start(),
@@ -3763,7 +3748,7 @@ impl App {
         if completion_click.is_some() { self.click = None; }
         let Some(d) = &self.dialog else { return };
         let (prompt, agent_i, model_i, base, error) = (d.prompt.clone(), d.agent, d.model, d.base.clone(), d.error.clone());
-        let (effort_i, chat_view, effort_kept) = (d.effort, d.chat_view(), d.clone.as_ref().map(|c| c.effort.clone()));
+        let (effort_i, effort_kept) = (d.effort, d.clone.as_ref().map(|c| c.effort.clone()));
         let (branches, list) = (d.branches.clone(), d.list);
         // Cloning: (task id, agent, branch, first prompt, last prompt, its model until another's picked).
         let clone = d.clone.as_ref().map(|c| (c.key.1, c.agent.clone(), c.branch.clone(), c.first.clone(), c.last.clone(), c.model.clone()));
@@ -4011,22 +3996,8 @@ impl App {
         let start_label = if clone.is_some() { "Clone" } else { "Start agent" };
         let sw = r.measure(UI, 13.0, 600, start_label) + 28.0;
         let start = Rect::new(sb.x - sw, sb.y, sw, sb.h);
-        // Where it runs, left of Start: [chat | terminal]. A clone runs as its source does.
-        let mut left = start.x - 10.0;
-        if clone.is_none() && headless::supported(agent) {
-            for (label, chat) in [("terminal", false), ("chat", true)] {
-                let lw = r.measure(UI, 12.5, 500, label) + 20.0;
-                let seg = Rect::new(left - lw, start.y + 4.0, lw, start.h - 8.0);
-                let on = chat == chat_view;
-                r.frame(seg, 0.0, if on { t.raised } else { t.dialog }, if on { t.border2 } else { t.border });
-                r.text(seg.x + 10.0, r.center(seg, UI, 12.5), label, UI, 12.5, 500, if on { t.text } else { t.text3 }, lw);
-                if !on && self.hit(r, seg) {
-                    self.actions.push(Action::PickView(chat));
-                }
-                left = seg.x + 1.0; // the two share an edge
-            }
-            left -= 11.0;
-        }
+        // Where it runs, left of Start. A clone runs as its source does.
+        let left = start.x - 10.0;
         let ready = clone.is_some() || !prompt.trim().is_empty();
         r.rect(start, 0.0, if ready { t.primary_bg } else { alpha(t.primary_bg, 0x80) });
         r.text(start.x + 14.0, r.center(start, UI, 13.0), start_label, UI, 13.0, 600, t.primary_fg, sw);
@@ -4040,7 +4011,7 @@ impl App {
             let hints: &[(&str, &str)] = if clone.is_some() {
                 &[("↵", "clone"), ("↑", "its prompts"), ("tab", "model"), ("esc", "close")]
             } else {
-                &[("↵", "start"), ("tab", "agent"), ("ctrl+tab", "model"), ("alt+tab", "effort"), ("ctrl+t", "chat/terminal"), ("esc", "close")]
+                &[("↵", "start"), ("tab", "agent"), ("ctrl+tab", "model"), ("alt+tab", "effort"), ("esc", "close")]
             };
             for &(key, what) in hints {
                 let kw = r.measure(MONO, 12.0, 500, key);
