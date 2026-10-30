@@ -1764,12 +1764,13 @@ impl App {
             if self.hit(r, button) { open_image(path); }
             ix += width + 6.0;
         }
-        let send = Rect::new(b.x + b.w - send_w - 6.0, b.y + b.h - 34.0, send_w, 28.0);
+        let send = Rect::new(b.x + b.w - send_w - 6.0, b.y + (b.h - 28.0) / 2.0, send_w, 28.0);
         let stopping = task.headless && matches!(group(&task.state), 0 | 1);
         let ready = stopping || !draft.trim().is_empty();
         let label = if stopping { "■ Stop" } else { "Send ↵" };
         r.rect(send, 4.0, if ready { t.primary_bg } else { t.raised });
-        r.text(send.x + 12.0, r.center(send, UI, 12.0), label, UI, 12.0, 600, if ready { t.primary_fg } else { t.text3 }, send_w);
+        let label_w = r.measure(UI, 12.0, 600, label);
+        r.text(send.x + (send.w - label_w) / 2.0, r.center(send, UI, 12.0), label, UI, 12.0, 600, if ready { t.primary_fg } else { t.text3 }, send_w);
         if ready && self.hit(r, send) {
             if stopping {
                 self.interrupt_chat();
