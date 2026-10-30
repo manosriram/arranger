@@ -3357,21 +3357,9 @@ impl App {
         r.rect(Rect::new(area.x, area.y + HEADER_H - 1.0, area.w, 1.0), 0.0, t.border);
         let top = Rect::new(area.x, area.y + 8.0, area.w, 28.0);
         let kind = adapter::kind(&task.agent);
-        let review_label = "Review";
-        let review_key = mod_label("R");
-        let bw = r.measure(UI, 12.0, 500, review_label) + r.measure(MONO, 10.5, 400, &review_key) + 30.0;
-        let review = Rect::new(head.x + head.w - 16.0 - bw, top.y, bw, 28.0);
-        let can = self.reviewable();
-        let fg = if can { t.text2 } else { alpha(t.text3, 120) };
-        r.frame(review, 4.0, t.bg, if can { t.border2 } else { t.border });
-        let rlw = r.text(review.x + 12.0, r.center(review, UI, 12.0), review_label, UI, 12.0, 500, fg, bw);
-        r.text(review.x + 18.0 + rlw, r.center(review, MONO, 10.5), &review_key, MONO, 10.5, 400, alpha(fg, 160), 60.0);
-        if can && self.hit(r, review) {
-            self.actions.push(Action::OpenReview);
-        }
-        // Secondary actions live in the same menu as a task's right-click actions.
+        // More is the far-right button; Review sits to its left.
         let key = (task.machine, task.id);
-        let more = Rect::new(review.x - 86.0, top.y, 78.0, 28.0);
+        let more = Rect::new(head.x + head.w - 16.0 - 78.0, top.y, 78.0, 28.0);
         let open = self.task_menu.is_some_and(|(k, _)| k == key);
         r.frame(more, 4.0, if open { t.raised } else { t.bg }, t.border2);
         r.text(more.x + 10.0, r.center(more, UI, 12.0), "More", UI, 12.0, 500, t.text2, 38.0);
@@ -3381,6 +3369,18 @@ impl App {
         if self.hit(r, more) {
             self.task_menu = Some((key, (more.x, more.y + more.h + 6.0)));
             self.click = None;
+        }
+        let review_label = "Review";
+        let review_key = mod_label("R");
+        let bw = r.measure(UI, 12.0, 500, review_label) + r.measure(MONO, 10.5, 400, &review_key) + 30.0;
+        let review = Rect::new(more.x - 8.0 - bw, top.y, bw, 28.0);
+        let can = self.reviewable();
+        let fg = if can { t.text2 } else { alpha(t.text3, 120) };
+        r.frame(review, 4.0, t.bg, if can { t.border2 } else { t.border });
+        let rlw = r.text(review.x + 12.0, r.center(review, UI, 12.0), review_label, UI, 12.0, 500, fg, bw);
+        r.text(review.x + 18.0 + rlw, r.center(review, MONO, 10.5), &review_key, MONO, 10.5, 400, alpha(fg, 160), 60.0);
+        if can && self.hit(r, review) {
+            self.actions.push(Action::OpenReview);
         }
         let tx = area.x + 20.0;
         let name = title(&task);
