@@ -3236,10 +3236,9 @@ impl App {
         ship_badge(r, t, &task.shipped, text_x + room - bw + 6.0, top.y + top.h / 2.0);
         if !dense {
             let sub = Rect::new(text_x, top.y + titles.len() as f32 * 18.0 + 2.0, row.w - 38.0, 16.0);
-            let cy = r.center(sub, UI, 11.5);
-            let bw = agent_badge(r, &task.agent, sub.x, cy, 12.0);
+            let bw = agent_badge(r, &task.agent, sub.x, sub.y + sub.h / 2.0, 12.0);
             let txt = machine.map_or_else(|| line.clone(), |m| format!("{m} · {line}"));
-            r.text(sub.x + bw + 5.0, cy, &txt, UI, 11.5, 400, sc, sub.w - bw - 5.0);
+            r.text(sub.x + bw + 5.0, r.center(sub, UI, 11.5), &txt, UI, 11.5, 400, sc, sub.w - bw - 5.0);
         }
         self.hit(r, hit_row)
     }
@@ -3266,10 +3265,9 @@ impl App {
             r.text(text_x, r.center(top, UI, 13.0) + i as f32 * 18.0, title, UI, 13.0, 500, t.text, card.w - 38.0);
         }
         let meta = Rect::new(text_x, top.y + titles.len() as f32 * 18.0, card.w - 38.0, 16.0);
-        let cy = r.center(meta, UI, 11.5);
-        let bw = agent_badge(r, &task.agent, meta.x, cy, 12.0);
+        let bw = agent_badge(r, &task.agent, meta.x, meta.y + meta.h / 2.0, 12.0);
         let host = machine.unwrap_or("");
-        r.text(meta.x + bw + 5.0, cy, host, UI, 11.5, 400, t.text3, meta.w - bw - 5.0);
+        r.text(meta.x + bw + 5.0, r.center(meta, UI, 11.5), host, UI, 11.5, 400, t.text3, meta.w - bw - 5.0);
         let ask = Rect::new(text_x, meta.y + meta.h, card.w - 38.0, 20.0);
         let expanded = self.expanded_request == Some(key);
         if expanded {
