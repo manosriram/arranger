@@ -7,7 +7,10 @@ use alacritty_terminal::{
 use std::{
     io,
     process::Command,
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -31,16 +34,70 @@ pub fn watch() -> (mpsc::Receiver<Vec<PlanLimit>>, mpsc::SyncSender<()>) {
     (rx, refresh)
 }
 
+/// A fresh directory for every probe, including concurrent probes and stale crash leftovers.
+struct ProbeDir(std::path::PathBuf);
+
+impl ProbeDir {
+    fn new() -> io::Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let path = std::env::temp_dir().join(format!(
+                "arranger-usage-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl Drop for ProbeDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+fn screen_text(screen: &Screen) -> String {
+    let grid = screen.grid();
+    (0..grid.screen_lines())
+        .map(|r| {
+            (0..grid.columns())
+                .map(|c| grid[Line(r as i32)][Column(c)].c)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Only navigate a recognized trust dialog, and derive direction from its selection.
+fn trust_keys(text: &str) -> Option<&'static [u8]> {
+    let lines: Vec<_> = text.lines().collect();
+    let yes = lines
+        .iter()
+        .position(|l| l.contains("Yes, I trust this folder"))?;
+    let no = lines.iter().position(|l| l.contains("No, exit"))?;
+    if lines[yes].contains('❯') {
+        Some(b"\r")
+    } else if lines[no].contains('❯') {
+        Some(if yes < no { b"\x1b[A" } else { b"\x1b[B" })
+    } else {
+        None
+    }
+}
+
 fn collect() -> io::Result<Vec<PlanLimit>> {
     // Outside any repository, with project settings and MCP servers disabled.
-    let dir = std::env::temp_dir().join(format!("arranger-usage-{}", std::process::id()));
-    std::fs::create_dir(&dir)?;
+    let dir = ProbeDir::new()?;
     let result = (|| {
         let mut cmd = Command::new("claude");
         for key in crate::adapter::PARENT_SESSION_ENV {
             cmd.env_remove(key);
         }
-        cmd.current_dir(&dir).env("TERM", "xterm-256color").args([
+        cmd.current_dir(&dir.0).env("TERM", "xterm-256color").args([
             "--setting-sources",
             "user",
             "--strict-mcp-config",
@@ -54,9 +111,8 @@ fn collect() -> io::Result<Vec<PlanLimit>> {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut last_change = Instant::now();
         let mut limits = Vec::new();
-        let mut trusted = false;
-        let mut trust_due = None;
-        let mut confirm_due = None;
+        let mut trust_action = None;
+        let mut trust_pending = None;
         while Instant::now() < deadline {
             let mut buf = [0; 32768];
             match rustix::io::read(&p.master, &mut buf) {
@@ -66,37 +122,36 @@ fn collect() -> io::Result<Vec<PlanLimit>> {
                     if !replies.is_empty() {
                         let _ = rustix::io::write(&p.master, &replies);
                     }
-                    let grid = screen.grid();
-                    let text = (0..grid.screen_lines())
-                        .map(|r| {
-                            (0..grid.columns())
-                                .map(|c| grid[Line(r as i32)][Column(c)].c)
-                                .collect::<String>()
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    limits = parse(&text);
-                    // This is the empty folder we just created, never a user's repository.
-                    if !trusted
-                        && text.contains("❯ No, exit")
-                        && text.contains("Yes, I trust this folder")
+                    let text = screen_text(&screen);
+                    let next = parse(&text);
+                    // Cursor motion, spinners and terminal queries do not change usage.
+                    if next
+                        .iter()
+                        .map(|l| (&l.window, l.used, &l.status))
+                        .ne(limits
+                            .iter()
+                            .map(|l: &PlanLimit| (&l.window, l.used, &l.status)))
                     {
-                        trust_due = Some(Instant::now() + Duration::from_millis(750));
-                        trusted = true;
+                        last_change = Instant::now();
+                        limits = next;
                     }
-                    last_change = Instant::now();
+                    // This is our fresh empty folder, never a user's repository.
+                    let keys = trust_keys(&text);
+                    if keys != trust_pending.map(|(keys, _)| keys) {
+                        trust_pending = keys.map(|keys| (keys, Instant::now()));
+                    }
                 }
-                Err(rustix::io::Errno::AGAIN) => {}
+                Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {}
                 Err(_) => break,
             }
-            if trust_due.is_some_and(|due| Instant::now() >= due) {
-                let _ = rustix::io::write(&p.master, b"\x1b[B");
-                trust_due = None;
-                confirm_due = Some(Instant::now() + Duration::from_millis(250));
-            }
-            if confirm_due.is_some_and(|due| Instant::now() >= due) {
-                let _ = rustix::io::write(&p.master, b"\r");
-                confirm_due = None;
+            // Let the dialog install its input handler before navigating. Confirm only
+            // after a subsequent frame visibly selects the affirmative option.
+            if let Some((keys, since)) = trust_pending
+                && since.elapsed() >= Duration::from_millis(750)
+                && trust_action != Some(keys)
+            {
+                rustix::io::write(&p.master, keys)?;
+                trust_action = Some(keys);
             }
             if !limits.is_empty() && last_change.elapsed() > Duration::from_secs(2) {
                 break;
@@ -122,27 +177,24 @@ fn collect() -> io::Result<Vec<PlanLimit>> {
         }
         Ok(limits)
     })();
-    let _ = std::fs::remove_dir(&dir);
     result
 }
 
 /// pi's `--list-models` table: one row per model whose provider has usable credentials.
 fn collect_pi() -> io::Result<Vec<PlanLimit>> {
-    let dir = std::env::temp_dir().join(format!("arranger-usage-{}", std::process::id()));
-    std::fs::create_dir(&dir)?;
+    let dir = ProbeDir::new()?;
     let result = (|| {
         let mut cmd = Command::new("pi");
         for key in crate::adapter::PARENT_SESSION_ENV {
             cmd.env_remove(key);
         }
-        cmd.current_dir(&dir).arg("--list-models");
+        cmd.current_dir(&dir.0).arg("--list-models");
         let out = cmd.output()?;
         if !out.status.success() {
             return Ok(Vec::new());
         }
         Ok(parse_pi(&String::from_utf8_lossy(&out.stdout)))
     })();
-    let _ = std::fs::remove_dir(&dir);
     result
 }
 
@@ -169,20 +221,28 @@ fn parse(text: &str) -> Vec<PlanLimit> {
     let mut limits = Vec::new();
     let mut window = None;
     for line in text.lines() {
-        let line = line.trim();
+        let line = line
+            .trim()
+            .trim_matches(|c: char| matches!(c, '│' | '┃' | '║'))
+            .trim();
         let lower = line.to_lowercase();
-        if lower.starts_with("current session") {
+        if lower == "current session" || lower.starts_with("current session ") {
             window = Some("5h".to_string());
-        } else if lower.starts_with("current week") {
+        } else if lower == "current week" || lower.starts_with("current week ") {
             window = Some(match line.find('(') {
                 Some(i) if lower[i..].contains("all models") => "week".to_string(),
                 Some(i) => format!("week {}", line[i..].to_lowercase().replace(" only", "")),
                 None => "week".to_string(),
             });
+        } else if lower.starts_with("resets") || lower.starts_with("extra usage") {
+            window = None;
         }
-        if let Some(i) = lower.find("% used") {
+        if let Some(i) = lower
+            .find('%')
+            .filter(|&i| lower[i + 1..].trim_start().starts_with("used"))
+        {
             let number = lower[..i]
-                .rsplit(|c: char| !c.is_ascii_digit() && c != '.')
+                .rsplit(|c: char| !c.is_ascii_digit() && c != '.' && c != '-' && c != '+')
                 .next()
                 .unwrap_or("");
             if let (Some(window), Ok(used)) = (window.take(), number.parse::<f64>())
@@ -196,6 +256,11 @@ fn parse(text: &str) -> Vec<PlanLimit> {
                 });
             }
         }
+    }
+    // A newly drawn heading without its percentage is an incomplete frame. Do not
+    // let a previously drawn window make the collector finish during loading.
+    if window.is_some() {
+        return Vec::new();
     }
     // In the API-billed CLI the Usage tab contains only session totals; its billing
     // banner can already have scrolled off the screen when the tab finishes drawing.
@@ -217,6 +282,69 @@ fn parse(text: &str) -> Vec<PlanLimit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reads_terminal_redraws_and_decorated_sections() {
+        let mut screen = Screen::new(120, 80);
+        // An incomplete draw must not leave the old percentage on screen.
+        screen.feed(b"Current session\r\n42% used");
+        assert_eq!(parse(&screen_text(&screen))[0].used, Some(42.0));
+        let redraw = "\x1b[2J\x1b[H│ Current session │\r\n│ \x1b[32m12.5%   used\x1b[0m │\r\n│ Resets 4pm │\r\n│ Current week (all models) │\r\n│ 81% used │";
+        // Exercise escape sequences and UTF-8 split across arbitrary read boundaries.
+        for byte in redraw.as_bytes() {
+            screen.feed(&[*byte]);
+        }
+        let limits = parse(&screen_text(&screen));
+        assert_eq!(
+            limits
+                .iter()
+                .map(|l| (l.window.as_str(), l.used))
+                .collect::<Vec<_>>(),
+            vec![("5h", Some(12.5)), ("week", Some(81.0))]
+        );
+        screen.feed(b"\x1b[2J\x1b[HLoading usage...");
+        assert!(parse(&screen_text(&screen)).is_empty());
+    }
+
+    #[test]
+    fn unrelated_sections_cannot_supply_a_missing_percentage() {
+        assert!(parse("Current session\nResets 4pm\nExtra usage\n42% used").is_empty());
+        assert!(parse("Current session\n-5% used").is_empty());
+        assert!(parse("Current session\nNaN% used").is_empty());
+        assert!(
+            parse("Current session\n42% used\nCurrent week (all models)\nLoading...").is_empty()
+        );
+        assert_eq!(parse("Current session\n100% used")[0].used, Some(100.0));
+    }
+
+    #[test]
+    fn trust_navigation_follows_the_selected_option() {
+        assert_eq!(
+            trust_keys("Yes, I trust this folder\n❯ No, exit"),
+            Some(&b"\x1b[A"[..])
+        );
+        assert_eq!(
+            trust_keys("❯ No, exit\nYes, I trust this folder"),
+            Some(&b"\x1b[B"[..])
+        );
+        assert_eq!(
+            trust_keys("❯ Yes, I trust this folder\nNo, exit"),
+            Some(&b"\r"[..])
+        );
+        assert_eq!(trust_keys("Yes, I trust this folder\nNo, exit"), None);
+        assert_eq!(trust_keys("❯ Yes, proceed"), None);
+    }
+
+    #[test]
+    fn probe_directories_are_unique_and_removed_on_drop() {
+        let a = ProbeDir::new().unwrap();
+        let b = ProbeDir::new().unwrap();
+        assert_ne!(a.0, b.0);
+        let path = a.0.clone();
+        drop(a);
+        assert!(!path.exists());
+        assert!(b.0.is_dir());
+    }
+
     #[test]
     #[ignore = "launches the installed Claude CLI"]
     fn installed_cli_usage() {
