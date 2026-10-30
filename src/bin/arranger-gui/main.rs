@@ -3210,7 +3210,10 @@ impl App {
             r.rect(row, 0.0, t.sel);
         }
         self.icon(r, t, task, row.x + 8.0, top.y + top.h / 2.0);
-        let text_x = row.x + 30.0;
+        let mut text_x = row.x + 30.0;
+        if dense {
+            text_x += agent_badge(r, &task.agent, text_x, top.y + top.h / 2.0, 12.0) + 5.0;
+        }
         let sc = match g {
             0 => t.needs,
             4 => t.faint,
@@ -3228,7 +3231,7 @@ impl App {
             r.text(row.x + row.w - rw, r.center(top, UI, 10.5), &status, UI, 10.5, 400, sc, rw - 10.0);
         }
         let tc = if g == 4 { t.text3 } else if on { t.tc_on } else { t.tc };
-        let room = row.w - 38.0 - rw;
+        let room = row.x + row.w - 8.0 - text_x - rw;
         let bw = if task.shipped.is_empty() { 0.0 } else { r.measure(UI, 10.5, 500, &format!("✓ {}", task.shipped)) + 16.0 };
         for (i, title) in titles.iter().enumerate() {
             r.text(text_x, r.center(top, UI, 13.0) + i as f32 * 18.0, title, UI, 13.0, 500, tc, room - bw);
