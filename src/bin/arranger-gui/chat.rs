@@ -26,6 +26,14 @@ const READ_BAR_H: f32 = 22.0;
 const READ_VIEW_MAX: f32 = 320.0;
 /// Scrollbar gutter on the right of a read window.
 const READ_BAR_W: f32 = 8.0;
+/// Height of the agent's header over each of its turns.
+const TURN_H: f32 = 28.0;
+/// Between tool cards back to back, tighter than `GAP` so a turn's steps read as one group.
+const STEP_GAP: f32 = 6.0;
+/// Room a chip of inline code takes at each side of its text.
+const CHIP_PAD: f32 = 4.0;
+/// Width of the coloured stripe at the left of a card.
+const STRIPE: f32 = 2.0;
 
 #[derive(Default)]
 struct Slash {
@@ -49,6 +57,10 @@ enum Ink {
     Add,
     Del,
     Bad,
+    /// Borders: a code block's stripe.
+    Line,
+    /// The user's own stripe.
+    Primary,
     Kind(ToolKind),
 }
 
@@ -59,6 +71,12 @@ enum Fill {
     Add,
     Del,
     Box,
+    /// A tool's output, sunk into its card.
+    Well,
+    /// A horizontal rule across the row's middle.
+    Rule,
+    /// A plan's progress bar, this far done (0 to 1).
+    Progress(f32),
 }
 
 struct Run {
@@ -69,6 +87,8 @@ struct Run {
     weight: u16,
     ink: Ink,
     max_w: f32,
+    /// Inline code: drawn on a chip.
+    chip: bool,
 }
 
 struct Row {
@@ -78,6 +98,8 @@ struct Row {
     fill: Option<Fill>,
     /// Clicking it opens or closes the item's details.
     toggle: bool,
+    /// A stripe down the left edge, in this ink.
+    bar: Option<Ink>,
 }
 
 struct Laid {
@@ -85,11 +107,13 @@ struct Laid {
     h: f32,
 }
 
-/// One item drawn on its own, or a run of consecutive reads drawn as one scrollable window.
+/// One item drawn on its own, a run of consecutive reads drawn as one scrollable window, or the
+/// agent's header over the turn that starts at an item.
 #[derive(Clone, Copy)]
 enum View {
     Item(usize),
     Reads(usize, usize),
+    Turn(usize),
 }
 
 /// The scrollable content of a run of back-to-back reads, in window-local coordinates.
@@ -211,25 +235,42 @@ impl ChatView {
 }
 
 /// Greedy word wrap of styled runs into rows `line_h` high from `x0`, `w` wide. A word wider than
-/// a line breaks between characters.
+/// a line breaks between characters. Words of one run that land on one row stay one run, so an
+/// inline code chip covers its spaces too. Inline code (code ink on an unfilled row) goes on a chip,
+/// with room kept clear on both sides of it.
 fn wrap_runs(r: &Renderer, runs: &[(String, usize, f32, u16, Ink)], x0: f32, w: f32, line_h: f32, fill: Option<Fill>) -> Vec<Row> {
-    let mut rows = vec![Row { y: 0.0, h: line_h, runs: Vec::new(), fill, toggle: false }];
+    let mut rows = vec![Row { y: 0.0, h: line_h, runs: Vec::new(), fill, toggle: false, bar: None }];
     let mut x = x0;
-    for (text, font, size, weight, ink) in runs {
+    // The run (by index into `runs`) and word the current row's last piece came from.
+    let mut from: Option<(usize, usize)> = None;
+    for (k, (text, font, size, weight, ink)) in runs.iter().enumerate() {
         let space = r.advance(*font, *size, *weight, ' ');
+        let chip = *ink == Ink::Code && fill.is_none();
+        // A new piece of this run steps in past a chip's edge: its own, or the one before it.
+        let edge = |row: &Row, from: Option<(usize, usize)>| {
+            if from.is_some_and(|(fk, _)| fk == k) {
+                return 0.0;
+            }
+            let mut pad = if chip { CHIP_PAD } else { 0.0 };
+            if row.runs.last().is_some_and(|run| run.chip) {
+                pad += CHIP_PAD;
+            }
+            pad
+        };
         for (i, word) in text.split(' ').enumerate() {
             if i > 0 {
                 x += space;
             }
             let mut word = word.to_string();
             loop {
+                let pad = edge(rows.last().unwrap(), from);
                 let ww = r.measure(*font, *size, *weight, &word);
-                if x + ww <= x0 + w || word.is_empty() {
+                if x + pad + ww <= x0 + w || word.is_empty() {
                     break;
                 }
                 if x > x0 {
-                    rows.push(Row { y: 0.0, h: line_h, runs: Vec::new(), fill, toggle: false });
-                    x = x0;
+                    rows.push(Row { y: 0.0, h: line_h, runs: Vec::new(), fill, toggle: false, bar: None });
+                    (x, from) = (x0, None);
                     continue;
                 }
                 // Alone on its line and still too wide: as much as fits, the rest on the next.
@@ -244,13 +285,25 @@ fn wrap_runs(r: &Renderer, runs: &[(String, usize, f32, u16, Ink)], x0: f32, w: 
                     cut = j + ch.len_utf8();
                 }
                 let rest = word.split_off(cut);
-                rows.last_mut().unwrap().runs.push(Run { x, text: word, font: *font, size: *size, weight: *weight, ink: *ink, max_w: w });
-                rows.push(Row { y: 0.0, h: line_h, runs: Vec::new(), fill, toggle: false });
-                (x, word) = (x0, rest);
+                x += pad;
+                rows.last_mut().unwrap().runs.push(Run { x, text: word, font: *font, size: *size, weight: *weight, ink: *ink, max_w: w, chip });
+                rows.push(Row { y: 0.0, h: line_h, runs: Vec::new(), fill, toggle: false, bar: None });
+                (x, word, from) = (x0, rest, None);
             }
             if !word.is_empty() {
                 let ww = r.measure(*font, *size, *weight, &word);
-                rows.last_mut().unwrap().runs.push(Run { x, text: word, font: *font, size: *size, weight: *weight, ink: *ink, max_w: ww + 1.0 });
+                x += edge(rows.last().unwrap(), from);
+                let row = rows.last_mut().unwrap();
+                match (row.runs.last_mut(), from) {
+                    (Some(prev), Some((fk, fi))) if fk == k => {
+                        // As many spaces as the layout advanced past.
+                        prev.text.push_str(&" ".repeat(i - fi));
+                        prev.text.push_str(&word);
+                        prev.max_w = x + ww - prev.x + 1.0;
+                    }
+                    _ => row.runs.push(Run { x, text: word, font: *font, size: *size, weight: *weight, ink: *ink, max_w: ww + 1.0, chip }),
+                }
+                from = Some((k, i));
                 x += ww;
             }
         }
@@ -259,27 +312,37 @@ fn wrap_runs(r: &Renderer, runs: &[(String, usize, f32, u16, Ink)], x0: f32, w: 
 }
 
 fn spacer(h: f32, fill: Option<Fill>) -> Row {
-    Row { y: 0.0, h, runs: Vec::new(), fill, toggle: false }
+    Row { y: 0.0, h, runs: Vec::new(), fill, toggle: false, bar: None }
 }
 
 fn one(x: f32, text: &str, font: usize, size: f32, weight: u16, ink: Ink, max_w: f32) -> Run {
-    Run { x, text: text.into(), font, size, weight, ink, max_w }
+    Run { x, text: text.into(), font, size, weight, ink, max_w, chip: false }
 }
 
-/// An agent's markdown: paragraphs, headings, bullets, fenced code, and bold and `code` runs.
+/// An agent's markdown: paragraphs, headings, bullets, quotes, rules, fenced code, and bold and
+/// `code` runs.
 fn markdown(r: &Renderer, text: &str, w: f32) -> Vec<Row> {
-    let mut rows = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
     let mut fenced = false;
     for line in text.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
+        if let Some(lang) = trimmed.strip_prefix("```") {
             fenced = !fenced;
-            rows.push(spacer(6.0, Some(Fill::Code)));
+            let lang = lang.trim();
+            // The opening fence names the block's language, if it has one.
+            let mut row = spacer(if fenced && !lang.is_empty() { 24.0 } else { 8.0 }, Some(Fill::Code));
+            if fenced && !lang.is_empty() {
+                row.runs.push(one(14.0, lang, UI, 10.5, 600, Ink::Faint, w - 28.0));
+            }
+            row.bar = Some(Ink::Line);
+            rows.push(row);
             continue;
         }
         if fenced {
             let runs = [(line.replace('\t', "    "), MONO, CODE, 400, Ink::Code)];
-            rows.extend(wrap_runs(r, &runs, 12.0, w - 24.0, CODE_H, Some(Fill::Code)));
+            let mut wrapped = wrap_runs(r, &runs, 14.0, w - 28.0, CODE_H, Some(Fill::Code));
+            wrapped.iter_mut().for_each(|row| row.bar = Some(Ink::Line));
+            rows.extend(wrapped);
             continue;
         }
         if trimmed.is_empty() {
@@ -287,13 +350,21 @@ fn markdown(r: &Renderer, text: &str, w: f32) -> Vec<Row> {
             continue;
         }
         if image_path(trimmed).is_some() {
-            rows.push(Row { y: 0.0, h: 26.0, runs: vec![one(0.0, trimmed, UI, BODY, 400, Ink::Text, w)], fill: Some(Fill::Box), toggle: false });
+            rows.push(Row { y: 0.0, h: 26.0, runs: vec![one(0.0, trimmed, UI, BODY, 400, Ink::Text, w)], fill: Some(Fill::Box), toggle: false, bar: None });
             continue;
         }
-        let heading = trimmed.starts_with('#');
+        if trimmed.trim_end().len() >= 3 && ['-', '*', '_'].iter().any(|&c| trimmed.trim_end().chars().all(|ch| ch == c)) {
+            rows.push(spacer(17.0, Some(Fill::Rule)));
+            continue;
+        }
+        let level = trimmed.chars().take_while(|&c| c == '#').count();
+        let heading = level > 0 && trimmed[level..].starts_with(' ');
+        let quote = trimmed.strip_prefix('>').map(str::trim_start);
         let ordered = trimmed.split_once(". ").filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
         let (marker, body) = if heading {
-            (None, trimmed.trim_start_matches('#').trim_start())
+            (None, trimmed[level..].trim_start())
+        } else if let Some(q) = quote {
+            (None, q)
         } else if let Some(b) = ["- ", "* ", "+ "].iter().find_map(|m| trimmed.strip_prefix(m)) {
             (Some("•".to_string()), b)
         } else if let Some((n, b)) = ordered {
@@ -301,20 +372,35 @@ fn markdown(r: &Renderer, text: &str, w: f32) -> Vec<Row> {
         } else {
             (None, trimmed)
         };
-        let lead = (line.len() - trimmed.len()) as f32 * 4.0;
+        let (size, line_h) = match (heading, level) {
+            (true, 1) => (18.0, 28.0),
+            (true, 2) => (16.0, 25.0),
+            (true, _) => (14.0, 22.0),
+            _ => (BODY, BODY_H),
+        };
+        let lead = (line.len() - trimmed.len()) as f32 * 4.0 + if quote.is_some() { 14.0 } else { 0.0 };
         let indent = lead + if marker.is_some() { 20.0 } else { 0.0 };
+        let base = if quote.is_some() { Ink::Text2 } else { Ink::Text };
         let runs: Vec<_> = review::spans(body)
             .into_iter()
             .map(|(s, bold, code)| {
-                let ink = if code { Ink::Code } else { Ink::Text };
-                (s, if code { MONO } else { UI }, BODY, if bold || heading { 600 } else { 400 }, ink)
+                let ink = if code { Ink::Code } else { base };
+                let size = if code { size - 1.0 } else { size };
+                (s, if code { MONO } else { UI }, size, if bold || heading { 600 } else { 400 }, ink)
             })
             .collect();
-        let mut wrapped = wrap_runs(r, &runs, indent, w - indent, BODY_H, None);
+        let mut wrapped = wrap_runs(r, &runs, indent, w - indent, line_h, None);
+        if quote.is_some() {
+            wrapped.iter_mut().for_each(|row| row.bar = Some(Ink::Dim));
+        }
         if let Some(m) = marker {
             wrapped[0].runs.insert(0, one(lead, &m, UI, BODY, 400, Ink::Dim, 20.0));
         }
         if heading {
+            // Room above a heading that follows text, and a little below it.
+            if rows.last().is_some_and(|row| !row.runs.is_empty()) {
+                rows.push(spacer(8.0, None));
+            }
             wrapped.last_mut().unwrap().h += 4.0;
         }
         rows.extend(wrapped);
@@ -335,10 +421,14 @@ fn tool_verb(kind: ToolKind, name: &str) -> String {
 }
 
 /// Consecutive reads become one scrollable window; anything else, and a lone read, stays as-is.
-fn views(items: &[ChatItem]) -> Vec<View> {
+/// Each turn of the agent's opens with its header. `at_start`: `items[0]` begins the conversation.
+fn views(items: &[ChatItem], at_start: bool) -> Vec<View> {
     let mut views = Vec::new();
     let mut i = 0;
     while i < items.len() {
+        if turn_starts(items, i, at_start) {
+            views.push(View::Turn(i));
+        }
         if matches!(items[i], ChatItem::Tool { kind: ToolKind::Read, .. }) {
             let mut j = i;
             while j < items.len() && matches!(items[j], ChatItem::Tool { kind: ToolKind::Read, .. }) {
@@ -362,19 +452,25 @@ fn read_window_h(content_h: f32) -> f32 {
 
 /// Height the items an older page just put in front add above the old viewport. A read run that
 /// the join merged contributes only its growth, not its whole window again.
-fn prepended_added(r: &Renderer, c: &ChatView, views: &[View], heights: &[f32], prepended: usize, w: f32, local: bool) -> f32 {
+fn prepended_added(r: &Renderer, c: &ChatView, views: &[View], heights: &[f32], gaps: &[f32], prepended: usize, w: f32, local: bool) -> f32 {
     let mut added = 0.0;
     for (v, view) in views.iter().enumerate() {
         match *view {
             View::Item(i) => {
                 if i < prepended {
-                    added += heights[v] + GAP;
+                    added += heights[v] + gaps[v];
+                }
+            }
+            // A header at the join is new too: the item before it only just arrived.
+            View::Turn(i) => {
+                if i <= prepended {
+                    added += heights[v] + gaps[v];
                 }
             }
             View::Reads(start, len) => {
                 let end = start + len;
                 if end <= prepended {
-                    added += heights[v] + GAP;
+                    added += heights[v] + gaps[v];
                 } else if start < prepended {
                     // The run used to begin at `prepended`; the prepended reads only grew it.
                     let old = &c.items[prepended..end];
@@ -400,9 +496,7 @@ fn intersect(a: Rect, b: Rect) -> Rect {
 }
 
 fn draw_row(r: &mut Renderer, t: &Theme, x: f32, ry: f32, w: f32, row: &Row) {
-    if let Some(f) = row.fill {
-        r.rect(Rect::new(x, ry, w, row.h), 0.0, fill(t, f));
-    }
+    paint_row(r, t, x, ry, w, row);
     for run in &row.runs {
         let ty = r.center(Rect::new(0.0, ry, 0.0, row.h), run.font, run.size);
         r.text(x + run.x, ty, &run.text, run.font, run.size, run.weight, ink(t, run.ink), run.max_w);
@@ -454,6 +548,7 @@ fn read_win_layout(r: &Renderer, items: &[ChatItem], w: f32) -> ReadWin {
             ],
             fill: None,
             toggle: false,
+            bar: None,
         });
         let summary = read_summary(input, output, *ok);
         let ink = if *ok == Some(false) { Ink::Del } else { Ink::Dim };
@@ -463,6 +558,7 @@ fn read_win_layout(r: &Renderer, items: &[ChatItem], w: f32) -> ReadWin {
             runs: vec![one(x0 + 8.0, &summary, UI, CODE, 400, ink, (w - x0 - right - 8.0).max(40.0))],
             fill: Some(Fill::Box),
             toggle: false,
+            bar: None,
         });
         rows.push(spacer(8.0, Some(Fill::Box)));
     }
@@ -478,30 +574,41 @@ fn layout(r: &Renderer, item: &ChatItem, w: f32, open: bool, local: bool) -> Lai
     let mut rows = Vec::new();
     match item {
         ChatItem::User { text } => {
-            rows.push(spacer(8.0, Some(Fill::User)));
-            rows.push(Row { y: 0.0, h: 18.0, runs: vec![one(14.0, "YOU", UI, 10.5, 600, Ink::Dim, 60.0)], fill: Some(Fill::User), toggle: false });
+            rows.push(spacer(10.0, Some(Fill::User)));
+            rows.push(Row { y: 0.0, h: 20.0, runs: vec![one(16.0, "You", UI, 11.5, 600, Ink::Dim, 60.0)], fill: Some(Fill::User), toggle: false, bar: None });
             for para in text.lines() {
                 if image_path(para).is_some() {
-                    rows.push(Row { y: 0.0, h: 26.0, runs: vec![one(14.0, para, UI, BODY, 400, Ink::Text, w - 28.0)], fill: Some(Fill::User), toggle: false });
+                    rows.push(Row { y: 0.0, h: 26.0, runs: vec![one(16.0, para, UI, BODY, 400, Ink::Text, w - 32.0)], fill: Some(Fill::User), toggle: false, bar: None });
                 } else {
-                    rows.extend(wrap_runs(r, &[(para.to_string(), UI, BODY, 400, Ink::Text)], 14.0, w - 28.0, BODY_H, Some(Fill::User)));
+                    rows.extend(wrap_runs(r, &[(para.to_string(), UI, BODY, 400, Ink::Text)], 16.0, w - 32.0, BODY_H, Some(Fill::User)));
                 }
             }
-            rows.push(spacer(8.0, Some(Fill::User)));
+            rows.push(spacer(10.0, Some(Fill::User)));
+            rows.iter_mut().for_each(|row| row.bar = Some(Ink::Primary));
         }
         ChatItem::Assistant { text } => rows = markdown(r, text, w),
         ChatItem::Thinking { text } => {
             let n = text.lines().filter(|l| !l.trim().is_empty()).count();
-            let head = vec![
-                one(0.0, if open { "▾" } else { "▸" }, UI, 12.0, 400, Ink::Dim, 14.0),
-                one(18.0, "Thinking", UI, 12.0, 400, Ink::Dim, 100.0),
-                one(104.0, &format!("{n} line{}", if n == 1 { "" } else { "s" }), UI, 12.0, 400, Ink::Faint, 120.0),
+            let count = format!("{n} line{}", if n == 1 { "" } else { "s" });
+            let cw = r.measure(UI, 11.5, 400, &count);
+            let tw = r.measure(UI, 12.0, 500, "Thinking");
+            let mut head = vec![
+                one(14.0, if open { "▾" } else { "▸" }, UI, 11.0, 400, Ink::Dim, 14.0),
+                one(30.0, "Thinking", UI, 12.0, 500, Ink::Dim, tw + 1.0),
+                one(w - cw - 14.0, &count, UI, 11.5, 400, Ink::Faint, cw + 1.0),
             ];
-            rows.push(Row { y: 0.0, h: 22.0, runs: head, fill: None, toggle: true });
+            // Closed, its first line, so a glance says what it was about.
+            if let Some(first) = text.lines().map(str::trim).find(|l| !l.is_empty()).filter(|_| !open) {
+                let px = 30.0 + tw + 12.0;
+                head.insert(2, one(px, first, UI, 12.0, 400, Ink::Faint, (w - cw - 28.0 - px).max(0.0)));
+            }
+            rows.push(Row { y: 0.0, h: 28.0, runs: head, fill: None, toggle: true, bar: Some(Ink::Faint) });
             if open {
                 for para in text.lines() {
-                    rows.extend(wrap_runs(r, &[(para.to_string(), UI, 12.0, 400, Ink::Dim)], 18.0, w - 18.0, 19.0, None));
+                    rows.extend(wrap_runs(r, &[(para.to_string(), UI, 12.0, 400, Ink::Dim)], 30.0, w - 44.0, 19.0, None));
                 }
+                rows.push(spacer(8.0, None));
+                rows.iter_mut().for_each(|row| row.bar = Some(Ink::Faint));
             }
         }
         ChatItem::Tool { name, kind, target, output, ok, diff, .. } => {
@@ -510,38 +617,55 @@ fn layout(r: &Renderer, item: &ChatItem, w: f32, open: bool, local: bool) -> Lai
                 Some(false) => ("✗", Ink::Bad),
                 None => ("…", Ink::Dim),
             };
+            let stripe = if *ok == Some(false) { Ink::Bad } else { Ink::Kind(*kind) };
             let (adds, dels) = (diff.iter().filter(|l| l.kind == '+').count(), diff.iter().filter(|l| l.kind == '-').count());
             let lines = output.lines().count();
-            let meta = if !diff.is_empty() {
-                format!("+{adds} −{dels}")
+            // At the right: what an edit changed, or how much came back.
+            let meta: Vec<(String, Ink)> = if !diff.is_empty() {
+                vec![(format!("+{adds}"), Ink::Add), (format!("−{dels}"), Ink::Del)]
             } else if ok.is_none() {
-                "running".into()
+                vec![("running".into(), Ink::Dim)]
             } else if lines > 0 {
-                format!("{lines} line{}", if lines == 1 { "" } else { "s" })
+                vec![(format!("{lines} line{}", if lines == 1 { "" } else { "s" }), Ink::Dim)]
             } else {
-                String::new()
+                Vec::new()
             };
             let more = !diff.is_empty() || !output.trim().is_empty();
-            let mw = r.measure(UI, 11.5, 400, &meta);
             let target = if target.is_empty() { name.as_str() } else { target.as_str() };
             // A long tool name (an MCP tool's) pushes the target over, up to a third of the line.
             let verb = tool_verb(*kind, name);
-            let vw = r.measure(UI, 12.5, 500, &verb).min(w / 3.0);
-            let tx = (20.0 + vw + 10.0).max(96.0);
-            let mut head = vec![
-                one(0.0, mark, UI, 12.5, 600, mark_ink, 14.0),
-                one(20.0, &verb, UI, 12.5, 500, Ink::Kind(*kind), vw + 1.0),
-                one(tx, target, MONO, 12.5, 400, Ink::Text, (w - tx - mw - 40.0).max(40.0)),
-                one(w - mw - 22.0, &meta, UI, 11.5, 400, Ink::Dim, mw + 1.0),
-            ];
-            if more {
-                head.push(one(w - 10.0, if open { "▾" } else { "▸" }, UI, 11.0, 400, Ink::Faint, 12.0));
+            let vw = r.measure(UI, 12.5, 600, &verb).min(w / 3.0);
+            let tx = (34.0 + vw + 12.0).max(100.0);
+            let right = w - if more { 32.0 } else { 14.0 };
+            let mut mx = right;
+            let mut meta_runs = Vec::new();
+            for (text, ink) in meta.iter().rev() {
+                let mw = r.measure(UI, 11.5, 500, text);
+                mx -= mw;
+                meta_runs.insert(0, one(mx, text, UI, 11.5, 500, *ink, mw + 1.0));
+                mx -= 6.0;
             }
-            rows.push(Row { y: 0.0, h: 24.0, runs: head, fill: None, toggle: more });
+            let mut head = vec![
+                one(14.0, mark, UI, 12.5, 600, mark_ink, 14.0),
+                one(34.0, &verb, UI, 12.5, 600, Ink::Kind(*kind), vw + 1.0),
+                one(tx, target, MONO, 12.5, 400, Ink::Text, (mx - tx - 12.0).max(40.0)),
+            ];
+            head.extend(meta_runs);
+            if more {
+                head.push(one(w - 22.0, if open { "▾" } else { "▸" }, UI, 11.0, 400, Ink::Dim, 12.0));
+            }
+            rows.push(Row { y: 0.0, h: 32.0, runs: head, fill: Some(Fill::Box), toggle: more, bar: Some(stripe) });
+            // Closed, the first line of what came back, under the target.
+            let preview = output.lines().map(str::trim).find(|l| !l.is_empty()).filter(|_| !open && diff.is_empty() && *kind != ToolKind::Read);
+            if let Some(first) = preview {
+                let ink = if *ok == Some(false) { Ink::Del } else { Ink::Dim };
+                rows[0].h = 26.0;
+                rows.push(Row { y: 0.0, h: 18.0, runs: vec![one(tx, first, MONO, 11.5, 400, ink, (right - tx).max(40.0))], fill: Some(Fill::Box), toggle: more, bar: Some(stripe) });
+                rows.push(Row { y: 0.0, h: 8.0, runs: Vec::new(), fill: Some(Fill::Box), toggle: more, bar: Some(stripe) });
+            }
             if open && more {
-                let x0 = 22.0;
-                rows.push(spacer(4.0, None));
-                rows.push(Row { y: 0.0, h: 6.0, runs: Vec::new(), fill: Some(Fill::Box), toggle: false });
+                let x0 = 34.0;
+                rows.push(spacer(8.0, Some(Fill::Well)));
                 let body: Vec<(String, Ink, Fill)> = if !diff.is_empty() {
                     diff.iter()
                         .take(MAX_LINES)
@@ -549,44 +673,65 @@ fn layout(r: &Renderer, item: &ChatItem, w: f32, open: bool, local: bool) -> Lai
                             let (ink, fill) = match l.kind {
                                 '+' => (Ink::Add, Fill::Add),
                                 '-' => (Ink::Del, Fill::Del),
-                                _ => (Ink::Text2, Fill::Box),
+                                _ => (Ink::Text2, Fill::Well),
                             };
                             (format!("{} {}", l.kind, l.text.trim_end_matches(['\n', '\r'])), ink, fill)
                         })
                         .collect()
                 } else {
-                    output.lines().take(MAX_LINES).map(|l| (l.to_string(), if *ok == Some(false) { Ink::Del } else { Ink::Text2 }, Fill::Box)).collect()
+                    output.lines().take(MAX_LINES).map(|l| (l.to_string(), if *ok == Some(false) { Ink::Del } else { Ink::Text2 }, Fill::Well)).collect()
                 };
                 for (text, ink, fill) in body {
-                    let mut wrapped = wrap_runs(r, &[(text.replace('\t', "    "), MONO, CODE, 400, ink)], x0 + 12.0, w - x0 - 24.0, CODE_H, Some(fill));
+                    let mut wrapped = wrap_runs(r, &[(text.replace('\t', "    "), MONO, CODE, 400, ink)], x0, w - x0 - 14.0, CODE_H, Some(fill));
                     for row in &mut wrapped {
-                        row.runs.iter_mut().for_each(|run| run.x = run.x.max(x0 + 12.0));
+                        row.runs.iter_mut().for_each(|run| run.x = run.x.max(x0));
                     }
                     rows.extend(wrapped);
                 }
-                rows.push(Row { y: 0.0, h: 6.0, runs: Vec::new(), fill: Some(Fill::Box), toggle: false });
+                rows.push(spacer(8.0, Some(Fill::Well)));
+                rows.iter_mut().for_each(|row| row.bar = Some(stripe));
             }
         }
         ChatItem::Todos { items } => {
-            rows.push(spacer(8.0, Some(Fill::Box)));
-            rows.push(Row { y: 0.0, h: 18.0, runs: vec![one(12.0, "PLAN", UI, 10.5, 600, Ink::Dim, 60.0)], fill: Some(Fill::Box), toggle: false });
+            let done = items.iter().filter(|(_, s)| s == "completed").count();
+            let progress = format!("{done} of {} done", items.len());
+            let pw = r.measure(UI, 11.5, 500, &progress);
+            rows.push(spacer(10.0, Some(Fill::Box)));
+            rows.push(Row {
+                y: 0.0,
+                h: 20.0,
+                runs: vec![one(14.0, "Plan", UI, 12.0, 600, Ink::Text, 60.0), one(w - pw - 14.0, &progress, UI, 11.5, 500, Ink::Dim, pw + 1.0)],
+                fill: Some(Fill::Box),
+                toggle: false,
+                bar: None,
+            });
+            rows.push(spacer(12.0, Some(Fill::Progress(done as f32 / items.len().max(1) as f32))));
             for (step, state) in items {
-                let (mark, ink) = match state.as_str() {
-                    "completed" => ("✓", Ink::Dim),
-                    "in_progress" => ("›", Ink::Text),
-                    _ => ("·", Ink::Faint),
+                let (mark, mark_ink, ink, weight) = match state.as_str() {
+                    "completed" => ("✓", Ink::Add, Ink::Dim, 400),
+                    "in_progress" => ("›", Ink::Kind(ToolKind::Read), Ink::Text, 600),
+                    _ => ("○", Ink::Faint, Ink::Text2, 400),
                 };
-                let mut wrapped = wrap_runs(r, &[(step.clone(), UI, 12.5, 400, ink)], 34.0, w - 46.0, 20.0, Some(Fill::Box));
-                wrapped[0].runs.insert(0, one(12.0, mark, UI, 12.5, 600, ink, 16.0));
+                let mut wrapped = wrap_runs(r, &[(step.clone(), UI, 12.5, weight, ink)], 36.0, w - 50.0, 22.0, Some(Fill::Box));
+                wrapped[0].runs.insert(0, one(14.0, mark, UI, 12.5, 600, mark_ink, 16.0));
                 rows.extend(wrapped);
             }
-            rows.push(spacer(8.0, Some(Fill::Box)));
+            rows.push(spacer(10.0, Some(Fill::Box)));
+            rows.iter_mut().for_each(|row| row.bar = Some(Ink::Kind(ToolKind::Read)));
         }
         ChatItem::Notice { text, error } => {
             let (mark, ink) = if *error { ("!", Ink::Bad) } else { ("·", Ink::Dim) };
-            let mut wrapped = wrap_runs(r, &[(text.clone(), UI, 12.0, 400, ink)], 16.0, w - 16.0, 19.0, None);
-            wrapped[0].runs.insert(0, one(0.0, mark, UI, 12.0, 600, ink, 12.0));
-            rows.extend(wrapped);
+            let (x0, fill) = if *error { (34.0, Some(Fill::Del)) } else { (16.0, None) };
+            let mut wrapped = wrap_runs(r, &[(text.clone(), UI, 12.0, if *error { 500 } else { 400 }, ink)], x0, w - x0 - 14.0, 20.0, fill);
+            wrapped[0].runs.insert(0, one(x0 - 16.0, mark, UI, 12.0, 700, ink, 12.0));
+            if *error {
+                rows.push(spacer(7.0, fill));
+                rows.extend(wrapped);
+                rows.push(spacer(7.0, fill));
+                rows.iter_mut().for_each(|row| row.bar = Some(Ink::Bad));
+            } else {
+                rows.extend(wrapped);
+            }
         }
     }
     let mut y = 0.0;
@@ -610,6 +755,8 @@ fn ink(t: &Theme, ink: Ink) -> Rgba {
         Ink::Code => t.tc,
         Ink::Add => add,
         Ink::Del | Ink::Bad => del,
+        Ink::Line => t.border2,
+        Ink::Primary => t.primary_bg,
         Ink::Kind(ToolKind::Edit) => t.needs,
         Ink::Kind(ToolKind::Bash) => accent("pi"),
         Ink::Kind(ToolKind::Other) => t.text2,
@@ -621,10 +768,85 @@ fn fill(t: &Theme, f: Fill) -> Rgba {
     let (_, add, _, del) = t.diff();
     match f {
         Fill::User => t.raised,
-        Fill::Code | Fill::Box => t.bg,
+        Fill::Code | Fill::Box | Fill::Rule | Fill::Progress(_) => t.bg,
+        Fill::Well => t.term,
         Fill::Add => add,
         Fill::Del => del,
     }
+}
+
+/// A row's background: its fill (a rule or a progress bar draws instead), its stripe, and the
+/// chips under inline code.
+fn paint_row(r: &mut Renderer, t: &Theme, x: f32, ry: f32, w: f32, row: &Row) {
+    match row.fill {
+        Some(Fill::Rule) => r.rect(Rect::new(x, ry + (row.h / 2.0).floor(), w, 1.0), 0.0, t.border2),
+        Some(Fill::Progress(done)) => {
+            r.rect(Rect::new(x, ry, w, row.h), 0.0, fill(t, Fill::Box));
+            let track = Rect::new(x + 14.0, ry + (row.h - 3.0) / 2.0, w - 28.0, 3.0);
+            r.rect(track, 0.0, t.border2);
+            r.rect(Rect::new(track.x, track.y, track.w * done.clamp(0.0, 1.0), track.h), 0.0, t.done);
+        }
+        Some(f) => r.rect(Rect::new(x, ry, w, row.h), 0.0, fill(t, f)),
+        None => {}
+    }
+    if let Some(bar) = row.bar {
+        r.rect(Rect::new(x, ry, STRIPE, row.h), 0.0, ink(t, bar));
+    }
+    for run in row.runs.iter().filter(|run| run.chip) {
+        let tw = r.measure(run.font, run.size, run.weight, &run.text).min(run.max_w);
+        let ch = (run.size * 1.55).min(row.h).round();
+        r.rect(Rect::new(x + run.x - CHIP_PAD, ry + ((row.h - ch) / 2.0).round(), tw + 2.0 * CHIP_PAD, ch), 0.0, t.raised);
+    }
+}
+
+/// Starts a turn: the item after what the user sent, or the first one there is.
+fn turn_starts(items: &[ChatItem], i: usize, at_start: bool) -> bool {
+    !matches!(items[i], ChatItem::User { .. }) && if i == 0 { at_start } else { matches!(items[i - 1], ChatItem::User { .. }) }
+}
+
+/// What a turn (the items up to the next thing the user sent) did, for its header:
+/// "2 reads · 1 edit · 1 command · 1 failed".
+fn turn_stats(items: &[ChatItem]) -> String {
+    let mut counts = [0usize; 6];
+    let mut failed = 0;
+    for item in items.iter().take_while(|item| !matches!(item, ChatItem::User { .. })) {
+        if let ChatItem::Tool { kind, ok, .. } = item {
+            counts[*kind as usize] += 1;
+            failed += usize::from(*ok == Some(false));
+        }
+    }
+    // In ToolKind's order: Edit, Read, Bash, Search, Web, Other.
+    let names = [("edit", "edits"), ("read", "reads"), ("command", "commands"), ("search", "searches"), ("fetch", "fetches"), ("tool", "tools")];
+    let order = [1, 3, 0, 2, 4, 5];
+    let mut parts: Vec<String> = order
+        .iter()
+        .filter(|&&k| counts[k] > 0)
+        .map(|&k| format!("{} {}", counts[k], if counts[k] == 1 { names[k].0 } else { names[k].1 }))
+        .collect();
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    parts.join(" · ")
+}
+
+fn is_step(items: &[ChatItem], view: View) -> bool {
+    match view {
+        View::Reads(..) => true,
+        View::Item(i) => matches!(items[i], ChatItem::Tool { .. }),
+        View::Turn(_) => false,
+    }
+}
+
+/// Space under each view: tight between tool cards and under a turn's header.
+fn gaps(items: &[ChatItem], views: &[View]) -> Vec<f32> {
+    (0..views.len())
+        .map(|v| match (views[v], views.get(v + 1)) {
+            (_, None) => 0.0,
+            (View::Turn(_), _) => 4.0,
+            (a, Some(&b)) if is_step(items, a) && is_step(items, b) => STEP_GAP,
+            _ => GAP,
+        })
+        .collect()
 }
 
 impl App {
@@ -866,7 +1088,10 @@ impl App {
         if task.state == "running" {
             let cy = bottom - 16.0;
             self.icon(r, t, task, x + 6.0, cy);
-            let line = if task.action.is_empty() { "working".to_string() } else { task.action.clone() };
+            let mut line = if task.action.is_empty() { "working".to_string() } else { task.action.clone() };
+            if task.since != 0 {
+                line = format!("{line} · {}", ago(task.since));
+            }
             r.text(x + 24.0, cy - 8.0, &line, UI, 12.0, 400, t.text3, w - 24.0);
             bottom -= 30.0;
         }
@@ -883,7 +1108,8 @@ impl App {
             c.laid.iter_mut().for_each(|l| *l = None);
             c.read_win.iter_mut().for_each(|l| *l = None);
         }
-        let views = views(&c.items);
+        let views = views(&c.items, c.start == 0);
+        let gaps = gaps(&c.items, &views);
         let mut heights: Vec<f32> = Vec::with_capacity(views.len());
         for view in &views {
             match *view {
@@ -900,14 +1126,15 @@ impl App {
                     }
                     heights.push(read_window_h(c.read_win[start].as_ref().unwrap().content_h));
                 }
+                View::Turn(_) => heights.push(TURN_H),
             }
         }
         if c.prepended > 0 {
-            let added = prepended_added(r, c, &views, &heights, c.prepended, w, task.machine == 0);
+            let added = prepended_added(r, c, &views, &heights, &gaps, c.prepended, w, task.machine == 0);
             c.top = c.top.map(|top| top + added);
             c.prepended = 0;
         }
-        let total = 18.0 + heights.iter().sum::<f32>() + GAP * heights.len().saturating_sub(1) as f32 + 18.0;
+        let total = 18.0 + heights.iter().sum::<f32>() + gaps.iter().sum::<f32>() + 18.0;
         c.max_top = (total - area.h).max(0.0);
         let top = c.top.map_or(c.max_top, |y| y.min(c.max_top));
         if top <= 0.0 && c.start > 0 && !c.loading {
@@ -960,7 +1187,7 @@ impl App {
                         }
                     }
                 }
-                row_y += h + GAP;
+                row_y += h + gaps[v];
             }
             if let Some((i, j)) = nearest.filter(|_| !interactive_press) {
                 let row = &c.laid[i].as_ref().unwrap().rows[j];
@@ -1004,9 +1231,7 @@ impl App {
                                 continue;
                             }
                             let band = Rect::new(x, ry, w, row.h);
-                            if let Some(f) = row.fill {
-                                r.rect(band, 0.0, fill(t, f));
-                            }
+                            paint_row(r, t, x, ry, w, row);
                             if row.toggle {
                                 r.target(band, Cursor::Pointer);
                                 if self.click.is_some_and(|p| band.contains(p) && area.contains(p)) {
@@ -1050,6 +1275,27 @@ impl App {
                                 r.text(x + run.x, ty, &run.text, run.font, run.size, run.weight, ink(t, run.ink), run.max_w);
                                 run_start += run.text.len() + 1;
                             }
+                        }
+                    }
+                    View::Turn(i) => {
+                        // The agent, its model, a hairline, and what the turn did so far.
+                        let band = Rect::new(x, y, w, h);
+                        let cy = (y + h / 2.0).round();
+                        r.rect(Rect::new(x, cy - 4.0, 8.0, 8.0), 0.0, accent(&task.agent));
+                        let mut tx = x + 16.0;
+                        tx += r.text(tx, r.center(band, UI, 12.5), &task.agent, UI, 12.5, 600, t.text, 160.0);
+                        if !task.model.is_empty() {
+                            tx += 8.0;
+                            tx += r.text(tx, r.center(band, MONO, 11.5), &task.model, MONO, 11.5, 400, t.text3, 220.0);
+                        }
+                        let stats = turn_stats(&c.items[i..]);
+                        let sw = r.measure(UI, 11.5, 400, &stats).min((x + w - tx - 40.0).max(0.0));
+                        if sw > 0.0 {
+                            r.text(x + w - sw, r.center(band, UI, 11.5), &stats, UI, 11.5, 400, t.text3, sw);
+                        }
+                        let (rx, rw) = (tx + 12.0, x + w - sw - 12.0 - (tx + 12.0));
+                        if rw > 0.0 {
+                            r.rect(Rect::new(rx, cy, rw, 1.0), 0.0, t.border);
                         }
                     }
                     View::Reads(start, len) => {
@@ -1099,12 +1345,12 @@ impl App {
                         // The border goes on last so scrolled content can't cover it.
                         r.rect(Rect::new(x, y, w, 1.0), 0.0, t.border2);
                         r.rect(Rect::new(x, y + window_h - 1.0, w, 1.0), 0.0, t.border2);
-                        r.rect(Rect::new(x, y, 1.0, window_h), 0.0, t.border2);
                         r.rect(Rect::new(x + w - 1.0, y, 1.0, window_h), 0.0, t.border2);
+                        r.rect(Rect::new(x, y, STRIPE, window_h), 0.0, ink(t, Ink::Kind(ToolKind::Read)));
                     }
                 }
             }
-            y += h + GAP;
+            y += h + gaps[v];
         }
         r.set_clip(old_clip);
         if let Some((a, b)) = c.selection {
@@ -1377,11 +1623,39 @@ mod tests {
     fn reads_group_back_to_back_only() {
         let read = |id: &str| ChatItem::Tool { id: id.into(), name: "Read".into(), kind: ToolKind::Read, target: "f".into(), input: String::new(), output: String::new(), ok: Some(true), diff: vec![] };
         let edit = || ChatItem::Tool { id: "e".into(), name: "Edit".into(), kind: ToolKind::Edit, target: "f".into(), input: String::new(), output: String::new(), ok: Some(true), diff: vec![] };
-        let v = views(&[read("a"), read("b"), edit(), read("c")]);
+        let v = views(&[read("a"), read("b"), edit(), read("c")], false);
         assert_eq!(v.len(), 3);
         assert!(matches!(v[0], View::Reads(0, 2)));
         assert!(matches!(v[1], View::Item(2)));
         assert!(matches!(v[2], View::Item(3)));
+    }
+
+    #[test]
+    fn each_turn_opens_with_a_header_that_counts_its_steps() {
+        let tool = |kind, ok| ChatItem::Tool { id: "t".into(), name: "T".into(), kind, target: "f".into(), input: String::new(), output: String::new(), ok, diff: vec![] };
+        let user = || ChatItem::User { text: "go".into() };
+        let reply = || ChatItem::Assistant { text: "done".into() };
+        let items = [
+            reply(),
+            tool(ToolKind::Read, Some(true)),
+            tool(ToolKind::Read, Some(true)),
+            tool(ToolKind::Bash, Some(false)),
+            user(),
+            tool(ToolKind::Edit, Some(true)),
+            user(),
+        ];
+        let v = views(&items, true);
+        assert!(matches!(v[0], View::Turn(0)) && matches!(v[1], View::Item(0)) && matches!(v[2], View::Reads(1, 2)));
+        assert!(matches!(v[5], View::Turn(5)) && matches!(v[6], View::Item(5)) && matches!(v[7], View::Item(6)));
+        assert_eq!(v.len(), 8, "no header under a prompt nothing answered yet");
+        // Mid-conversation, the first loaded item may not start a turn.
+        assert!(matches!(views(&items, false)[0], View::Item(0)));
+        assert_eq!(turn_stats(&items), "2 reads · 1 command · 1 failed");
+        assert_eq!(turn_stats(&items[5..]), "1 edit");
+        assert_eq!(turn_stats(&[reply()]), "");
+        let g = gaps(&items, &v);
+        assert_eq!((g[0], g[1], g[2], g[3]), (4.0, GAP, STEP_GAP, GAP));
+        assert_eq!(*g.last().unwrap(), 0.0);
     }
 
     #[test]
