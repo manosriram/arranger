@@ -3863,8 +3863,9 @@ impl App {
             r.rect(Rect::new(0.0, 0.0, w, h), 0.0, t.scrim);
             r.target(Rect::new(0.0, 0.0, w, h), Cursor::Arrow);
         }
-        let dw = if inline { w - left } else { (w - 32.0).min(680.0) };
-        let pad = if inline { 32.0 } else { 22.0 };
+        // One compact card, centered: the prompt and its options in a single box.
+        let dw = (w - left - 32.0).min(680.0);
+        let pad = 22.0;
         let width = dw - 2.0 * pad;
         let choices = connected_models(agent, &self.hosts[host_i].limits);
         let model = match clone.as_ref().and_then(|c| c.5.as_deref()) {
@@ -3893,12 +3894,16 @@ impl App {
             controls.push(("on", self.hosts[host_i].name(), None, 0.0, clone.is_some()));
         }
         controls.push(("from", shown.as_str(), None, if pick { 22.0 } else { 10.0 }, clone.is_some()));
+        // Start (or Clone) shares the chips row, right-aligned, so no row is spent on it alone.
+        let start_label = if clone.is_some() { "Clone" } else { "Start agent" };
+        let sw = r.measure(UI, 13.0, 600, start_label) + 28.0;
         // Lay out every chip before sizing the editor, reserving room for wrapped rows.
         let (mut cx, mut cy) = (0.0, 0.0);
+        let chips_w = width - sw - 12.0;
         let mut chips: Vec<Rect> = controls.iter().map(|(key, value, dot, extra, _)| {
             let lead = if dot.is_some() { 16.0 } else { 0.0 };
-            let cw = (32.0 + lead + r.measure(UI, 13.0, 400, key) + r.measure(MONO, 13.0, 500, value) + extra).min(width);
-            if cx > 0.0 && cx + cw > width { cx = 0.0; cy += 40.0; }
+            let cw = (32.0 + lead + r.measure(UI, 13.0, 400, key) + r.measure(MONO, 13.0, 500, value) + extra).min(chips_w);
+            if cx > 0.0 && cx + cw > chips_w { cx = 0.0; cy += 40.0; }
             let b = Rect::new(cx, cy, cw, 32.0);
             cx += cw + 8.0;
             b
@@ -3935,20 +3940,21 @@ impl App {
         // Reserve space for the controls before letting the editor grow. Recent prompts
         // are optional when a short window needs the space for editing instead.
         let heading_h = if inline { 32.0 } else { 20.0 };
-        let fixed_h = heading_h + clone_h + 16.0 + controls_h + 18.0 + repo_h + 58.0;
-        let available_h = (h - TITLE_H - if inline { STATUS_H + 20.0 } else { 32.0 }).max(0.0);
-        if fixed_h + recent_h + 78.0 > available_h {
+        let err_h = if error.is_empty() { 0.0 } else { 22.0 };
+        let fixed_h = heading_h + clone_h + 16.0 + controls_h + 14.0 + err_h + repo_h + 20.0;
+        let available_h = (h - TITLE_H - STATUS_H - 24.0).max(0.0);
+        if fixed_h + recent_h + 60.0 > available_h {
             recent_h = 0.0;
         }
-        let editor_h = (available_h - fixed_h - recent_h).max(26.0);
-        let text_h = if inline { editor_h } else { content_h.min(editor_h) };
+        let editor_h = (available_h - fixed_h - recent_h).max(26.0).min(6.0 * 26.0);
+        let text_h = content_h.min(editor_h);
         let dh = fixed_h + text_h + recent_h;
-        let top = if inline { TITLE_H } else { 104.0_f32.min((h - dh - 16.0).max(TITLE_H + 16.0)) };
+        // The card floats in the middle of the page, so dropdowns opened from its chips have
+        // room below instead of hitting the window's bottom edge.
+        let top = ((TITLE_H + h - STATUS_H - dh) / 2.0).max(TITLE_H + 16.0);
         let dlg = Rect::new(left + (w - left - dw) / 2.0, top, dw, dh);
-        if !inline {
-            r.rect(Rect::new(dlg.x - 1.0, dlg.y + 6.0, dlg.w + 2.0, dlg.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x1C }));
-            r.frame(dlg, 0.0, t.dialog, t.border2);
-        }
+        r.rect(Rect::new(dlg.x - 1.0, dlg.y + 6.0, dlg.w + 2.0, dlg.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x1C }));
+        r.frame(dlg, 0.0, t.dialog, t.border2);
 
         // Cloning: which task, what it was asked, and the question the prompt answers.
         if let Some((id, ..)) = &clone {
@@ -4031,6 +4037,14 @@ impl App {
                 r.path(9, "M18 26L32 40L46 26", Some(6.0), b.x + b.w - 22.0, b.y + 10.0, 12.0, t.text3);
             }
         }
+        // Start, right of the chips; the keys still work without the hint row they were listed in.
+        let ready = clone.is_some() || !prompt.trim().is_empty();
+        let start = Rect::new(dlg.x + dlg.w - pad - sw, cy - 1.0, sw, 34.0);
+        r.rect(start, 4.0, if inline { t.needs } else { t.primary_bg });
+        r.text(start.x + 14.0, r.center(start, UI, 13.0), start_label, UI, 13.0, 600, if inline { t.bg } else { t.primary_fg }, sw);
+        if self.hit(r, start) && ready {
+            self.actions.push(Action::Start);
+        }
         // A clone's agent, machine and branch are its source's: shown, not picked. Clicking a
         // pickable chip opens its options as a menu (the same chip again closes it); Tab cycles.
         let opened = if clone.is_none() && self.hit(r, chips[0]) {
@@ -4075,7 +4089,11 @@ impl App {
         }
 
         // Repo on another machine.
-        let mut y = cy + controls_h + 18.0;
+        let mut y = cy + controls_h + 14.0;
+        if !error.is_empty() {
+            r.text(dlg.x + pad, y + 4.0, &error, UI, 12.5, 400, t.del, width);
+            y += err_h;
+        }
         if remote {
             let lw = r.text(dlg.x + pad, r.center(Rect::new(0.0, y, 0.0, 32.0), UI, 13.0), "repo", UI, 13.0, 400, t.text3, 60.0);
             let field = Rect::new(dlg.x + pad + lw + 10.0, y, dlg.w - 2.0 * pad - lw - 10.0, 32.0);
@@ -4098,47 +4116,6 @@ impl App {
                     reuse = Some(p.clone());
                 }
             }
-            y += recent_h;
-        }
-
-        // Footer: keys on the left, Start agent on the right.
-        let foot = Rect::new(dlg.x + 1.0, y, dlg.w - 2.0, dlg.y + dlg.h - y - 1.0);
-        r.rect(Rect::new(foot.x, foot.y, foot.w, 1.0), 0.0, t.border);
-        let sb = Rect::new(foot.x + foot.w - pad + 1.0, foot.y + 12.0, 0.0, 34.0);
-        let start_label = if clone.is_some() { "Clone" } else { "Start agent" };
-        let sw = r.measure(UI, 13.0, 600, start_label) + 28.0;
-        let start = Rect::new(sb.x - sw, sb.y, sw, sb.h);
-        // Where it runs, left of Start. A clone runs as its source does.
-        let left = start.x - 10.0;
-        let ready = clone.is_some() || !prompt.trim().is_empty();
-        r.rect(start, 4.0, if inline { t.needs } else { t.primary_bg });
-        r.text(start.x + 14.0, r.center(start, UI, 13.0), start_label, UI, 13.0, 600, if inline { t.bg } else { t.primary_fg }, sw);
-        if self.hit(r, start) && ready {
-            self.actions.push(Action::Start);
-        }
-        let room = left - foot.x - pad - 2.0;
-        if error.is_empty() {
-            // As many key hints as fit.
-            let mut hx = foot.x + pad - 1.0;
-            let hints: &[(&str, &str)] = if clone.is_some() {
-                &[("↵", "clone"), ("↑", "its prompts"), ("tab", "model"), ("esc", "close")]
-            } else if inline {
-                &[("↵", "start"), ("tab", "agent"), ("ctrl+tab", "model"), ("alt+tab", "effort")]
-            } else {
-                &[("↵", "start"), ("tab", "agent"), ("ctrl+tab", "model"), ("alt+tab", "effort"), ("esc", "close")]
-            };
-            for &(key, what) in hints {
-                let kw = r.measure(MONO, 12.0, 500, key);
-                let ww = r.measure(UI, 12.0, 400, what);
-                if hx + kw + 6.0 + ww > foot.x + pad + room {
-                    break;
-                }
-                r.text(hx, r.center(start, MONO, 12.0), key, MONO, 12.0, 500, t.text, kw + 2.0);
-                r.text(hx + kw + 6.0, r.center(start, UI, 12.0), what, UI, 12.0, 400, t.text3, ww + 2.0);
-                hx += kw + 6.0 + ww + 18.0;
-            }
-        } else {
-            r.text(foot.x + pad - 1.0, r.center(start, UI, 12.5), &error, UI, 12.5, 400, t.del, room);
         }
 
         self.draw_completion(r, t, Rect::new(dlg.x + pad, ty + text_h + 4.0, dlg.w - 2.0 * pad, (h - ty - text_h - 20.0).max(32.0)), completion_click);
