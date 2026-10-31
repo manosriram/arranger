@@ -322,6 +322,8 @@ enum Action {
     NewProject,
     /// Start an ended task's agent again (resuming its session), sending it this prompt if any.
     Revive(TaskKey, String),
+    /// Show the homepage by closing the selected task (it keeps running; this only deselects it).
+    CloseTask,
     /// Stop the task's agent and remove it: its worktree, log and history.
     Delete(TaskKey),
     /// Open the new-task dialog to clone this task: its chat and edits, on a new worktree.
@@ -347,6 +349,8 @@ struct App {
     gfx: Option<Gfx>,
     hosts: Vec<Host>,
     selected: Option<TaskKey>,
+    /// True while on the homepage with no task selected: `Msg::Tasks` won't auto-select one.
+    home: bool,
     session: Option<Session>,
     /// The selected headless task's conversation, in place of its terminal.
     chat: Option<chat::ChatView>,
@@ -533,6 +537,7 @@ fn run() -> io::Result<()> {
         gfx: None,
         hosts: Vec::new(),
         selected: None,
+        home: false,
         session: None,
         chat: None,
         drafts: std::collections::HashMap::new(),
@@ -794,7 +799,7 @@ impl ApplicationHandler<Msg> for App {
             },
             Msg::Tasks(m, tasks) => {
                 self.user_event_tasks(m, tasks);
-                if self.selected.is_none_or(|k| self.task(k).is_none()) {
+                if !self.home && self.selected.is_none_or(|k| self.task(k).is_none()) {
                     // Dev aid for screenshots (`ARRANGER_SELECT=<task id>`): start on that local task.
                     let pick = std::env::var("ARRANGER_SELECT").ok().and_then(|v| v.parse().ok()).map(|id| (0, id)).filter(|&k| self.task(k).is_some());
                     let selected = pick.or_else(|| self.order().first().copied());
@@ -2244,6 +2249,7 @@ impl App {
                     self.user_event_tasks(m, tasks);
                 }
                 self.selected = Some((m, id));
+                self.home = false;
                 self.sync_session();
             }
             Ok(other) => d.error = format!("{other:?}"),
@@ -2327,6 +2333,7 @@ impl App {
                     "n" => self.actions.push(Action::NewTask),
                     "r" => self.actions.push(Action::OpenReview),
                     "d" if self.review.is_none() && self.machine_tasks.is_none() && self.dialog.is_none() && self.add_host.is_none() => self.clone_selected(),
+                    "w" if self.current().is_some() => self.actions.push(Action::CloseTask),
                     "j" | "k" if self.review.is_some() => {
                         let files = self.review.as_ref().and_then(|rv| rv.data.as_ref()).map_or(0, |d| d.files.len());
                         let cur = self.review.as_ref().map_or(0, |rv| rv.file);
@@ -2659,6 +2666,7 @@ impl App {
                     }
                     if self.inline_composer() { self.dialog = None; }
                     self.selected = Some(id);
+                    self.home = false;
                     (self.wheel, self.ticks, self.glide) = (0.0, 0.0, 0.0);
                     // An open dialog keeps its field until it's closed.
                     if self.dialog.is_none() && self.add_host.is_none() {
@@ -2758,6 +2766,7 @@ impl App {
                             // Its chat attaches by itself once the task shows as running.
                             self.revive_error = None;
                             (self.review, self.machine_tasks, self.selected) = (None, None, Some(key));
+                            self.home = false;
                             self.focus = self.rest();
                         }
                         Ok(r) => self.revive_error = Some((key, format!("unexpected reply: {r:?}"))),
@@ -2766,6 +2775,11 @@ impl App {
                 }
                 Action::Clone(key) => self.open_clone(key),
                 Action::SendChat => self.send_chat(None),
+                Action::CloseTask => {
+                    (self.selected, self.home) = (None, true);
+                    (self.review, self.answering, self.answered, self.task_menu, self.confirm_delete, self.multi_select) = (None, None, None, None, None, None);
+                    self.sync_session();
+                }
                 Action::Delete(key @ (m, id)) => {
                     self.spawn_request(m, Tag::Delete, Request::Kill { id });
                     self.stats.remove(&key);
@@ -3404,6 +3418,13 @@ impl App {
         // A terminal (a shell in this worktree; click again to leave) and a trash can, left of Review.
         let trash = Rect::new(review.x - 6.0 - 28.0, top.y, 28.0, 28.0);
         let term = Rect::new(trash.x - 6.0 - 28.0, top.y, 28.0, 28.0);
+        // Close (✕) drops the task for the homepage; the agent itself keeps running (⌘W).
+        let close = Rect::new(term.x - 6.0 - 28.0, top.y, 28.0, 28.0);
+        r.frame(close, 4.0, t.bg, t.border2);
+        r.path(40, "M16 16L48 48M48 16L16 48", Some(6.0), close.x + 7.0, close.y + 7.0, 14.0, t.text2);
+        if self.hit(r, close) {
+            self.actions.push(Action::CloseTask);
+        }
         let on = self.shell;
         let can_term = on || self.shellable();
         let term_fg = if on { t.text } else if can_term { t.text2 } else { alpha(t.text3, 120) };
@@ -3420,7 +3441,7 @@ impl App {
         }
         let tx = area.x + 20.0;
         let name = title(&task);
-        let available = (term.x - tx - 12.0).max(0.0);
+        let available = (close.x - tx - 12.0).max(0.0);
         let title_hit_w = r.measure(UI, 15.0, 600, &name).min(available);
         if self.hit(r, Rect::new(tx, top.y, title_hit_w, top.h)) {
             set_clipboard(&task.title);
@@ -3428,7 +3449,7 @@ impl App {
         }
         let copied = self.title_copied.is_some_and(|(copied_key, until)| copied_key == key && Instant::now() < until);
         let message_w = if copied { r.measure(UI, 11.0, 400, "Title copied") + 12.0 } else { 0.0 };
-        let title_rect = Rect::new(tx, top.y, (term.x - tx - 12.0 - message_w).max(0.0), top.h);
+        let title_rect = Rect::new(tx, top.y, (close.x - tx - 12.0 - message_w).max(0.0), top.h);
         let title_w = r.text(tx, r.center(top, UI, 15.0), &name, UI, 15.0, 600, t.text, title_rect.w);
         if copied {
             r.text(tx + title_w + 12.0, r.center(top, UI, 11.0), "Title copied", UI, 11.0, 400, t.text3, message_w - 12.0);

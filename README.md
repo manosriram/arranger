@@ -41,6 +41,7 @@ Agent process groups are tied to their owner's lifetime: deleting a task, stoppi
 | ⌘N | New task: pick an agent and its model, write the prompt |
 | ⌘D | Clone the selected task, including its chat and edits |
 | ⌘J / ⌘K | Next / previous agent |
+| ⌘W | Close the selected task (it keeps running) and go back to the homepage |
 | ⌘I | Type into the selected agent's terminal |
 | ⌘R | Review the diff: revert hunks, comment, then merge (or commit, or open a PR). Greyed out while there's nothing to review |
 | ⌘T | Switch between dark and light |
