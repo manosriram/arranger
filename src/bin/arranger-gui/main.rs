@@ -3228,7 +3228,7 @@ impl App {
         self.icon(r, t, task, row.x + 8.0, top.y + top.h / 2.0);
         let mut text_x = row.x + 30.0;
         if dense {
-            text_x += agent_badge(r, &task.agent, text_x, top.y + top.h / 2.0, 12.0) + 5.0;
+            text_x += agent_badge(r, t, &task.agent, text_x, top.y + top.h / 2.0, 12.0) + 5.0;
         }
         let sc = match g {
             0 => t.needs,
@@ -3255,7 +3255,7 @@ impl App {
         ship_badge(r, t, &task.shipped, text_x + room - bw + 6.0, top.y + top.h / 2.0);
         if !dense {
             let sub = Rect::new(text_x, top.y + titles.len() as f32 * 18.0 + 2.0, row.w - 38.0, 16.0);
-            let bw = agent_badge(r, &task.agent, sub.x, sub.y + sub.h / 2.0, 12.0);
+            let bw = agent_badge(r, t, &task.agent, sub.x, sub.y + sub.h / 2.0, 12.0);
             let txt = machine.map_or_else(|| line.clone(), |m| format!("{m} · {line}"));
             r.text(sub.x + bw + 5.0, r.center(sub, UI, 11.5), &txt, UI, 11.5, 400, sc, sub.w - bw - 5.0);
         }
@@ -3284,7 +3284,7 @@ impl App {
             r.text(text_x, r.center(top, UI, 13.0) + i as f32 * 18.0, title, UI, 13.0, 500, t.text, card.w - 38.0);
         }
         let meta = Rect::new(text_x, top.y + titles.len() as f32 * 18.0, card.w - 38.0, 16.0);
-        let bw = agent_badge(r, &task.agent, meta.x, meta.y + meta.h / 2.0, 12.0);
+        let bw = agent_badge(r, t, &task.agent, meta.x, meta.y + meta.h / 2.0, 12.0);
         let host = machine.unwrap_or("");
         r.text(meta.x + bw + 5.0, r.center(meta, UI, 11.5), host, UI, 11.5, 400, t.text3, meta.w - bw - 5.0);
         let ask = Rect::new(text_x, meta.y + meta.h, card.w - 38.0, 20.0);
@@ -4274,7 +4274,7 @@ fn logo(r: &mut Renderer, x: f32, y: f32, size: f32, ink: Rgba, amber: Rgba) {
 /// width (== size). `r.path` lays a path in a 64-unit box, so the size passed is scaled up to
 /// make the logo's 24-unit viewBox fill `size`. Path ids sit in a private range so the atlas
 /// never reuses another shape's cached glyph.
-fn agent_badge(r: &mut Renderer, agent: &str, x: f32, cy: f32, size: f32) -> f32 {
+fn agent_badge(r: &mut Renderer, t: &Theme, agent: &str, x: f32, cy: f32, size: f32) -> f32 {
     let kind = adapter::kind(agent);
     let id = 60 + match kind {
         "claude" => 0,
@@ -4283,7 +4283,7 @@ fn agent_badge(r: &mut Renderer, agent: &str, x: f32, cy: f32, size: f32) -> f32
         "gemini" => 3,
         _ => 4,
     };
-    let ink = if kind == "codex" { [0, 0, 0, 255] } else { accent(kind) };
+    let ink = if kind == "codex" { if t.dark { [255; 4] } else { [0, 0, 0, 255] } } else { accent(kind) };
     r.path(id, agent_logo(kind), None, x, cy - size / 2.0, size * 64.0 / 24.0, ink);
     size
 }
