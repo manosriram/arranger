@@ -3894,16 +3894,20 @@ impl App {
             controls.push(("on", self.hosts[host_i].name(), None, 0.0, clone.is_some()));
         }
         controls.push(("from", shown.as_str(), None, if pick { 22.0 } else { 10.0 }, clone.is_some()));
-        // Start (or Clone) shares the chips row, right-aligned, so no row is spent on it alone.
-        let start_label = if clone.is_some() { "Clone" } else { "Start agent" };
-        let sw = r.measure(UI, 13.0, 600, start_label) + 28.0;
+        // Start (or Clone) shares the chips row, right-aligned, so no row is spent on it alone:
+        // a square up-arrow button, its width reserved here.
+        let sw = 34.0;
         // Lay out every chip before sizing the editor, reserving room for wrapped rows.
         let (mut cx, mut cy) = (0.0, 0.0);
         let chips_w = width - sw - 12.0;
         let mut chips: Vec<Rect> = controls.iter().map(|(key, value, dot, extra, _)| {
             let lead = if dot.is_some() { 16.0 } else { 0.0 };
-            let cw = (32.0 + lead + r.measure(UI, 13.0, 400, key) + r.measure(MONO, 13.0, 500, value) + extra).min(chips_w);
-            if cx > 0.0 && cx + cw > chips_w { cx = 0.0; cy += 40.0; }
+            let want = 32.0 + lead + r.measure(UI, 13.0, 400, key) + r.measure(MONO, 13.0, 500, value) + extra;
+            // A long value (a branch, a model name) squeezes into the room left on its row and
+            // ellipsizes, rather than dropping its chip to a line of its own; a row with under
+            // 120px left still wraps.
+            if cx > 0.0 && chips_w - cx < 120.0 { cx = 0.0; cy += 40.0; }
+            let cw = want.min(if cx > 0.0 { chips_w - cx } else { chips_w });
             let b = Rect::new(cx, cy, cw, 32.0);
             cx += cw + 8.0;
             b
@@ -3953,8 +3957,9 @@ impl App {
         // room below instead of hitting the window's bottom edge.
         let top = ((TITLE_H + h - STATUS_H - dh) / 2.0).max(TITLE_H + 16.0);
         let dlg = Rect::new(left + (w - left - dw) / 2.0, top, dw, dh);
-        r.rect(Rect::new(dlg.x - 1.0, dlg.y + 6.0, dlg.w + 2.0, dlg.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x1C }));
-        r.frame(dlg, 0.0, t.dialog, t.border2);
+        // A soft drop shadow: the card's own shape, offset down, behind it.
+        r.rect(Rect::new(dlg.x - 2.0, dlg.y + 6.0, dlg.w + 4.0, dlg.h + 2.0), 12.0, alpha([0, 0, 0, 255], if t.dark { 0x50 } else { 0x18 }));
+        r.frame(dlg, 10.0, t.dialog, t.border2);
 
         // Cloning: which task, what it was asked, and the question the prompt answers.
         if let Some((id, ..)) = &clone {
@@ -4037,11 +4042,12 @@ impl App {
                 r.path(9, "M18 26L32 40L46 26", Some(6.0), b.x + b.w - 22.0, b.y + 10.0, 12.0, t.text3);
             }
         }
-        // Start, right of the chips; the keys still work without the hint row they were listed in.
+        // Start, right of the chips: an up-arrow button, always visible; only the click waits
+        // for something to start.
         let ready = clone.is_some() || !prompt.trim().is_empty();
         let start = Rect::new(dlg.x + dlg.w - pad - sw, cy - 1.0, sw, 34.0);
-        r.rect(start, 4.0, if inline { t.needs } else { t.primary_bg });
-        r.text(start.x + 14.0, r.center(start, UI, 13.0), start_label, UI, 13.0, 600, if inline { t.bg } else { t.primary_fg }, sw);
+        r.rect(start, 8.0, if inline { t.needs } else { t.primary_bg });
+        r.path(41, "M32 14V50M20 26L32 14L44 26", Some(7.0), start.x + 9.0, start.y + 9.0, 16.0, if inline { t.bg } else { t.primary_fg });
         if self.hit(r, start) && ready {
             self.actions.push(Action::Start);
         }
@@ -4148,8 +4154,8 @@ impl App {
             let top = chip.y + chip.h + 4.0;
             m.scroll = m.scroll.min((full - (h - STATUS_H - 12.0 - top).max(40.0)).max(0.0));
             m.rect = Rect::new(chip.x, top, labels.iter().map(|l| r.measure(MONO, 13.0, 400, l)).fold(chip.w, |mw, x| mw.max(x + 48.0)).min(dlg.w / 2.0), full.min((h - STATUS_H - 12.0 - top).max(40.0)));
-            r.rect(Rect::new(m.rect.x - 1.0, m.rect.y + 3.0, m.rect.w + 2.0, m.rect.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
-            r.frame(m.rect, 0.0, t.dialog, t.border2);
+            r.rect(Rect::new(m.rect.x - 2.0, m.rect.y + 3.0, m.rect.w + 4.0, m.rect.h + 2.0), 10.0, alpha([0, 0, 0, 255], if t.dark { 0x50 } else { 0x16 }));
+            r.frame(m.rect, 8.0, t.dialog, t.border2);
             r.target(m.rect, Cursor::Arrow);
             let old_clip = r.clip();
             r.set_clip(Some(m.rect));
@@ -4158,7 +4164,7 @@ impl App {
             for (i, label) in labels.iter().enumerate().take(last).skip(first) {
                 let row = Rect::new(m.rect.x + 4.0, m.rect.y + 4.0 + i as f32 * 32.0 - m.scroll, m.rect.w - 8.0, 32.0);
                 if on == Some(i) {
-                    r.rect(row, 0.0, t.sel);
+                    r.rect(row, 5.0, t.sel);
                 }
                 r.text(row.x + 10.0, r.center(row, MONO, 13.0), label, MONO, 13.0, 400, t.text, row.w - 40.0);
                 if on == Some(i) {
@@ -4192,14 +4198,14 @@ impl App {
                 let lw = shown.iter().map(|b| r.measure(MONO, 13.0, 400, b)).fold(bfield.w, |m, x| m.max(x + 48.0)).min(dlg.w / 2.0);
                 let lr = Rect::new(bfield.x, bfield.y + bfield.h + 4.0, lw, 8.0 + shown.len() as f32 * 32.0);
                 d.list = Some(lr);
-                r.rect(Rect::new(lr.x - 1.0, lr.y + 3.0, lr.w + 2.0, lr.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
-                r.frame(lr, 0.0, t.dialog, t.border2);
+                r.rect(Rect::new(lr.x - 2.0, lr.y + 3.0, lr.w + 4.0, lr.h + 2.0), 10.0, alpha([0, 0, 0, 255], if t.dark { 0x50 } else { 0x16 }));
+                r.frame(lr, 8.0, t.dialog, t.border2);
                 r.target(lr, Cursor::Arrow);
                 for (i, b) in shown.iter().enumerate() {
                     let row = Rect::new(lr.x + 4.0, lr.y + 4.0 + i as f32 * 32.0, lr.w - 8.0, 32.0);
                     let on = **b == base;
                     if on {
-                        r.rect(row, 0.0, t.sel);
+                        r.rect(row, 5.0, t.sel);
                     }
                     r.text(row.x + 10.0, r.center(row, MONO, 13.0), b, MONO, 13.0, 400, t.text, row.w - 40.0);
                     if on {

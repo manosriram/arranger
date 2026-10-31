@@ -427,13 +427,14 @@ impl Renderer {
         self.verts.extend([a, b, c, b, d, c]);
     }
 
-    /// Filled rect. Corners are square throughout the app, so `_radius` is not drawn.
-    pub fn rect(&mut self, r: Rect, _radius: f32, color: Rgba) {
+    /// Filled rect, corners rounded by `radius` when it is nonzero (clamped so a small rect
+    /// cannot ask for more roundness than it has room for).
+    pub fn rect(&mut self, r: Rect, radius: f32, color: Rgba) {
         let d = self.dpi;
         // Round both edges, not the size, so neighbouring rects (terminal cell backgrounds) meet without seams.
         let (x, y) = ((r.x * d).round(), (r.y * d).round());
         let (w, h) = (((r.x + r.w) * d).round() - x, ((r.y + r.h) * d).round() - y);
-        self.quad(x, y, w, h, [0.0; 4], 0.0, color);
+        self.quad(x, y, w, h, [0.0; 4], (radius * d).min(w.min(h) / 2.0), color);
     }
 
     /// Draw a local image inside a bounding box, preserving its aspect ratio.
