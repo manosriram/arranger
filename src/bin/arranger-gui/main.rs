@@ -258,7 +258,6 @@ struct AddHost {
 
 enum Action {
     Select(TaskKey),
-    ToggleBookmark(TaskKey),
     ToggleRequest(TaskKey),
     Focus(Focus),
     NewTask,
@@ -287,7 +286,8 @@ enum Action {
     RemoveHost(usize),
     PickTheme(usize),
     ToggleMenu,
-    ToggleBookmarks,
+    /// Show or hide the task sidebar, for a full-width chat.
+    ToggleSidebar,
     ToggleUsage,
     RefreshUsage,
     ToggleVim,
@@ -303,8 +303,6 @@ enum Action {
     OpenProject(Option<PathBuf>),
     /// Pick a name and place for a new project folder, and open it.
     NewProject,
-    /// Back to the welcome screen, to switch projects.
-    Welcome,
     /// Start an ended task's agent again (resuming its session), sending it this prompt if any.
     Revive(TaskKey, String),
     /// Stop the task's agent and remove it: its worktree, log and history.
@@ -332,7 +330,6 @@ struct App {
     gfx: Option<Gfx>,
     hosts: Vec<Host>,
     selected: Option<TaskKey>,
-    bookmarks: Vec<Bookmark>,
     session: Option<Session>,
     /// The selected headless task's conversation, in place of its terminal.
     chat: Option<chat::ChatView>,
@@ -348,11 +345,10 @@ struct App {
     /// Vim keys: a normal mode for moving and acting without the mouse.
     vim: bool,
     ding_muted: bool,
-    /// The title- or status-bar popup that's open, and the buttons that open them: Settings
-    /// (`scheme_btn`), Bookmarks, and the usage chip.
+    /// The status-bar popup that's open, and the buttons that open them: Settings
+    /// (`scheme_btn`) and the usage chip.
     popup: Popup,
     scheme_btn: Rect,
-    bookmarks_btn: Rect,
     usage_btn: Rect,
     /// The usage popover's last frame, for wheel scrolling; its content's scroll offset.
     usage_bounds: Rect,
@@ -451,6 +447,8 @@ struct App {
     caret: Option<(Focus, usize)>,
     /// Sidebar and review-rail widths, which their dividers drag.
     sidebar_w: f32,
+    /// Whether the sidebar shows at all; ⌘B or the title-bar button toggles it.
+    sidebar_open: bool,
     rail_w: f32,
     dragging: Option<Divider>,
     caret_on: bool,
@@ -518,7 +516,6 @@ fn run() -> io::Result<()> {
         gfx: None,
         hosts: Vec::new(),
         selected: None,
-        bookmarks: Vec::new(),
         session: None,
         chat: None,
         drafts: std::collections::HashMap::new(),
@@ -530,7 +527,6 @@ fn run() -> io::Result<()> {
         ding_muted: false,
         popup: Popup::None,
         scheme_btn: Rect::new(0.0, 0.0, 0.0, 0.0),
-        bookmarks_btn: Rect::default(),
         usage_btn: Rect::default(),
         usage_bounds: Rect::default(),
         usage_scroll: 0.0,
@@ -593,6 +589,7 @@ fn run() -> io::Result<()> {
         text_hit: Default::default(),
         caret: None,
         sidebar_w: SIDEBAR_W,
+        sidebar_open: true,
         rail_w: 280.0,
         dragging: None,
         caret_on: true,
@@ -610,7 +607,6 @@ fn run() -> io::Result<()> {
     app.ding_muted = settings.ding_muted;
     app.prompts = settings.prompts;
     app.recent = settings.recent;
-    app.bookmarks = settings.bookmarks;
     // Started inside a project (from a terminal): that's the one. Else (Finder, the Dock) ask.
     match welcome::project_root(&app.repo) {
         Some(top) => {
@@ -629,18 +625,10 @@ fn run() -> io::Result<()> {
     event_loop.run_app(&mut app).map_err(io::Error::other)
 }
 
-/// Stable machine identity keeps saved threads valid when machines are reordered.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-struct Bookmark {
-    host: Option<String>,
-    id: u64,
-}
-
 /// Window preferences, kept in <data>/gui.json.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 #[serde(default)]
 struct Settings {
-    bookmarks: Vec<Bookmark>,
     theme: String,
     vim: bool,
     ding_muted: bool,
@@ -817,11 +805,10 @@ impl ApplicationHandler<Msg> for App {
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() && std::env::var_os("ARRANGER_TERMINAL").is_some() {
                         self.shell = true;
                     }
-                    // `ARRANGER_MENU=settings|bookmarks|usage` snapshots that title- or status-bar popup open.
+                    // `ARRANGER_MENU=settings|usage` snapshots that status-bar popup open.
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some() {
                         match std::env::var("ARRANGER_MENU").as_deref() {
                             Ok("settings") => self.popup = Popup::Settings,
-                            Ok("bookmarks") => self.popup = Popup::Bookmarks,
                             Ok("usage") => self.popup = Popup::Usage,
                             _ => {}
                         }
@@ -1058,13 +1045,6 @@ fn hidden_tasks(tasks: &[TaskInfo]) -> usize {
     tasks.iter().filter(|t| t.shipped == "merged" || group(&t.state) == 4).count()
 }
 
-/// The Bookmarks list's rows: the saved tasks, most recently active first.
-fn bookmark_rows<'a>(tasks: impl Iterator<Item = &'a TaskInfo>, saved: impl Fn(&TaskInfo) -> bool) -> Vec<&'a TaskInfo> {
-    let mut v: Vec<&TaskInfo> = tasks.filter(|t| saved(t)).collect();
-    v.sort_by_key(|t| (std::cmp::Reverse(last_event(t)), std::cmp::Reverse(t.id)));
-    v
-}
-
 /// Past this many running or queued agents the sidebar goes dense: one line per row.
 const DENSE_AT: usize = 6;
 
@@ -1190,7 +1170,6 @@ fn age(task: &TaskInfo) -> String {
 enum Popup {
     None,
     Settings,
-    Bookmarks,
     Usage,
 }
 
@@ -1587,14 +1566,6 @@ impl App {
         self.spawn_request(key.0, Tag::Changes(key), Request::Review { id: key.1 });
     }
 
-    fn bookmark(&self, key: TaskKey) -> Bookmark {
-        Bookmark { host: self.hosts[key.0].cfg.as_ref().map(|m| m.ssh.clone()), id: key.1 }
-    }
-
-    fn is_bookmarked(&self, key: TaskKey) -> bool {
-        self.bookmarks.contains(&self.bookmark(key))
-    }
-
     fn all_tasks(&self) -> impl Iterator<Item = &TaskInfo> {
         self.hosts.iter().filter(|h| !h.removed).flat_map(|h| &h.tasks)
     }
@@ -1609,7 +1580,6 @@ impl App {
     fn popover(&self, w: f32, h: f32) -> Option<Rect> {
         match self.popup {
             Popup::Settings => Some(self.menu_rect()),
-            Popup::Bookmarks => Some(self.bookmarks_rect()),
             Popup::Usage if !self.welcome => Some(self.usage_rect(w, h)),
             _ => None,
         }
@@ -1782,7 +1752,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        let s = Settings { theme: THEMES[self.theme].name.into(), vim: self.vim, ding_muted: self.ding_muted, prompts: self.prompts.clone(), recent: self.recent.clone(), bookmarks: self.bookmarks.clone() };
+        let s = Settings { theme: THEMES[self.theme].name.into(), vim: self.vim, ding_muted: self.ding_muted, prompts: self.prompts.clone(), recent: self.recent.clone() };
         if arranger::security::private_dir(&proto::data_dir()).is_ok() {
             let _ = arranger::security::write_private(&Settings::path(), &serde_json::to_vec_pretty(&s).unwrap_or_default());
         }
@@ -1928,13 +1898,18 @@ impl App {
         }
     }
 
+    /// The sidebar's left edge: 0 when hidden, its width when shown.
+    fn sb_x(&self) -> f32 {
+        if self.sidebar_open { self.sidebar_w } else { 0.0 }
+    }
+
     /// The sidebar's or review rail's divider under `p`, which a press starts dragging.
     fn divider_at(&self, p: (f32, f32)) -> Option<Divider> {
         if (self.dialog.is_some() && !self.inline_composer()) || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || p.1 < TITLE_H {
             return None;
         }
         match &self.review {
-            None => ((p.0 - self.sidebar_w).abs() <= 4.0).then_some(Divider::Sidebar),
+            None => (self.sidebar_open && (p.0 - self.sidebar_w).abs() <= 4.0).then_some(Divider::Sidebar),
             Some(_) => ((p.0 - self.rail_w).abs() <= 4.0 && p.1 > TITLE_H + review::STRIP_H).then_some(Divider::Rail),
         }
     }
@@ -1943,7 +1918,8 @@ impl App {
     fn scroll_by(&mut self, dy: f32) {
         if self.confirm_delete.is_some() { return; }
         let inline = self.inline_composer();
-        if let Some(d) = self.dialog.as_mut().filter(|_| !inline || self.mouse.0 >= self.sidebar_w) {
+        let sx = self.sb_x();
+        if let Some(d) = self.dialog.as_mut().filter(|_| !inline || self.mouse.0 >= sx) {
             if d.prompt_bounds.is_some_and(|b| b.contains(self.mouse)) {
                 d.prompt_scroll = (d.prompt_scroll - dy).max(0.0);
             }
@@ -1960,7 +1936,7 @@ impl App {
         } else if let Some(rv) = self.review.as_mut().filter(|_| self.mouse.1 > TITLE_H + review::STRIP_H) {
             let s = if self.mouse.0 < self.rail_w { &mut rv.rail_scroll } else { &mut rv.scroll };
             *s = (*s - dy).max(0.0);
-        } else if self.mouse.0 < self.sidebar_w {
+        } else if self.mouse.0 < self.sb_x() {
             self.scroll = (self.scroll - dy).max(0.0);
         } else if let Some(c) = self.chat.as_mut().filter(|_| self.review.is_none() && !self.welcome) {
             let mouse = self.mouse;
@@ -2022,7 +1998,7 @@ impl App {
         let n = lines.unsigned_abs() as usize;
         if mode.intersects(TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) {
             let cell_w = self.gfx.as_ref()?.r.advance(MONO, TERM_SIZE, 400, '0');
-            let col = ((self.mouse.0 - self.sidebar_w - 16.0) / cell_w).max(0.0) as u32 + 1;
+            let col = ((self.mouse.0 - self.sb_x() - 16.0) / cell_w).max(0.0) as u32 + 1;
             let row = ((self.mouse.1 - TITLE_H - HEADER_H - 12.0) / LINE_H).max(0.0) as u32 + 1;
             let button = if up { 64 } else { 65 };
             let one = if mode.contains(TermMode::SGR_MOUSE) {
@@ -2332,6 +2308,7 @@ impl App {
                     "j" => self.move_selection(1),
                     "k" => self.move_selection(-1),
                     "t" => self.actions.push(Action::ToggleTheme),
+                    "b" => self.actions.push(Action::ToggleSidebar),
                     // Rounded to tenths so repeated steps land on the same glyph sizes in the atlas.
                     "=" | "+" => self.zoom = ((self.zoom + 0.1) * 10.0).round().min(20.0) / 10.0,
                     "-" | "_" => self.zoom = ((self.zoom - 0.1) * 10.0).round().max(6.0) / 10.0,
@@ -2645,15 +2622,6 @@ impl App {
     fn apply(&mut self) {
         for action in std::mem::take(&mut self.actions) {
             match action {
-                Action::ToggleBookmark(key) => {
-                    let bookmark = self.bookmark(key);
-                    if let Some(i) = self.bookmarks.iter().position(|b| b == &bookmark) {
-                        self.bookmarks.remove(i);
-                    } else {
-                        self.bookmarks.push(bookmark);
-                    }
-                    self.save_settings();
-                }
                 Action::Select(id) => {
                     if self.multi_select.is_some() {
                         self.toggle_task_selection(id);
@@ -2673,6 +2641,10 @@ impl App {
                 Action::Focus(f) => {
                     // "The agent" is its message box when it runs headless.
                     let f = if f == Focus::Term && self.chat_wanted().is_some() { Focus::Message } else { f };
+                    // Searching needs the sidebar's field.
+                    if f == Focus::Filter {
+                        self.sidebar_open = true;
+                    }
                     self.confirm_delete = None;
                     if self.focus != f {
                         self.anchor = None;
@@ -2694,7 +2666,12 @@ impl App {
                     self.popup = Popup::None;
                 }
                 Action::ToggleMenu => self.popup = self.popup.toggle(Popup::Settings),
-                Action::ToggleBookmarks => self.popup = self.popup.toggle(Popup::Bookmarks),
+                Action::ToggleSidebar => {
+                    self.sidebar_open = !self.sidebar_open;
+                    if !self.sidebar_open && self.focus == Focus::Filter {
+                        self.focus = self.rest();
+                    }
+                }
                 Action::ToggleUsage => {
                     self.popup = self.popup.toggle(Popup::Usage);
                     self.usage_scroll = 0.0;
@@ -2744,10 +2721,6 @@ impl App {
                 }
                 Action::OpenProject(path) => self.open_project(path, false),
                 Action::NewProject => self.open_project(None, true),
-                Action::Welcome => {
-                    (self.welcome, self.review, self.machine_tasks) = (true, None, None);
-                    self.welcome_error.clear();
-                }
                 Action::Revive(key @ (m, id), prompt) => {
                     let sock = self.sock(m);
                     match request_at(sock.as_deref(), &Request::Revive { id, prompt }) {
@@ -2816,6 +2789,10 @@ impl App {
                         (self.shell, self.review, self.machine_tasks) = (on, None, None);
                         self.focus = self.rest();
                         self.sync_session();
+                        // Opening the shell drops you straight into it, once it attached.
+                        if on && self.session.is_some() {
+                            self.focus = Focus::Term;
+                        }
                     }
                 }
                 Action::PickHost(m) => self.pick_host(m),
@@ -2987,12 +2964,17 @@ impl App {
             self.draw_review(r, t, Rect::new(0.0, TITLE_H, w, h - TITLE_H - STATUS_H));
 
         } else {
-            self.draw_sidebar(r, t, h);
-            self.draw_main(r, t, Rect::new(self.sidebar_w, TITLE_H, w - self.sidebar_w, h - TITLE_H - STATUS_H));
+            if self.sidebar_open {
+                self.draw_sidebar(r, t, h);
+            }
+            let sx = self.sb_x();
+            self.draw_main(r, t, Rect::new(sx, TITLE_H, w - sx, h - TITLE_H - STATUS_H));
         }
         if !self.welcome {
-            let (x, top) = if self.review.is_some() { (self.rail_w, TITLE_H + review::STRIP_H) } else { (self.sidebar_w, TITLE_H) };
-            r.target(Rect::new(x - 4.0, top, 8.0, h - top - STATUS_H), Cursor::Resize);
+            let (x, top) = if self.review.is_some() { (self.rail_w, TITLE_H + review::STRIP_H) } else { (self.sb_x(), TITLE_H) };
+            if x > 0.0 {
+                r.target(Rect::new(x - 4.0, top, 8.0, h - top - STATUS_H), Cursor::Resize);
+            }
         }
         if !self.welcome {
             self.draw_status(r, t, w, h);
@@ -3020,7 +3002,6 @@ impl App {
         }
         match self.popup {
             Popup::Settings => self.draw_menu(r, t),
-            Popup::Bookmarks => self.draw_bookmarks(r, t),
             Popup::Usage if !self.welcome => self.draw_usage(r, t, w, h),
             _ => {}
         }
@@ -3078,62 +3059,23 @@ impl App {
 
     fn draw_title(&mut self, r: &mut Renderer, t: &Theme, w: f32) {
         r.rect(Rect::new(0.0, TITLE_H - 1.0, w, 1.0), 0.0, t.border);
-        logo(r, 14.0, 11.0, 22.0, t.text, t.needs);
+        // Show or hide the sidebar (⌘B), so the chat gets the width.
+        let mut lx = 14.0;
+        if !self.welcome {
+            let b = Rect::new(lx, (TITLE_H - 28.0) / 2.0, 28.0, 28.0);
+            r.frame(b, 4.0, t.bg, t.border);
+            let icon = if self.sidebar_open { t.text2 } else { t.text3 };
+            let inner = b.inset(8.0);
+            r.frame(inner, 2.0, t.bg, icon);
+            r.rect(Rect::new(inner.x, inner.y, 5.0, inner.h), 0.0, icon);
+            if self.hit(r, b) {
+                self.actions.push(Action::ToggleSidebar);
+            }
+            lx += 38.0;
+        }
+        logo(r, lx, 11.0, 22.0, t.text, t.needs);
         let bar = Rect::new(0.0, 0.0, w, TITLE_H);
-        let x = 44.0 + r.text(44.0, r.center(bar, UI, 14.0), "arranger", UI, 14.0, 600, t.text, 200.0);
-        let home = std::env::var("HOME").unwrap_or_default();
-        let repo = self.repo.display().to_string();
-        let repo = repo.strip_prefix(&home).map_or(repo.clone(), |rest| format!("~{rest}"));
-        if !self.welcome {
-            r.text(x + 8.0, r.center(bar, UI, 13.0), "/", UI, 13.0, 400, t.faint, 20.0);
-        }
-        let x = x + 14.0;
-        let rw = if self.welcome { 0.0 } else { r.text(x + 10.0, r.center(bar, MONO, 11.0), &repo, MONO, 11.0, 400, t.text2, 400.0) };
-        // The project path: click it to switch projects.
-        if !self.welcome && self.hit(r, Rect::new(x + 4.0, (TITLE_H - 22.0) / 2.0, rw + 12.0, 22.0)) {
-            self.actions.push(Action::Welcome);
-        }
-
-        // Review opens from the task header. Its tab is only a location indicator once open.
-        let mut nx = x + 26.0 + rw;
-        let review = self.review.is_some();
-        let tabs = [("Workspace", !review && !self.shell), ("Review", review)];
-        for (label, on) in tabs.into_iter().filter(|(label, _)| !self.welcome && (*label != "Review" || review)) {
-            let tw = r.measure(UI, 13.0, 500, label) + 24.0;
-            let tab = Rect::new(nx, (TITLE_H - 30.0) / 2.0, tw, 30.0);
-            if on {
-                r.rect(tab, 0.0, t.raised);
-            }
-            r.text(tab.x + 12.0, r.center(tab, UI, 13.0), label, UI, 13.0, 500, if on { t.text } else { t.text3 }, tw);
-            if !on && self.hit(r, tab) {
-                self.actions.push(if review { Action::Review(ReviewAction::Close) } else { Action::Shell(false) });
-            }
-            nx += tw + 4.0;
-        }
-
-        // Settings ˅, and Bookmarks left of it.
-        let label = "Settings";
-        let label_w = r.measure(UI, 12.0, 400, label);
-        let b = Rect::new(w - 10.0 - (label_w + 38.0), (TITLE_H - 28.0) / 2.0, label_w + 38.0, 28.0);
-        self.scheme_btn = b;
-        r.frame(b, 4.0, if self.popup == Popup::Settings { t.raised } else { t.bg }, t.border);
-        r.text(b.x + 10.0, r.center(b, UI, 12.0), label, UI, 12.0, 400, t.text2, label_w + 4.0);
-        r.path(9, "M18 26L32 40L46 26", Some(6.0), b.x + b.w - 20.0, b.y + 8.0, 12.0, t.text3);
-        if self.hit(r, b) {
-            self.actions.push(Action::ToggleMenu);
-        }
-        if !self.welcome {
-            let n = self.all_tasks().filter(|t| self.is_bookmarked((t.machine, t.id))).count();
-            let label = if n == 0 { "Bookmarks".to_string() } else { format!("Bookmarks {n}") };
-            let lw = r.measure(UI, 12.0, 400, &label);
-            let bb = Rect::new(b.x - 8.0 - (lw + 20.0), b.y, lw + 20.0, b.h);
-            self.bookmarks_btn = bb;
-            r.frame(bb, 4.0, if self.popup == Popup::Bookmarks { t.raised } else { t.bg }, t.border);
-            r.text(bb.x + 10.0, r.center(bb, UI, 12.0), &label, UI, 12.0, 400, t.text2, lw + 4.0);
-            if self.hit(r, bb) {
-                self.actions.push(Action::ToggleBookmarks);
-            }
-        }
+        r.text(lx + 30.0, r.center(bar, UI, 14.0), "arranger", UI, 14.0, 600, t.text, 200.0);
     }
 
     fn draw_sidebar(&mut self, r: &mut Renderer, t: &Theme, h: f32) {
@@ -3141,20 +3083,13 @@ impl App {
         r.rect(side, 0.0, t.panel);
         r.rect(Rect::new(self.sidebar_w - 1.0, TITLE_H, 1.0, side.h), 0.0, t.border);
 
-        // Primary task controls stay visible; shortcuts still focus the same search field.
+        // One row of controls: the search field, then a compact + for a new task.
         let filtering = self.focus == Focus::Filter || !self.filter.is_empty();
-        let new = Rect::new(8.0, TITLE_H + 8.0, self.sidebar_w - 16.0, 32.0);
+        let row_w = self.sidebar_w - 16.0;
+        let plus_w = (row_w * 0.2).round();
         let needs = self.all_tasks().any(|task| group(&task.state) == 0);
-        let new_fg = if needs { t.text2 } else { t.primary_fg };
-        if needs { r.frame(new, 4.0, t.panel, t.border2); } else { r.rect(new, 4.0, t.primary_bg); }
-        r.path(12, "M32 8V56M8 32H56", Some(5.0), new.x + 12.0, new.y + 10.0, 12.0, new_fg);
-        r.text(new.x + 30.0, r.center(new, UI, 13.0), "New task", UI, 13.0, 500, new_fg, new.w - 108.0);
-        let shortcut = mod_label("N");
-        let sw = r.measure(MONO, 10.5, 400, &shortcut);
-        r.text(new.x + new.w - sw - 12.0, r.center(new, MONO, 10.5), &shortcut, MONO, 10.5, 400, if needs { t.text3 } else { new_fg }, sw + 2.0);
-        if self.hit(r, new) { self.actions.push(Action::NewTask); }
         let top = {
-            let f = Rect::new(8.0, new.y + new.h + 8.0, self.sidebar_w - 16.0, 28.0);
+            let f = Rect::new(8.0, TITLE_H + 8.0, row_w - plus_w - 6.0, 28.0);
             let focused = self.focus == Focus::Filter;
             r.frame(f, 4.0, t.bg, if focused { t.work } else { t.border2 });
             r.path(11, "M44 44L56 56M48 28A20 20 0 1 1 8 28A20 20 0 1 1 48 28", Some(5.0), f.x + 8.0, f.y + 7.0, 14.0, t.text3);
@@ -3170,6 +3105,11 @@ impl App {
             if self.hit_as(r, f, Cursor::Text) {
                 self.actions.push(Action::Focus(Focus::Filter));
             }
+            let new = Rect::new(8.0 + row_w - plus_w, TITLE_H + 8.0, plus_w, 28.0);
+            let new_fg = if needs { t.text2 } else { t.primary_fg };
+            if needs { r.frame(new, 4.0, t.panel, t.border2); } else { r.rect(new, 4.0, t.primary_bg); }
+            r.path(12, "M32 8V56M8 32H56", Some(5.0), new.x + (new.w - 12.0) / 2.0, new.y + 8.0, 12.0, new_fg);
+            if self.hit(r, new) { self.actions.push(Action::NewTask); }
             f.y + f.h + 6.0
         };
 
@@ -3443,9 +3383,26 @@ impl App {
         if can && self.hit(r, review) {
             self.actions.push(Action::OpenReview);
         }
+        // A terminal (a shell in this worktree; click again to leave) and a trash can, left of Review.
+        let trash = Rect::new(review.x - 6.0 - 28.0, top.y, 28.0, 28.0);
+        let term = Rect::new(trash.x - 6.0 - 28.0, top.y, 28.0, 28.0);
+        let on = self.shell;
+        let can_term = on || self.shellable();
+        let term_fg = if on { t.text } else if can_term { t.text2 } else { alpha(t.text3, 120) };
+        r.frame(term, 4.0, if on { t.raised } else { t.bg }, if can_term { t.border2 } else { t.border });
+        r.path(22, "M8 12H56V52H8V12M18 26L26 32L18 38M32 38H42", Some(6.0), term.x + 7.0, term.y + 7.0, 14.0, term_fg);
+        if can_term && self.hit(r, term) {
+            self.actions.push(Action::Shell(!on));
+        }
+        r.frame(trash, 4.0, t.bg, t.border2);
+        r.path(23, "M10 18H54M26 18V10H38V18M14 18V50H50V18M26 28V40M38 28V40", Some(6.0), trash.x + 7.0, trash.y + 7.0, 14.0, t.del);
+        if self.hit(r, trash) {
+            self.confirm_delete = Some(vec![key]);
+            self.click = None;
+        }
         let tx = area.x + 20.0;
         let name = title(&task);
-        let available = (more.x - tx - 12.0).max(0.0);
+        let available = (term.x - tx - 12.0).max(0.0);
         let title_hit_w = r.measure(UI, 15.0, 600, &name).min(available);
         if self.hit(r, Rect::new(tx, top.y, title_hit_w, top.h)) {
             set_clipboard(&task.title);
@@ -3453,7 +3410,7 @@ impl App {
         }
         let copied = self.title_copied.is_some_and(|(copied_key, until)| copied_key == key && Instant::now() < until);
         let message_w = if copied { r.measure(UI, 11.0, 400, "Title copied") + 12.0 } else { 0.0 };
-        let title_rect = Rect::new(tx, top.y, (more.x - tx - 12.0 - message_w).max(0.0), top.h);
+        let title_rect = Rect::new(tx, top.y, (term.x - tx - 12.0 - message_w).max(0.0), top.h);
         let title_w = r.text(tx, r.center(top, UI, 15.0), &name, UI, 15.0, 600, t.text, title_rect.w);
         if copied {
             r.text(tx + title_w + 12.0, r.center(top, UI, 11.0), "Title copied", UI, 11.0, 400, t.text3, message_w - 12.0);
@@ -3635,17 +3592,30 @@ impl App {
         for task in self.all_tasks() {
             counts[group(&task.state).min(3)] += 1;
         }
-        let mut x = 12.0;
+        // Settings lives here (bottom left) as a gear icon, keeping the title bar empty.
+        let mut x = 8.0;
+        {
+            let b = Rect::new(x, bar.y + 1.0, 24.0, 24.0);
+            self.scheme_btn = b;
+            r.frame(b, 4.0, if self.popup == Popup::Settings { t.raised } else { t.bg }, t.border);
+            // A gear: ring plus eight teeth, stroked like the app's other icons.
+            let gear = "M46 32A14 14 0 1 1 18 32A14 14 0 1 1 46 32M49 32H54M32 15V10M15 32H10M32 49V54M44 20L47.6 16.4M20 20L16.4 16.4M20 44L16.4 47.6M44 44L47.6 47.6";
+            r.path(21, gear, Some(6.0), b.x + 3.5, b.y + 3.5, 17.0, t.text2);
+            if self.hit(r, b) {
+                self.actions.push(Action::ToggleMenu);
+            }
+            x += b.w + 10.0;
+        }
         let y = r.center(bar, MONO, 11.5);
         if self.vim {
             // NORMAL, or INSERT while keys go to a field or the agent.
             let insert = self.focus != Focus::Normal;
             let label = if insert { "INSERT" } else { "NORMAL" };
             let pw = r.measure(MONO, 11.5, 500, label) + 18.0;
-            let pill = Rect::new(0.0, bar.y + 1.0, pw, STATUS_H - 1.0);
+            let pill = Rect::new(x, bar.y + 1.0, pw, STATUS_H - 1.0);
             r.rect(pill, 0.0, if insert { t.work } else { t.raised });
-            r.text(9.0, y, label, MONO, 11.5, 500, if insert { t.on_accent } else { t.text }, pw);
-            x = pw + 12.0;
+            r.text(x + 9.0, y, label, MONO, 11.5, 500, if insert { t.on_accent } else { t.text }, pw);
+            x += pw + 12.0;
             if self.answering.is_some() {
                 x += r.text(x, y, "j/k choose · ↵ answer · esc leave", MONO, 11.5, 500, t.needs, 300.0) + 14.0;
             }
@@ -3843,7 +3813,7 @@ impl App {
         let agent = clone.as_ref().map_or(AGENTS[agent_i], |c| c.1.as_str());
         let recent: Vec<String> = if clone.is_some() || self.inline_composer() { Vec::new() } else { self.prompts.iter().rev().filter(|p| **p != prompt).take(3).cloned().collect() };
         let inline = self.inline_composer();
-        let left = if inline { self.sidebar_w } else { 0.0 };
+        let left = if inline { self.sb_x() } else { 0.0 };
         if !inline {
             r.rect(Rect::new(0.0, 0.0, w, h), 0.0, t.scrim);
             r.target(Rect::new(0.0, 0.0, w, h), Cursor::Arrow);
@@ -4446,16 +4416,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bookmarks_survive_settings_roundtrip_and_older_preferences() {
-        let old: Settings = serde_json::from_str(r#"{"theme":"Paper","vim":true}"#).unwrap();
-        assert!(old.bookmarks.is_empty());
-        let saved = Settings {
-            bookmarks: vec![Bookmark { host: None, id: 7 }, Bookmark { host: Some("user@gpu".into()), id: 7 }],
-            ..old
-        };
-        let loaded: Settings = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
-        assert_eq!(loaded.bookmarks, saved.bookmarks);
-        assert_ne!(loaded.bookmarks[0], loaded.bookmarks[1]);
+    fn settings_roundtrip_and_older_preferences() {
+        // Older gui.json files (with removed fields like bookmarks) still load.
+        let old: Settings = serde_json::from_str(r#"{"theme":"Paper","vim":true,"bookmarks":[{"id":7}]}"#).unwrap();
+        assert_eq!((old.theme.as_str(), old.vim), ("Paper", true));
+        let loaded: Settings = serde_json::from_slice(&serde_json::to_vec(&old).unwrap()).unwrap();
         assert_eq!(loaded.theme, "Paper");
         assert!(loaded.vim);
     }
@@ -4695,14 +4660,13 @@ mod tests {
         let open = Popup::None.toggle(Popup::Usage);
         assert_eq!(open, Popup::Usage);
         assert_eq!(open.toggle(Popup::Settings), Popup::Settings);
-        assert_eq!(Popup::Settings.toggle(Popup::Bookmarks), Popup::Bookmarks);
         // Its own button again closes it.
         assert_eq!(open.toggle(Popup::Usage), Popup::None);
         // Esc closes an open popup and stops there; with none open it goes on to the window.
         let esc = Key::Named(NamedKey::Escape);
         assert_eq!(Popup::Usage.key(&esc), Some(Popup::None));
         assert_eq!(Popup::None.key(&esc), None);
-        assert_eq!(Popup::Bookmarks.key(&Key::Character("j".into())), None);
+        assert_eq!(Popup::Usage.key(&Key::Character("j".into())), None);
         // A click outside both the popup and its button closes it; inside either doesn't.
         let (pop, btn) = (Rect::new(100.0, 100.0, 200.0, 100.0), Rect::new(250.0, 300.0, 80.0, 20.0));
         assert!(clicked_outside(Some((10.0, 10.0)), pop, btn));
@@ -4739,14 +4703,5 @@ mod tests {
         assert!(sidebar_sections(&hosts, "task 6", None).iter().all(|s| s.tasks.is_empty()));
         // Machine names match the filter.
         assert_eq!(keys(&sidebar_sections(&hosts, "gpu", None)[1]), [(1, 3)]);
-    }
-
-    #[test]
-    fn bookmarks_list_saved_tasks_newest_first() {
-        let tasks = [task(1, 0, "exited", 10), task(2, 0, "running", 30), task(3, 1, "done", 20), task(4, 1, "done", 40)];
-        let saved = |t: &TaskInfo| t.id != 4;
-        let rows: Vec<u64> = bookmark_rows(tasks.iter(), saved).iter().map(|t| t.id).collect();
-        assert_eq!(rows, [2, 3, 1], "ended ones too; unsaved ones never");
-        assert!(bookmark_rows(tasks.iter(), |_| false).is_empty());
     }
 }

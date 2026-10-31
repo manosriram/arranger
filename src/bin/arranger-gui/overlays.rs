@@ -1,4 +1,4 @@
-//! What floats over the Workspace: one machine's every task, the settings menu, bookmarks, plan
+//! What floats over the Workspace: one machine's every task, the settings menu, plan
 //! usage and the vim key sheet.
 
 use super::*;
@@ -11,8 +11,6 @@ const FOOT_H: f32 = 34.0;
 /// Rows the machine popup draws at first, and adds each time its list is scrolled near the end.
 pub const MT_PAGE: usize = 50;
 const GROUPS: [&str; 5] = ["Needs you", "Running", "Queued", "Done", "Ended"];
-/// Bookmarks the title-bar list shows.
-const BOOKMARKS_MAX: usize = 12;
 
 impl App {
     pub(super) fn task_is_selected(&self, key: TaskKey) -> bool {
@@ -59,7 +57,7 @@ impl App {
     pub fn draw_task_selection(&mut self, r: &mut Renderer, t: &Theme, w: f32, h: f32) {
         if self.confirm_delete.is_some() { return; }
         if let Some(tasks) = &self.multi_select {
-            let bar = Rect::new(8.0, h - 66.0, (self.sidebar_w - 16.0).min(w - 16.0), 36.0);
+            let bar = Rect::new(8.0, h - 66.0, (self.sb_x() - 16.0).max(200.0).min(w - 16.0), 36.0);
             r.frame(bar, 4.0, t.dialog, t.border2);
             let label = format!("Delete {} · d", tasks.len());
             let delete = Rect::new(bar.x + 8.0, bar.y, bar.w - 80.0, bar.h);
@@ -92,7 +90,7 @@ impl App {
                 (label, wrap(r, &value, font, 11.5, 400, width - 108.0), font)
             }).collect();
             let details_h = 12.0 + details.iter().map(|(_, lines, _)| lines.len() as f32 * 16.0 + 6.0).sum::<f32>();
-            let height = title_h + details_h + if can_clone { 114.0 } else { 76.0 };
+            let height = title_h + details_h + if can_clone { 76.0 } else { 38.0 };
             let menu = Rect::new(x.min(w - width - 8.0).max(8.0), y.min(h - height - 8.0).max(8.0), width, height);
             r.frame(menu, 4.0, t.dialog, t.border2);
             r.target(menu, Cursor::Arrow);
@@ -116,8 +114,7 @@ impl App {
             }
             let actions_y = menu.y + title_h + details_h;
             r.rect(Rect::new(menu.x + 8.0, actions_y, menu.w - 16.0, 1.0), 0.0, t.border);
-            let label = if self.is_bookmarked(key) { "Remove bookmark" } else { "Bookmark thread" };
-            let mut labels = vec![(label, None)];
+            let mut labels = Vec::new();
             if can_clone { labels.push(("Clone task", Some(mod_label("D")))); }
             labels.push(("Select task", None));
             for (i, (label, shortcut)) in labels.iter().enumerate() {
@@ -129,8 +126,7 @@ impl App {
                 }
                 if self.hit(r, row) {
                     match i {
-                        0 => self.actions.push(Action::ToggleBookmark(key)),
-                        1 if can_clone => self.actions.push(Action::Clone(key)),
+                        0 if can_clone => self.actions.push(Action::Clone(key)),
                         _ => {
                             self.multi_select = Some(vec![key]);
                             self.answering = None;
@@ -394,13 +390,13 @@ impl App {
         self.actions.extend(acts);
     }
 
-    /// The settings menu's box under its title-bar button: the schemes in two columns, the
+    /// The settings menu's box above its status-bar button: the schemes in two columns, the
     /// switches, local server controls, then the machines.
     pub fn menu_rect(&self) -> Rect {
         let b = self.scheme_btn;
         let hosts = self.hosts.iter().filter(|h| !h.removed).count() as f32;
         let h = 6.0 + 24.0 + THEMES.len().div_ceil(2) as f32 * 28.0 + 13.0 + 2.0 * 30.0 + 13.0 + 24.0 + hosts * 28.0 + 40.0 + 6.0 + 109.0;
-        Rect::new(b.x + b.w - 300.0, b.y + b.h + 6.0, 300.0, h)
+        Rect::new(b.x, (b.y - h - 6.0).max(TITLE_H), 300.0, h)
     }
 
     pub fn draw_menu(&mut self, r: &mut Renderer, t: &Theme) {
@@ -516,52 +512,6 @@ impl App {
         // A click anywhere else closes it.
         if clicked_outside(self.click, menu, b) {
             acts.push(Action::ToggleMenu);
-        }
-        self.actions.extend(acts);
-    }
-
-    /// Bookmarked threads, most recently active first.
-    fn bookmarked(&self) -> Vec<&TaskInfo> {
-        bookmark_rows(self.all_tasks(), |t| self.is_bookmarked((t.machine, t.id)))
-    }
-
-    pub fn bookmarks_rect(&self) -> Rect {
-        let b = self.bookmarks_btn;
-        let rows = self.bookmarked().len().clamp(1, BOOKMARKS_MAX) as f32;
-        Rect::new(b.x + b.w - 360.0, b.y + b.h + 6.0, 360.0, 12.0 + rows * 34.0)
-    }
-
-    /// The bookmarks list under its title-bar button; a row opens that thread.
-    pub fn draw_bookmarks(&mut self, r: &mut Renderer, t: &Theme) {
-        let b = self.bookmarks_btn;
-        let pop = self.bookmarks_rect();
-        r.rect(Rect::new(pop.x - 1.0, pop.y + 3.0, pop.w + 2.0, pop.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
-        r.frame(pop, 0.0, t.bg, t.border2);
-        r.target(pop, Cursor::Arrow);
-        let mut acts = Vec::new();
-        let saved = self.bookmarked();
-        if saved.is_empty() {
-            let row = Rect::new(pop.x, pop.y + 6.0, pop.w, 34.0);
-            r.text(row.x + 14.0, r.center(row, UI, 12.0), "Bookmark a thread to keep it here", UI, 12.0, 400, t.text3, row.w - 28.0);
-        }
-        for (k, task) in saved.iter().take(BOOKMARKS_MAX).enumerate() {
-            let row = Rect::new(pop.x + 6.0, pop.y + 6.0 + k as f32 * 34.0, pop.w - 12.0, 34.0);
-            let key = (task.machine, task.id);
-            if self.selected == Some(key) {
-                r.rect(row, 0.0, t.sel);
-            }
-            self.icon(r, t, task, row.x + 8.0, row.y + row.h / 2.0);
-            let right = adapter::kind(&task.agent);
-            let rw = r.measure(MONO, 11.5, 400, right);
-            r.text(row.x + row.w - 8.0 - rw, r.center(row, MONO, 11.5), right, MONO, 11.5, 400, t.text3, rw + 2.0);
-            let tc = if group(&task.state) == 4 { t.text3 } else { t.text };
-            r.text(row.x + 30.0, r.center(row, UI, 12.5), &title(task), UI, 12.5, 500, tc, row.w - rw - 50.0);
-            if self.hit(r, row) {
-                acts.extend([Action::Select(key), Action::ToggleBookmarks]);
-            }
-        }
-        if clicked_outside(self.click, pop, b) {
-            acts.push(Action::ToggleBookmarks);
         }
         self.actions.extend(acts);
     }

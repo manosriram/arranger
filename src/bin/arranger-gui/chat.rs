@@ -1817,7 +1817,8 @@ impl App {
             if self.hit(r, button) { open_image(path); }
             ix += width + 6.0;
         }
-        let send = Rect::new(b.x + b.w - send_w - 6.0, b.y + (b.h - 28.0) / 2.0, send_w, 28.0);
+        // Bottom right of the input box.
+        let send = Rect::new(b.x + b.w - send_w - 6.0, b.y + b.h - 28.0 - 6.0, send_w, 28.0);
         let stopping = task.headless && matches!(group(&task.state), 0 | 1);
         let ready = stopping || !draft.trim().is_empty();
         let label = if stopping { "■ Stop" } else { "Send ↵" };

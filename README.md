@@ -9,7 +9,7 @@ Linux and macOS. Rust throughout; no webview.
   <img alt="arranger workspace with six agents on three machines, permission and question cards in the sidebar, and a finished Claude Code chat selected, showing its search, reads, edits with a diff, and test runs" src="assets/screenshot.png">
 </picture>
 
-Threads can be saved with **More → Bookmark thread** in the thread header, or **Bookmark thread** in a thread's right-click menu. Both menus reveal the full task title with a copy icon beside it, plus the branch, machine, elapsed time and available token/cost details. The task header keeps the agent, branch and change summary visible; **Review** opens its diff. Open any saved thread from **Bookmarks** in the title bar. Saved threads remain available after restarting, including ended and merged threads; choose **Remove bookmark** to unsave one.
+A thread's **More** menu and its right-click menu reveal the full task title with a copy icon beside it, plus the branch, machine, elapsed time and available token/cost details. The task header keeps the agent, branch and change summary visible; **Review** opens its diff.
 
 ## Install
 
@@ -72,7 +72,7 @@ Nothing is read from or written to the repository for this.
 
 Merging brings the base branch into the task branch before fast-forwarding the base. Conflicts must be resolved first. A further base move or a commit hook changing the reviewed tree blocks the merge so you can review and retry.
 
-**Run in worktree** in Review opens a terminal in the task’s checkout (over SSH for remote tasks). Run your app or tests there before merging; uncommitted edits are included. From the CLI, `arranger run <id>` opens a shell, or `arranger run <id> <command> [args…]` runs a command with its original exit status.
+The task header’s terminal button opens a shell in the task’s checkout (over SSH for remote tasks). Run your app or tests there before merging; uncommitted edits are included. From the CLI, `arranger run <id>` opens a shell, or `arranger run <id> <command> [args…]` runs a command with its original exit status.
 
 If merging hits a conflict, `main` is left alone: the conflict lands in the agent's worktree, and Review offers to have the agent resolve it (or take one side) before merging again.
 
