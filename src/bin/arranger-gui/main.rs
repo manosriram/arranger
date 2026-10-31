@@ -1071,11 +1071,6 @@ fn sidebar_sections<'a>(hosts: &'a [Host], filter: &str, selected: Option<TaskKe
     out
 }
 
-/// How many of a machine's tasks the sidebar leaves out: ended or merged.
-fn hidden_tasks(tasks: &[TaskInfo]) -> usize {
-    tasks.iter().filter(|t| t.shipped == "merged" || group(&t.state) == 4).count()
-}
-
 /// Past this many running or queued agents the sidebar goes dense: one line per row.
 const DENSE_AT: usize = 6;
 
@@ -1625,14 +1620,9 @@ impl App {
 
     /// Sidebar sections: what needs you, then everything else, across every machine, most
     /// recently active first within each state; ended tasks only while filtering or selected
-    /// (Settings' machine rows and the list's foot open the rest). Unreachable machines last.
+    /// (Settings' machine rows open the rest). Unreachable machines last.
     fn sections(&self) -> Vec<Section<'_>> {
         sidebar_sections(&self.hosts, &self.filter, self.selected)
-    }
-
-    /// Tasks the sidebar leaves out on machine `m` (ended or merged), for the list's foot.
-    fn hidden(&self, m: usize) -> usize {
-        hidden_tasks(&self.hosts[m].tasks)
     }
 
     /// More than `DENSE_AT` agents are running or queued: the sidebar packs its rows.
@@ -3242,23 +3232,6 @@ impl App {
             r.text(16.0, y + 10.0, &note, UI, 12.0, 400, t.text3, self.sidebar_w - 32.0);
             y += 34.0;
         }
-        // The foot: what's left out (ended and merged), behind each machine's every-task popup.
-        if self.filter.is_empty() {
-            for (m, host) in self.hosts.iter().enumerate().filter(|(_, h)| !h.removed && matches!(h.link, Link::Up(_))) {
-                let n = self.hidden(m);
-                if n == 0 {
-                    continue;
-                }
-                let label = if multi { format!("{n} ended on {} · see all →", host.name()) } else { format!("{n} ended · see all →") };
-                let row = Rect::new(6.0, y + 4.0, self.sidebar_w - 13.0, 28.0);
-                let hot = row.contains(self.mouse);
-                r.text(row.x + 10.0, r.center(row, UI, 12.0), &label, UI, 12.0, 400, if hot { t.text2 } else { t.text3 }, row.w - 20.0);
-                if self.hit(r, row) && clicked(self.click) {
-                    picks.push(Action::MachineTasks(Some(m)));
-                }
-                y += 28.0;
-            }
-        }
         let content_h = y + self.scroll - list.y;
         self.scroll = self.scroll.min((content_h - list.h + 8.0).max(0.0));
         r.set_clip(None);
@@ -3665,7 +3638,7 @@ impl App {
                 x += r.text(x, y, "j/k choose · ↵ answer · esc leave", MONO, 11.5, 500, t.needs, 300.0) + 14.0;
             }
         }
-        for (i, (sym, label)) in [("■", "need you"), ("●", "running"), ("○", "queued"), ("✓", "done")].iter().enumerate() {
+        for (i, (sym, label)) in [("■", "need you"), ("●", "running"), ("○", "queued")].iter().enumerate() {
             let c = if counts[i] == 0 { t.faint } else if i == 0 { t.needs } else if i == 1 { t.text2 } else { t.text3 };
             let weight = if i == 0 && counts[i] > 0 { 600 } else { 400 };
             x += r.text(x, r.center(bar, UI, 11.0), &format!("{sym} {} {label}", counts[i]), UI, 11.0, weight, c, 200.0) + 14.0;
@@ -4818,8 +4791,6 @@ mod tests {
         assert_eq!(keys(&sections[0]), [(0, 2), (1, 4)]);
         assert_eq!(keys(&sections[1]), [(1, 3), (0, 1), (0, 7)], "ended and merged tasks are left out");
         assert!(sections[2].tasks.is_empty());
-        // The foot counts what's left out, per machine.
-        assert_eq!((hidden_tasks(&hosts[0].tasks), hidden_tasks(&hosts[1].tasks)), (2, 0));
         // The selected ended task stays; filtering finds ended ones too, never merged ones.
         assert!(keys(&sidebar_sections(&hosts, "", Some((0, 5)))[1]).contains(&(0, 5)));
         let found = sidebar_sections(&hosts, "OLD", None);
