@@ -774,7 +774,11 @@ impl ApplicationHandler<Msg> for App {
                 if self.selected.is_none_or(|k| self.task(k).is_none()) {
                     // Dev aid for screenshots (`ARRANGER_SELECT=<task id>`): start on that local task.
                     let pick = std::env::var("ARRANGER_SELECT").ok().and_then(|v| v.parse().ok()).map(|id| (0, id)).filter(|&k| self.task(k).is_some());
-                    self.selected = pick.or_else(|| self.order().first().copied());
+                    let selected = pick.or_else(|| self.order().first().copied());
+                    let close_composer = selected.is_some() && self.inline_composer();
+                    if close_composer { self.dialog = None; }
+                    self.selected = selected;
+                    if close_composer { self.focus = self.rest(); }
                     // Snapshot a chat draft through the same composer and completion paths as typing.
                     if std::env::var_os("ARRANGER_SNAPSHOT").is_some()
                         && let Some(key) = self.selected
@@ -1897,7 +1901,7 @@ impl App {
 
     /// The sidebar's or review rail's divider under `p`, which a press starts dragging.
     fn divider_at(&self, p: (f32, f32)) -> Option<Divider> {
-        if self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || p.1 < TITLE_H {
+        if (self.dialog.is_some() && !self.inline_composer()) || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || p.1 < TITLE_H {
             return None;
         }
         match &self.review {
@@ -1909,7 +1913,8 @@ impl App {
     /// Scrolls whatever is under the mouse by `dy` pixels (positive = towards the top).
     fn scroll_by(&mut self, dy: f32) {
         if self.confirm_delete.is_some() { return; }
-        if let Some(d) = self.dialog.as_mut() {
+        let inline = self.inline_composer();
+        if let Some(d) = self.dialog.as_mut().filter(|_| !inline || self.mouse.0 >= self.sidebar_w) {
             if d.prompt_bounds.is_some_and(|b| b.contains(self.mouse)) {
                 d.prompt_scroll = (d.prompt_scroll - dy).max(0.0);
             }
@@ -2625,6 +2630,7 @@ impl App {
                         self.toggle_task_selection(id);
                         continue;
                     }
+                    if self.inline_composer() { self.dialog = None; }
                     self.selected = Some(id);
                     (self.wheel, self.ticks, self.glide) = (0.0, 0.0, 0.0);
                     // An open dialog keeps its field until it's closed.
@@ -2888,7 +2894,15 @@ impl App {
 
     // ---------- drawing ----------
 
+    fn inline_composer(&self) -> bool {
+        !self.welcome && self.review.is_none() && self.current().is_none()
+            && self.dialog.as_ref().is_none_or(|d| d.clone.is_none())
+    }
+
     fn draw(&mut self) {
+        if self.inline_composer() && self.dialog.is_none() {
+            self.open_dialog();
+        }
         let Some(mut gfx) = self.gfx.take() else { return };
         let size = gfx.window.inner_size();
         let t = self.theme();
@@ -2910,7 +2924,7 @@ impl App {
 
         self.probe_changes();
         // Under an open dialog or popup nothing reacts: the views below draw without the click.
-        let modal_click = (self.dialog.is_some() || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || self.task_menu.is_some()).then(|| self.click.take());
+        let modal_click = ((self.dialog.is_some() && !self.inline_composer()) || self.add_host.is_some() || self.machine_tasks.is_some() || self.confirm_delete.is_some() || self.task_menu.is_some()).then(|| self.click.take());
         let floating = self.popover(w, h).filter(|f| self.click.is_some_and(|p| f.contains(p))).and_then(|_| self.click.take());
         self.draw_title(r, t, w);
         if self.welcome {
@@ -3343,19 +3357,6 @@ impl App {
 
     fn draw_main(&mut self, r: &mut Renderer, t: &Theme, area: Rect) {
         let Some(task) = self.current().cloned() else {
-            let msg = format!("Start a task with {}", mod_label("N"));
-            let mw = r.measure(UI, 13.0, 400, &msg);
-            logo(r, area.x + (area.w - 64.0) / 2.0, area.y + area.h / 2.0 - 84.0, 64.0, t.faint, t.needs);
-            r.text(area.x + (area.w - mw) / 2.0, area.y + area.h / 2.0 - 8.0, &msg, UI, 13.0, 400, t.text3, area.w);
-            // A button too, for anyone who doesn't know the shortcut.
-            let label = "New task";
-            let bw = r.measure(UI, 13.0, 500, label) + 32.0;
-            let b = Rect::new(area.x + (area.w - bw) / 2.0, area.y + area.h / 2.0 + 22.0, bw, 34.0);
-            r.rect(b, 4.0, t.primary_bg);
-            r.text(b.x + 16.0, r.center(b, UI, 13.0), label, UI, 13.0, 500, t.primary_fg, bw);
-            if self.hit(r, b) {
-                self.actions.push(Action::NewTask);
-            }
             return;
         };
         // Two compact rows: title and actions, then inline task metadata.
@@ -3784,11 +3785,15 @@ impl App {
         // Another machine has no local branches to list; its repo path is typed.
         let remote = self.hosts[host_i].cfg.is_some() && clone.is_none();
         let agent = clone.as_ref().map_or(AGENTS[agent_i], |c| c.1.as_str());
-        let recent: Vec<String> = if clone.is_some() { Vec::new() } else { self.prompts.iter().rev().filter(|p| **p != prompt).take(3).cloned().collect() };
-        r.rect(Rect::new(0.0, 0.0, w, h), 0.0, t.scrim);
-        r.target(Rect::new(0.0, 0.0, w, h), Cursor::Arrow); // nothing under the scrim reacts
-        let dw = (w - 32.0).min(680.0);
-        let pad = 22.0;
+        let recent: Vec<String> = if clone.is_some() || self.inline_composer() { Vec::new() } else { self.prompts.iter().rev().filter(|p| **p != prompt).take(3).cloned().collect() };
+        let inline = self.inline_composer();
+        let left = if inline { self.sidebar_w } else { 0.0 };
+        if !inline {
+            r.rect(Rect::new(0.0, 0.0, w, h), 0.0, t.scrim);
+            r.target(Rect::new(0.0, 0.0, w, h), Cursor::Arrow);
+        }
+        let dw = if inline { w - left } else { (w - 32.0).min(680.0) };
+        let pad = if inline { 32.0 } else { 22.0 };
         let width = dw - 2.0 * pad;
         let choices = connected_models(agent, &self.hosts[host_i].limits);
         let model = match clone.as_ref().and_then(|c| c.5.as_deref()) {
@@ -3858,17 +3863,21 @@ impl App {
         let clone_h = if clone.is_some() { 30.0 + quotes.iter().map(|q| 22.0 + q.1.len() as f32 * 20.0 + 12.0).sum::<f32>() + 24.0 } else { 0.0 };
         // Reserve space for the controls before letting the editor grow. Recent prompts
         // are optional when a short window needs the space for editing instead.
-        let fixed_h = 20.0 + clone_h + 16.0 + controls_h + 18.0 + repo_h + 58.0;
-        let available_h = (h - TITLE_H - 32.0).max(0.0);
+        let heading_h = if inline { 32.0 } else { 20.0 };
+        let fixed_h = heading_h + clone_h + 16.0 + controls_h + 18.0 + repo_h + 58.0;
+        let available_h = (h - TITLE_H - if inline { STATUS_H + 20.0 } else { 32.0 }).max(0.0);
         if fixed_h + recent_h + 78.0 > available_h {
             recent_h = 0.0;
         }
-        let text_h = content_h.min((available_h - fixed_h - recent_h).max(26.0));
+        let editor_h = (available_h - fixed_h - recent_h).max(26.0);
+        let text_h = if inline { editor_h } else { content_h.min(editor_h) };
         let dh = fixed_h + text_h + recent_h;
-        let top = 104.0_f32.min((h - dh - 16.0).max(TITLE_H + 16.0));
-        let dlg = Rect::new((w - dw) / 2.0, top, dw, dh);
-        r.rect(Rect::new(dlg.x - 1.0, dlg.y + 6.0, dlg.w + 2.0, dlg.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x1C }));
-        r.frame(dlg, 0.0, t.dialog, t.border2);
+        let top = if inline { TITLE_H } else { 104.0_f32.min((h - dh - 16.0).max(TITLE_H + 16.0)) };
+        let dlg = Rect::new(left + (w - left - dw) / 2.0, top, dw, dh);
+        if !inline {
+            r.rect(Rect::new(dlg.x - 1.0, dlg.y + 6.0, dlg.w + 2.0, dlg.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x1C }));
+            r.frame(dlg, 0.0, t.dialog, t.border2);
+        }
 
         // Cloning: which task, what it was asked, and the question the prompt answers.
         if let Some((id, ..)) = &clone {
@@ -3890,7 +3899,7 @@ impl App {
         }
 
         // Prompt.
-        let ty = dlg.y + 20.0 + clone_h;
+        let ty = dlg.y + heading_h + clone_h;
         let prompt_focus = self.focus == Focus::Prompt;
         if prompt.is_empty() && clone.is_none() {
             r.text(dlg.x + pad, ty, "What should the agent do? (@ to reference files)", UI, 16.0, 400, t.text3, dlg.w - 2.0 * pad);
@@ -3939,7 +3948,7 @@ impl App {
             b.y += cy;
             let kw = r.measure(UI, 13.0, 400, key) + 8.0;
             let lead = if dot.is_some() { 16.0 } else { 0.0 };
-            let (fill, edge, kc, vc) = if *disabled { (t.raised, t.border, t.faint, t.text3) } else { (t.dialog, t.border2, t.text3, t.text) };
+            let (fill, edge, kc, vc) = if *disabled { (t.raised, t.border, t.faint, t.text3) } else { (if inline { t.bg } else { t.dialog }, t.border2, t.text3, t.text) };
             r.frame(*b, 4.0, fill, edge);
             if let Some(c) = dot {
                 r.rect(Rect::new(b.x + 12.0, b.y + 13.0, 6.0, 6.0), 0.0, if *disabled { alpha(*c, 0x80) } else { *c });
@@ -4020,9 +4029,9 @@ impl App {
         // Where it runs, left of Start. A clone runs as its source does.
         let left = start.x - 10.0;
         let ready = clone.is_some() || !prompt.trim().is_empty();
-        r.rect(start, 0.0, if ready { t.primary_bg } else { alpha(t.primary_bg, 0x80) });
-        r.text(start.x + 14.0, r.center(start, UI, 13.0), start_label, UI, 13.0, 600, t.primary_fg, sw);
-        if self.hit(r, start) {
+        r.rect(start, 4.0, if inline { t.needs } else { t.primary_bg });
+        r.text(start.x + 14.0, r.center(start, UI, 13.0), start_label, UI, 13.0, 600, if inline { t.bg } else { t.primary_fg }, sw);
+        if self.hit(r, start) && ready {
             self.actions.push(Action::Start);
         }
         let room = left - foot.x - pad - 2.0;
@@ -4031,6 +4040,8 @@ impl App {
             let mut hx = foot.x + pad - 1.0;
             let hints: &[(&str, &str)] = if clone.is_some() {
                 &[("↵", "clone"), ("↑", "its prompts"), ("tab", "model"), ("esc", "close")]
+            } else if inline {
+                &[("↵", "start"), ("tab", "agent"), ("ctrl+tab", "model"), ("alt+tab", "effort")]
             } else {
                 &[("↵", "start"), ("tab", "agent"), ("ctrl+tab", "model"), ("alt+tab", "effort"), ("esc", "close")]
             };
