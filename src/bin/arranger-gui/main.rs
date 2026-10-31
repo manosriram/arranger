@@ -3950,7 +3950,7 @@ impl App {
         if fixed_h + recent_h + 60.0 > available_h {
             recent_h = 0.0;
         }
-        let editor_h = (available_h - fixed_h - recent_h).max(26.0).min(6.0 * 26.0);
+        let editor_h = (available_h - fixed_h - recent_h).clamp(26.0, 6.0 * 26.0);
         let text_h = content_h.min(editor_h);
         let dh = fixed_h + text_h + recent_h;
         // The card floats in the middle of the page, so dropdowns opened from its chips have
