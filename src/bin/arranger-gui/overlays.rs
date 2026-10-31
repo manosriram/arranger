@@ -395,11 +395,11 @@ impl App {
     }
 
     /// The settings menu's box under its title-bar button: the schemes in two columns, the
-    /// switches, then the machines.
+    /// switches, local server controls, then the machines.
     pub fn menu_rect(&self) -> Rect {
         let b = self.scheme_btn;
         let hosts = self.hosts.iter().filter(|h| !h.removed).count() as f32;
-        let h = 6.0 + 24.0 + THEMES.len().div_ceil(2) as f32 * 28.0 + 13.0 + 2.0 * 30.0 + 13.0 + 24.0 + hosts * 28.0 + 40.0 + 6.0;
+        let h = 6.0 + 24.0 + THEMES.len().div_ceil(2) as f32 * 28.0 + 13.0 + 2.0 * 30.0 + 13.0 + 24.0 + hosts * 28.0 + 40.0 + 6.0 + 109.0;
         Rect::new(b.x + b.w - 300.0, b.y + b.h + 6.0, 300.0, h)
     }
 
@@ -456,6 +456,33 @@ impl App {
             }
             y += 30.0;
         }
+        r.rect(Rect::new(menu.x + 8.0, y + 6.0, menu.w - 16.0, 1.0), 0.0, t.border);
+        y += 13.0;
+        r.text(menu.x + 14.0, y + 8.0, "LOCAL SERVER", UI, 10.5, 500, t.text3, 120.0);
+        let running = matches!(self.hosts[0].link, Link::Up(_));
+        let state = if self.server_busy { "Working…" } else if running { "Running" } else { "Disconnected" };
+        let sw = r.measure(UI, 11.0, 400, state);
+        r.text(menu.x + menu.w - 14.0 - sw, y + 8.0, state, UI, 11.0, 400, if running { t.done } else { t.text3 }, sw + 2.0);
+        y += 24.0;
+        r.text(menu.x + 14.0, y + 2.0, "Stopping also ends local agents.", UI, 11.0, 400, t.text3, menu.w - 28.0);
+        y += 20.0;
+        let armed = self.server_stop_armed && running;
+        let button = Rect::new(menu.x + 14.0, y, if armed { menu.w - 100.0 } else { menu.w - 28.0 }, 28.0);
+        let label = if self.server_busy { "Please wait…" } else if armed { "Confirm stop + agents" } else if running { "Stop local server" } else { "Start local server" };
+        r.frame(button, 3.0, t.raised, if armed { t.del } else { t.border2 });
+        r.text(button.x + 10.0, r.center(button, UI, 12.0), label, UI, 12.0, 500, if armed { t.del } else { t.text2 }, button.w - 20.0);
+        if !self.server_busy && self.hit(r, button) {
+            acts.push(Action::ToggleServer);
+        }
+        if armed && !self.server_busy {
+            let cancel = Rect::new(button.x + button.w + 6.0, y, 66.0, 28.0);
+            r.frame(cancel, 3.0, t.bg, t.border2);
+            r.text(cancel.x + 10.0, r.center(cancel, UI, 12.0), "Cancel", UI, 12.0, 400, t.text2, cancel.w - 20.0);
+            if self.hit(r, cancel) { self.server_stop_armed = false; }
+        }
+        y += 32.0;
+        r.text(menu.x + 14.0, y + 2.0, "The app stays open when stopped.", UI, 11.0, 400, t.text3, menu.w - 28.0);
+        y += 20.0;
         r.rect(Rect::new(menu.x + 8.0, y + 6.0, menu.w - 16.0, 1.0), 0.0, t.border);
         y += 13.0;
         r.text(menu.x + 14.0, y + 8.0, "MACHINES", UI, 10.5, 500, t.text3, 100.0);

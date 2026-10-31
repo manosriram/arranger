@@ -80,6 +80,7 @@ pub enum Msg {
     Reply(Tag, Result<Reply, String>),
     /// The add-machine dialog's connection test.
     Tested(Result<String, String>),
+    ServerStopped(Result<(), String>),
     Paths(usize, String, Result<Reply, String>),
     /// A headless task's chat: its items so far, an older page, or a change.
     Chat(u64, Reply),
@@ -118,9 +119,9 @@ impl Host {
         self.cfg.as_ref().map_or(if cfg!(target_os = "macos") { "This Mac" } else { "This machine" }, |c| &c.name)
     }
 
-    /// The daemon socket to use; None is the local daemon (started on demand).
+    /// Explicit sockets keep GUI requests from restarting a deliberately stopped server.
     fn sock(&self) -> Option<PathBuf> {
-        self.cfg.as_ref().map(|c| machine::local_socket(&c.name))
+        Some(self.cfg.as_ref().map_or_else(proto::socket_path, |c| machine::local_socket(&c.name)))
     }
 }
 
@@ -282,6 +283,7 @@ enum Action {
     TestHost,
     AddHost,
     Reconnect(usize),
+    ToggleServer,
     RemoveHost(usize),
     PickTheme(usize),
     ToggleMenu,
@@ -322,6 +324,9 @@ enum Divider {
 }
 
 struct App {
+    server_busy: bool,
+    server_stop_armed: bool,
+    server_error: Option<String>,
     proxy: EventLoopProxy<Msg>,
     repo: PathBuf,
     gfx: Option<Gfx>,
@@ -479,26 +484,35 @@ fn main() {
     }
 }
 
+/// Start explicitly, then subscribe on the same connection. Failures leave the GUI usable.
+fn watch_local(proxy: EventLoopProxy<Msg>) {
+    thread::spawn(move || {
+        let result = (|| -> io::Result<()> {
+            let mut watch = connect()?;
+            watch.write_all(&proto::frame(&Request::Watch))?;
+            let _ = proxy.send_event(Msg::Link(0, Link::Up(0)));
+            loop {
+                let msg = match proto::read_msg(&mut watch)? {
+                    Reply::Tasks(tasks) => Msg::Tasks(0, tasks),
+                    Reply::Limits(limits) => Msg::Limits(0, limits),
+                    _ => return Err(io::Error::other("server disconnected")),
+                };
+                if proxy.send_event(msg).is_err() { return Ok(()); }
+            }
+        })();
+        if let Err(e) = result {
+            let _ = proxy.send_event(Msg::Link(0, Link::Down(e.to_string())));
+        }
+    });
+}
+
 fn run() -> io::Result<()> {
     let event_loop = EventLoop::<Msg>::with_user_event().build().map_err(io::Error::other)?;
     let proxy = event_loop.create_proxy();
-    let mut watch = connect()?;
-    watch.write_all(&proto::frame(&Request::Watch))?;
-    let p = proxy.clone();
-    thread::spawn(move || {
-        loop {
-            let msg = match proto::read_msg(&mut watch) {
-                Ok(Reply::Tasks(tasks)) => Msg::Tasks(0, tasks),
-                Ok(Reply::Limits(limits)) => Msg::Limits(0, limits),
-                _ => break,
-            };
-            if p.send_event(msg).is_err() {
-                return;
-            }
-        }
-        let _ = p.send_event(Msg::Link(0, Link::Down("daemon disconnected".into())));
-    });
     let mut app = App {
+        server_busy: true,
+        server_stop_armed: false,
+        server_error: None,
         proxy,
         repo: std::env::current_dir()?,
         gfx: None,
@@ -607,6 +621,8 @@ fn run() -> io::Result<()> {
     }
     app.focus = app.rest();
     app.link_host(None);
+    app.hosts[0].link = Link::Connecting;
+    watch_local(app.proxy.clone());
     for m in machine::load() {
         app.link_host(Some(m));
     }
@@ -829,7 +845,20 @@ impl ApplicationHandler<Msg> for App {
                 }
                 self.sync_session();
             }
+            Msg::ServerStopped(result) => {
+                self.server_busy = false;
+                self.server_stop_armed = false;
+                if let Err(e) = result {
+                    self.server_error = Some(format!("Stop failed: {e}"));
+                }
+            }
             Msg::Link(m, link) => {
+                if m == 0 && !matches!(link, Link::Connecting) {
+                    // Shutdown completes separately, after its watch stream closes.
+                    if matches!(link, Link::Up(_)) || !self.server_stop_armed {
+                        self.server_busy = false;
+                    }
+                }
                 if !matches!(link, Link::Up(_)) && m != 0 {
                     self.hosts[m].tasks.clear(); // stale once the link is gone
                 }
@@ -2801,6 +2830,28 @@ impl App {
                     }
                 }
                 Action::AddHost => self.save_host(),
+                Action::ToggleServer => {
+                    if !self.server_busy {
+                        self.server_error = None;
+                        if matches!(self.hosts[0].link, Link::Up(_)) {
+                            if self.server_stop_armed {
+                                self.server_busy = true;
+                                let p = self.proxy.clone();
+                                thread::spawn(move || {
+                                    let result = arranger::client::stop().map_err(|e| e.to_string());
+                                    let _ = p.send_event(Msg::ServerStopped(result));
+                                });
+                            } else {
+                                self.server_stop_armed = true;
+                            }
+                        } else {
+                            self.server_busy = true;
+                            self.server_stop_armed = false;
+                            self.hosts[0].link = Link::Connecting;
+                            watch_local(self.proxy.clone());
+                        }
+                    }
+                }
                 Action::Reconnect(m) => {
                     if let Some(tx) = self.hosts.get(m).and_then(|h| h.retry.as_ref()) {
                         let _ = tx.send(());
@@ -2889,6 +2940,9 @@ impl App {
     // ---------- drawing ----------
 
     fn draw(&mut self) {
+        if self.popup != Popup::Settings && !self.server_busy {
+            self.server_stop_armed = false;
+        }
         let Some(mut gfx) = self.gfx.take() else { return };
         let size = gfx.window.inner_size();
         let t = self.theme();
@@ -3602,8 +3656,10 @@ impl App {
         }
         let lost = matches!(self.hosts[0].link, Link::Down(_));
         let remotes: Vec<&Host> = self.hosts.iter().filter(|h| h.cfg.is_some() && !h.removed).collect();
-        let right = if lost {
-            "daemon disconnected".to_string()
+        let right = if let Some(error) = &self.server_error {
+            error.clone()
+        } else if lost {
+            match &self.hosts[0].link { Link::Down(e) => e.clone(), _ => String::new() }
         } else if !remotes.is_empty() {
             let up = 1 + remotes.iter().filter(|h| matches!(h.link, Link::Up(_))).count();
             format!("{up}/{} machines connected", remotes.len() + 1)
@@ -3629,7 +3685,7 @@ impl App {
             }
         }
         if !right.is_empty() {
-            let rw = r.measure(UI, 10.5, 400, &right);
+            let rw = r.measure(UI, 10.5, 400, &right).min((right_x - x - 20.0).max(0.0));
             r.text(right_x - rw, r.center(bar, UI, 10.5), &right, UI, 10.5, 400, if lost { t.del } else { t.text3 }, rw + 2.0);
             right_x -= rw + 14.0;
         }
