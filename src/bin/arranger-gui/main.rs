@@ -206,9 +206,26 @@ struct Dialog {
     branches: Vec<String>,
     /// The branch list is open, and where it was drawn last frame.
     list: Option<Rect>,
+    /// The chip menu (agent, model or effort) that's open, and where it was drawn last frame.
+    menu: Option<Menu>,
     error: String,
     /// Cloning this task rather than starting a new one: agent, machine and branch are its.
     clone: Option<CloneFrom>,
+}
+
+/// The new-task dialog's open chip menu: which chip, its rows' scroll, and where it was drawn.
+#[derive(Clone, Copy)]
+struct Menu {
+    chip: Chip,
+    scroll: f32,
+    rect: Rect,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Chip {
+    Agent,
+    Model,
+    Effort,
 }
 
 impl Dialog {
@@ -269,8 +286,8 @@ enum Action {
     Answering,
     PickAgent(usize),
     PickModel(usize),
-    /// The next of the dialog agent's reasoning efforts.
-    PickEffort,
+    /// The dialog agent's reasoning efforts: `usize::MAX` cycles, an index picks.
+    PickEffort(usize),
     Start,
     CloseDialog,
     OpenReview,
@@ -410,7 +427,7 @@ struct App {
     /// The Terminal tab is on (under Review, when that's open too).
     shell: bool,
     /// Whether each probed task has anything to review, keyed by the state it was probed in.
-    changes: std::collections::HashMap<TaskKey, (String, Option<bool>)>,
+    changes: std::collections::HashMap<TaskKey, (String, Option<bool>, Instant)>,
     /// Replay of a finished task's log, shown in place of a live session.
     history: Option<(TaskKey, Screen)>,
     /// How far into the top line the chat is scrolled, 0..1 of a line: the chat scrolls by pixel
@@ -695,6 +712,8 @@ fn init_gfx(el: &ActiveEventLoop) -> Result<Gfx, String> {
 }
 
 const BLINK: Duration = Duration::from_millis(530);
+/// Least time between diff probes of a selected running agent; each one scans its worktree.
+const PROBE_EVERY: Duration = Duration::from_secs(10);
 /// One full turn of the usage refresh button.
 const USAGE_SPIN: Duration = Duration::from_millis(600);
 
@@ -969,15 +988,27 @@ impl ApplicationHandler<Msg> for App {
                 self.chat_drag = false;
             },
             WindowEvent::MouseWheel { delta, .. } => match delta {
-                // A wheel notch glides; a trackpad already sends fine steps.
+                // A wheel notch glides; a trackpad already sends fine steps. A dropdown's few rows
+                // read best jumping a row at a time, not gliding.
                 MouseScrollDelta::LineDelta(_, y) => {
-                    if self.glide == 0.0 {
-                        self.glide_at = Instant::now();
+                    let mouse = self.mouse;
+                    match self.dialog.as_mut().and_then(|d| d.menu.as_mut().filter(|m| m.rect.contains(mouse))) {
+                        Some(m) => m.scroll = (m.scroll - y * 32.0).max(0.0),
+                        None => {
+                            if self.glide == 0.0 {
+                                self.glide_at = Instant::now();
+                            }
+                            self.glide += y * ROW_H * 1.5;
+                        }
                     }
-                    self.glide += y * ROW_H * 1.5;
                     self.redraw();
                 }
-                MouseScrollDelta::PixelDelta(p) => self.scroll_by(p.y as f32 / self.scale()),
+                MouseScrollDelta::PixelDelta(p) => {
+                    self.scroll_by(p.y as f32 / self.scale());
+                    // A trackpad's fine steps carry no animation of their own: without a frame
+                    // request here the scroll waits for the loop's next timer (the caret blink).
+                    self.request_frame();
+                }
             },
             WindowEvent::DroppedFile(path) if self.welcome => {
                 self.actions.push(Action::OpenProject(Some(path)));
@@ -1554,15 +1585,18 @@ impl App {
         self.current().is_some_and(|t| self.changes.get(&(t.machine, t.id)).is_none_or(|c| c.1 != Some(false)))
     }
 
-    /// Asks for the selected task's diff whenever its state has moved since the last ask.
+    /// Asks for the selected task's diff whenever its state has moved since the last ask. While
+    /// it runs, every tool call moves the stamp, and each probe is a blocking worktree scan in
+    /// the daemon's one thread — so cap their rate until it stops.
     fn probe_changes(&mut self) {
         let Some(t) = self.current() else { return };
         let (key, stamp) = ((t.machine, t.id), format!("{} {} {} {}", t.state, t.since, t.shipped, t.action));
-        if self.changes.get(&key).is_some_and(|c| c.0 == stamp) {
+        if let Some(c) = self.changes.get(&key)
+            && (c.0 == stamp || (is_live(&t.state) && c.2.elapsed() < PROBE_EVERY)) {
             return;
         }
         let prev = self.changes.get(&key).and_then(|c| c.1);
-        self.changes.insert(key, (stamp, prev));
+        self.changes.insert(key, (stamp, prev, Instant::now()));
         self.spawn_request(key.0, Tag::Changes(key), Request::Review { id: key.1 });
     }
 
@@ -1920,7 +1954,9 @@ impl App {
         let inline = self.inline_composer();
         let sx = self.sb_x();
         if let Some(d) = self.dialog.as_mut().filter(|_| !inline || self.mouse.0 >= sx) {
-            if d.prompt_bounds.is_some_and(|b| b.contains(self.mouse)) {
+            if let Some(m) = d.menu.as_mut().filter(|m| m.rect.contains(self.mouse)) {
+                m.scroll = (m.scroll - dy).max(0.0); // clamped to the menu's height when drawn
+            } else if d.prompt_bounds.is_some_and(|b| b.contains(self.mouse)) {
                 d.prompt_scroll = (d.prompt_scroll - dy).max(0.0);
             }
             return;
@@ -2121,7 +2157,7 @@ impl App {
     fn open_dialog(&mut self) {
         // Starts on the selected task's machine.
         let host = self.current().map_or(0, |t| t.machine);
-        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_layout: Default::default(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model: 0, effort: 0, host: 0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: None });
+        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_layout: Default::default(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model: 0, effort: 0, host: 0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, menu: None, error: String::new(), clone: None });
         self.pick_host(host);
         self.focus = Focus::Prompt;
         self.anchor = None;
@@ -2134,7 +2170,7 @@ impl App {
         let agent = adapter::kind(&t.agent).to_string();
         let model = connected_models(&agent, &self.hosts[key.0].limits).iter().position(|m| m.1 == t.model).unwrap_or(0);
         let clone = CloneFrom { key, agent, branch: t.branch.clone(), first: t.title.clone(), last: String::new(), model: Some(t.model.clone()), effort: t.effort.clone(), headless: t.headless };
-        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_layout: Default::default(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model, effort: 0, host: key.0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, error: String::new(), clone: Some(clone) });
+        self.dialog = Some(Dialog { completion: completion::Completion::default(), prompt: String::new(), prompt_layout: Default::default(), prompt_scroll: 0.0, prompt_bounds: None, prompt_position: None, agent: 0, model, effort: 0, host: key.0, repo: String::new(), base: String::new(), hist: None, branches: Vec::new(), list: None, menu: None, error: String::new(), clone: Some(clone) });
         self.focus = Focus::Prompt;
         self.anchor = None;
         self.spawn_request(key.0, Tag::LastPrompt(key), Request::Events { id: key.1 });
@@ -2285,7 +2321,7 @@ impl App {
             // A clone's agent is its source's, so Tab picks the model there.
             let model = m.control_key() || m.shift_key() || d.clone.is_some();
             self.actions.push(if m.alt_key() && d.clone.is_none() {
-                Action::PickEffort
+                Action::PickEffort(usize::MAX)
             } else if model {
                 Action::PickModel(usize::MAX)
             } else {
@@ -2772,9 +2808,10 @@ impl App {
                         }
                     }
                 }
-                Action::PickEffort => {
+                Action::PickEffort(i) => {
                     if let Some(d) = self.dialog.as_mut().filter(|d| d.clone.is_none()) {
-                        d.effort = (d.effort + 1) % efforts(d.agent()).len();
+                        let n = efforts(d.agent()).len();
+                        d.effort = if i == usize::MAX { (d.effort + 1) % n } else { i.min(n - 1) };
                     }
                 }
                 Action::Start => self.start(),
@@ -3798,11 +3835,17 @@ impl App {
         let (prompt, agent_i, model_i, base, error) = (d.prompt.clone(), d.agent, d.model, d.base.clone(), d.error.clone());
         let (effort_i, effort_kept) = (d.effort, d.clone.as_ref().map(|c| c.effort.clone()));
         let (branches, list) = (d.branches.clone(), d.list);
+        let menu = d.menu;
         // Cloning: (task id, agent, branch, first prompt, last prompt, its model until another's picked).
         let clone = d.clone.as_ref().map(|c| (c.key.1, c.agent.clone(), c.branch.clone(), c.first.clone(), c.last.clone(), c.model.clone()));
         // A click on the open branch list is the list's alone, whatever lies under it.
         let list_click = self.click.filter(|p| list.is_some_and(|l| l.contains(*p)));
         if list_click.is_some() {
+            self.click = None;
+        }
+        // A click on the open chip menu is the menu's alone, whatever lies under it.
+        let menu_click = self.click.filter(|p| menu.is_some_and(|m| m.rect.contains(*p)));
+        if menu_click.is_some() {
             self.click = None;
         }
         let (host_i, repo_path) = (d.host, d.repo.clone());
@@ -3840,9 +3883,9 @@ impl App {
             None => base.clone(),
         };
         let mut controls = vec![
-            ("agent", agent, Some(accent(agent)), 0.0, clone.is_some()),
-            ("model", model, None, 0.0, false),
-            ("effort", effort, None, 0.0, fixed),
+            ("agent", agent, Some(accent(agent)), if clone.is_some() { 0.0 } else { 22.0 }, clone.is_some()),
+            ("model", model, None, 22.0, false),
+            ("effort", effort, None, if fixed { 0.0 } else { 22.0 }, fixed),
         ];
         if hosts.len() > 1 {
             controls.push(("on", self.hosts[host_i].name(), None, 0.0, clone.is_some()));
@@ -3981,16 +4024,28 @@ impl App {
             }
             r.text(b.x + 12.0 + lead, r.center(*b, UI, 13.0), key, UI, 13.0, 400, kc, kw);
             r.text(b.x + 12.0 + lead + kw, r.center(*b, MONO, 13.0), value, MONO, 13.0, 500, vc, (b.w - 24.0 - lead - kw - extra).max(0.0));
+            // A chip with options shows the same chevron the branch list does.
+            if *extra >= 22.0 {
+                r.path(9, "M18 26L32 40L46 26", Some(6.0), b.x + b.w - 22.0, b.y + 10.0, 12.0, t.text3);
+            }
         }
-        // A clone's agent, machine and branch are its source's: shown, not picked.
-        if clone.is_none() && self.hit(r, chips[0]) {
-            self.actions.push(Action::PickAgent(usize::MAX));
-        }
-        if self.hit(r, chips[1]) {
-            self.actions.push(Action::PickModel(usize::MAX));
-        }
-        if !fixed && self.hit(r, chips[2]) {
-            self.actions.push(Action::PickEffort);
+        // A clone's agent, machine and branch are its source's: shown, not picked. Clicking a
+        // pickable chip opens its options as a menu (the same chip again closes it); Tab cycles.
+        let opened = if clone.is_none() && self.hit(r, chips[0]) {
+            Some(Chip::Agent)
+        } else if self.hit(r, chips[1]) {
+            Some(Chip::Model)
+        } else if !fixed && self.hit(r, chips[2]) {
+            Some(Chip::Effort)
+        } else {
+            None
+        };
+        if let Some(chip) = opened {
+            let d = self.dialog.as_mut().unwrap();
+            d.list = None; // one dropdown at a time
+            d.menu = d.menu.is_none_or(|m| m.chip != chip).then(|| Menu { chip, scroll: 0.0, rect: Rect::default() });
+        } else if menu.is_some_and(|m| self.click.is_some_and(|p| !m.rect.contains(p))) {
+            self.dialog.as_mut().unwrap().menu = None; // a click anywhere else closes it
         }
         if hosts.len() > 1 && clone.is_none() && self.hit(r, chips[3]) {
             let at = hosts.iter().position(|h| h.0 == host_i).unwrap_or(0);
@@ -4009,7 +4064,6 @@ impl App {
             self.field_text(r, t, vx, r.center(bfield, MONO, 13.0), &base, MONO, 13.0, (bfield.x + bfield.w - vx - 12.0).max(0.0), (Focus::Base, 0), true, self.caret_for(Focus::Base, &base), t.work);
         }
         if pick {
-            r.path(9, "M18 26L32 40L46 26", Some(6.0), bfield.x + bfield.w - 22.0, bfield.y + 10.0, 12.0, t.text3);
             if self.hit(r, bfield) {
                 let d = self.dialog.as_mut().unwrap();
                 d.list = if list.is_some() { None } else { Some(Rect::default()) };
@@ -4093,37 +4147,99 @@ impl App {
             self.caret = None; // its end
         }
 
+        // The chip menu, over everything else: agent, model or effort options, scrollable when
+        // they don't fit below the chip.
+        let mut picked = None;
+        if let Some(mut m) = d.menu {
+            let labels: Vec<&str> = match m.chip {
+                Chip::Agent => AGENTS.to_vec(),
+                Chip::Model => choices.iter().map(|(l, _)| l.as_str()).collect(),
+                Chip::Effort => efforts(agent).iter().map(|e| e.0).collect(),
+            };
+            // A clone's kept model stays checked until another is picked.
+            let (chip, on) = match m.chip {
+                Chip::Model => (chips[1], match clone.as_ref().and_then(|c| c.5.as_deref()) {
+                    Some(kept) if !kept.is_empty() => choices.iter().position(|c| c.1 == kept),
+                    _ => Some(model_i),
+                }),
+                Chip::Agent => (chips[0], Some(agent_i)),
+                Chip::Effort => (chips[2], Some(effort_i)),
+            };
+            let full = 8.0 + labels.len() as f32 * 32.0;
+            let top = chip.y + chip.h + 4.0;
+            m.scroll = m.scroll.min((full - (h - STATUS_H - 12.0 - top).max(40.0)).max(0.0));
+            m.rect = Rect::new(chip.x, top, labels.iter().map(|l| r.measure(MONO, 13.0, 400, l)).fold(chip.w, |mw, x| mw.max(x + 48.0)).min(dlg.w / 2.0), full.min((h - STATUS_H - 12.0 - top).max(40.0)));
+            r.rect(Rect::new(m.rect.x - 1.0, m.rect.y + 3.0, m.rect.w + 2.0, m.rect.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
+            r.frame(m.rect, 0.0, t.dialog, t.border2);
+            r.target(m.rect, Cursor::Arrow);
+            let old_clip = r.clip();
+            r.set_clip(Some(m.rect));
+            let first = (m.scroll / 32.0).floor() as usize;
+            let last = (first + ((m.rect.h - 8.0) / 32.0).ceil() as usize + 1).min(labels.len());
+            for (i, label) in labels.iter().enumerate().take(last).skip(first) {
+                let row = Rect::new(m.rect.x + 4.0, m.rect.y + 4.0 + i as f32 * 32.0 - m.scroll, m.rect.w - 8.0, 32.0);
+                if on == Some(i) {
+                    r.rect(row, 0.0, t.sel);
+                }
+                r.text(row.x + 10.0, r.center(row, MONO, 13.0), label, MONO, 13.0, 400, t.text, row.w - 40.0);
+                if on == Some(i) {
+                    r.path(8, "M14 33.6L25.6 45.2L50 18.8", Some(7.0), row.x + row.w - 22.0, row.y + 10.0, 12.0, t.text);
+                }
+                r.target(row, Cursor::Pointer);
+                if menu_click.is_some_and(|p| row.contains(p)) {
+                    picked = Some(match m.chip {
+                        Chip::Agent => Action::PickAgent(i),
+                        Chip::Model => Action::PickModel(i),
+                        Chip::Effort => Action::PickEffort(i),
+                    });
+                }
+            }
+            r.set_clip(old_clip);
+            if full > m.rect.h {
+                let track = Rect::new(m.rect.x + m.rect.w - 4.0, m.rect.y + 4.0, 2.0, m.rect.h - 8.0);
+                r.rect(track, 0.0, t.border);
+                let thumb_h = (track.h * track.h / full).max(12.0).min(track.h);
+                r.rect(Rect::new(track.x, track.y + m.scroll / (full - m.rect.h) * (track.h - thumb_h), 2.0, thumb_h), 0.0, t.text3);
+            }
+            d.menu = picked.is_none().then_some(m);
+        }
+
         // The branch list, over everything else. ponytail: the 8 most recent branches; scroll or type-to-filter if that's too few
-        if d.list.is_none() {
-            return;
-        }
-        if self.click.is_some_and(|p| !bfield.contains(p)) {
-            d.list = None; // a click anywhere else closes it
-            return;
-        }
-        let shown: Vec<&String> = branches.iter().take(8).collect();
-        let lw = shown.iter().map(|b| r.measure(MONO, 13.0, 400, b)).fold(bfield.w, |m, x| m.max(x + 48.0)).min(dlg.w / 2.0);
-        let lr = Rect::new(bfield.x, bfield.y + bfield.h + 4.0, lw, 8.0 + shown.len() as f32 * 32.0);
-        d.list = Some(lr);
-        r.rect(Rect::new(lr.x - 1.0, lr.y + 3.0, lr.w + 2.0, lr.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
-        r.frame(lr, 0.0, t.dialog, t.border2);
-        r.target(lr, Cursor::Arrow);
-        for (i, b) in shown.iter().enumerate() {
-            let row = Rect::new(lr.x + 4.0, lr.y + 4.0 + i as f32 * 32.0, lr.w - 8.0, 32.0);
-            let on = **b == base;
-            if on {
-                r.rect(row, 0.0, t.sel);
+        if d.list.is_some() {
+            if self.click.is_some_and(|p| !bfield.contains(p)) {
+                d.list = None; // a click anywhere else closes it
+            } else {
+                let shown: Vec<&String> = branches.iter().take(8).collect();
+                let lw = shown.iter().map(|b| r.measure(MONO, 13.0, 400, b)).fold(bfield.w, |m, x| m.max(x + 48.0)).min(dlg.w / 2.0);
+                let lr = Rect::new(bfield.x, bfield.y + bfield.h + 4.0, lw, 8.0 + shown.len() as f32 * 32.0);
+                d.list = Some(lr);
+                r.rect(Rect::new(lr.x - 1.0, lr.y + 3.0, lr.w + 2.0, lr.h + 2.0), 0.0, alpha([0, 0, 0, 255], if t.dark { 0x60 } else { 0x18 }));
+                r.frame(lr, 0.0, t.dialog, t.border2);
+                r.target(lr, Cursor::Arrow);
+                for (i, b) in shown.iter().enumerate() {
+                    let row = Rect::new(lr.x + 4.0, lr.y + 4.0 + i as f32 * 32.0, lr.w - 8.0, 32.0);
+                    let on = **b == base;
+                    if on {
+                        r.rect(row, 0.0, t.sel);
+                    }
+                    r.text(row.x + 10.0, r.center(row, MONO, 13.0), b, MONO, 13.0, 400, t.text, row.w - 40.0);
+                    if on {
+                        r.path(8, "M14 33.6L25.6 45.2L50 18.8", Some(7.0), row.x + row.w - 22.0, row.y + 10.0, 12.0, t.text);
+                    }
+                    r.target(row, Cursor::Pointer);
+                    if list_click.is_some_and(|p| row.contains(p)) {
+                        (d.base, d.list) = ((*b).clone(), None);
+                    }
+                }
+                if list_click.is_some() {
+                    self.redraw();
+                }
             }
-            r.text(row.x + 10.0, r.center(row, MONO, 13.0), b, MONO, 13.0, 400, t.text, row.w - 40.0);
-            if on {
-                r.path(8, "M14 33.6L25.6 45.2L50 18.8", Some(7.0), row.x + row.w - 22.0, row.y + 10.0, 12.0, t.text);
-            }
-            r.target(row, Cursor::Pointer);
-            if list_click.is_some_and(|p| row.contains(p)) {
-                (d.base, d.list) = ((*b).clone(), None);
-            }
         }
-        if list_click.is_some() {
+        if let Some(a) = picked {
+            self.actions.push(a);
+        }
+        if menu_click.is_some() {
             self.redraw();
         }
     }

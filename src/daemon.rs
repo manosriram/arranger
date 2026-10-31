@@ -227,7 +227,8 @@ pub fn run() -> io::Result<()> {
             worktree TEXT NOT NULL, state TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY, task INTEGER NOT NULL, ts INTEGER NOT NULL, event TEXT NOT NULL);
-         CREATE INDEX IF NOT EXISTS events_task ON events (task);
+         CREATE INDEX IF NOT EXISTS events_task_ts ON events (task, ts);
+         DROP INDEX IF EXISTS events_task;
          UPDATE tasks SET state = 'dead' WHERE state = 'running';
          DELETE FROM tasks WHERE state = 'new';",
     )
