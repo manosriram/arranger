@@ -431,7 +431,7 @@ struct App {
     /// The Terminal tab is on (under Review, when that's open too).
     shell: bool,
     /// Whether each probed task has anything to review, keyed by the state it was probed in.
-    changes: std::collections::HashMap<TaskKey, (String, Option<bool>)>,
+    changes: std::collections::HashMap<TaskKey, (String, Option<bool>, Instant)>,
     /// Replay of a finished task's log, shown in place of a live session.
     history: Option<(TaskKey, Screen)>,
     /// How far into the top line the chat is scrolled, 0..1 of a line: the chat scrolls by pixel
@@ -724,6 +724,8 @@ fn init_gfx(el: &ActiveEventLoop) -> Result<Gfx, String> {
 }
 
 const BLINK: Duration = Duration::from_millis(530);
+/// Least time between diff probes of a selected running agent; each one scans its worktree.
+const PROBE_EVERY: Duration = Duration::from_secs(10);
 /// One full turn of the usage refresh button.
 const USAGE_SPIN: Duration = Duration::from_millis(600);
 
@@ -1604,15 +1606,18 @@ impl App {
         self.current().is_some_and(|t| self.changes.get(&(t.machine, t.id)).is_none_or(|c| c.1 != Some(false)))
     }
 
-    /// Asks for the selected task's diff whenever its state has moved since the last ask.
+    /// Asks for the selected task's diff whenever its state has moved since the last ask. While
+    /// it runs, every tool call moves the stamp, and each probe is a blocking worktree scan in
+    /// the daemon's one thread — so cap their rate until it stops.
     fn probe_changes(&mut self) {
         let Some(t) = self.current() else { return };
         let (key, stamp) = ((t.machine, t.id), format!("{} {} {} {}", t.state, t.since, t.shipped, t.action));
-        if self.changes.get(&key).is_some_and(|c| c.0 == stamp) {
+        if let Some(c) = self.changes.get(&key)
+            && (c.0 == stamp || (is_live(&t.state) && c.2.elapsed() < PROBE_EVERY)) {
             return;
         }
         let prev = self.changes.get(&key).and_then(|c| c.1);
-        self.changes.insert(key, (stamp, prev));
+        self.changes.insert(key, (stamp, prev, Instant::now()));
         self.spawn_request(key.0, Tag::Changes(key), Request::Review { id: key.1 });
     }
 
