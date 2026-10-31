@@ -1953,7 +1953,9 @@ impl App {
         if self.confirm_delete.is_some() { return; }
         let inline = self.inline_composer();
         let sx = self.sb_x();
-        if let Some(d) = self.dialog.as_mut().filter(|_| !inline || self.mouse.0 >= sx) {
+        // The machine popup is the top layer: its list takes the wheel before what's under it.
+        let over_dialog = self.dialog.is_some() && self.machine_tasks.is_none() && (!inline || self.mouse.0 >= sx);
+        if let Some(d) = self.dialog.as_mut().filter(|_| over_dialog) {
             if let Some(m) = d.menu.as_mut().filter(|m| m.rect.contains(self.mouse)) {
                 m.scroll = (m.scroll - dy).max(0.0); // clamped to the menu's height when drawn
             } else if d.prompt_bounds.is_some_and(|b| b.contains(self.mouse)) {
@@ -2425,9 +2427,11 @@ impl App {
             self.normal_key(ev);
             return;
         }
-        if matches!(self.focus, Focus::Term | Focus::TasksFilter) && self.machine_tasks.is_some() && self.dialog.is_none() {
-            // The popup has no terminal: arrows move, ↵ opens the task, Esc closes it; anything
-            // else types into its filter.
+        // The popup has no terminal: arrows move, ↵ opens the task, Esc closes it; anything
+        // else types into its filter. The inline composer is the page under the popup, not a
+        // dialog competing for its keys.
+        if matches!(self.focus, Focus::Term | Focus::TasksFilter) && self.machine_tasks.is_some()
+            && (self.dialog.is_none() || self.inline_composer()) {
             match &ev.logical_key {
                 Key::Named(NamedKey::ArrowDown) => return self.move_selection(1),
                 Key::Named(NamedKey::ArrowUp) => return self.move_selection(-1),
@@ -3022,15 +3026,19 @@ impl App {
         if floating.is_some() {
             self.click = floating;
         }
+        // The machine popup's scrim covers the inline composer too: draw it under the popup,
+        // and without the click, like every other view under a modal.
+        let mt_click = self.machine_tasks.is_some().then(|| self.click.take());
+        if self.dialog.is_some() {
+            self.draw_dialog(r, t, w, h);
+        }
+        if let Some(click) = mt_click { self.click = click; }
         let context_click = self.task_menu.is_some().then(|| self.click.take());
         if self.machine_tasks.is_some() {
             self.task_regions.borrow_mut().clear();
             self.draw_machine_tasks(r, t, w, h);
         }
         if let Some(click) = context_click { self.click = click; }
-        if self.dialog.is_some() {
-            self.draw_dialog(r, t, w, h);
-        }
         if self.add_host.is_some() {
             self.draw_add_host(r, t, w, h);
         }
